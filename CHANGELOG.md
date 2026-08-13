@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+### Windows packaging
+- Added the first packaged Windows preview and standalone Windows 10/11 x64 build.
+- Added an original application icon with Tk and PyInstaller integration.
+- Standardized the public product and artifact name as Weibo Text Archiver.
+- Cleaned up the public repository presentation and release-facing documentation.
+- Preserved existing archive-integrity behavior without adding runtime dependencies.
+
 ## 0.4.0 (accepted)
 
 ### Incomplete archive semantics

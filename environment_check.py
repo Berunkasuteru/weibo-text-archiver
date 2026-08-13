@@ -52,10 +52,16 @@ for module in (
     except Exception as exc:
         fail(f"import {module}", exc)
 
+for asset in (ROOT / "assets/app_icon.png", ROOT / "assets/app_icon.ico"):
+    if asset.is_file():
+        ok(f"asset {asset.name}")
+    else:
+        fail(f"asset {asset.name}", "missing")
+
 try:
     for path in (ROOT / "weibo_archive").glob("*.py"):
         py_compile.compile(str(path), doraise=True)
-    ok("all V7 Python modules compile")
+    ok("all Python modules compile")
 except Exception as exc:
     fail("compile", exc)
 

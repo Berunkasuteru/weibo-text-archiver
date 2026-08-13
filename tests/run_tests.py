@@ -5,6 +5,7 @@ import ast
 import copy
 import json
 import runpy
+import struct
 import subprocess
 import sys
 import tempfile
@@ -188,8 +189,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.4.0"
-    assert VERSION_DISPLAY == "0.4.0"
+    assert __version__ == "0.4.1"
+    assert VERSION_DISPLAY == "0.4.1"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -197,25 +198,104 @@ def test_alpha4_version_and_gui_launcher():
     assert "Alpha 1" not in app_source
     assert "Alpha1" not in app_source
 
-    launcher = ROOT / "微博文字导出器.pyw"
+    launcher = ROOT / "WeiboTextArchiver.pyw"
     namespace = runpy.run_path(str(launcher), run_name="alpha4_launcher_import_test")
     assert callable(namespace["main"])
     assert callable(namespace["_show_startup_error"])
 
     user_visible_startup_files = (
         ROOT / "START.bat",
-        ROOT / "启动微博文字导出器.bat",
         ROOT / "CHECK_ENV.bat",
-        ROOT / "环境检查.bat",
         ROOT / "TEST.bat",
         ROOT / "tests" / "RUN_TESTS.bat",
-        ROOT / "README_先看.txt",
+        ROOT / "README.md",
+        ROOT / "BUILD_WINDOWS.bat",
         launcher,
     )
     for path in user_visible_startup_files:
         source = path.read_text(encoding="utf-8-sig")
         assert "Weibo Archive V7.0 Alpha 1" not in source
         assert "Alpha1" not in source
+
+
+def test_windows_preview_packaging_contract():
+    from weibo_archive.app import APP_TITLE
+    from weibo_archive.paths import resource_path
+
+    assert APP_TITLE == "Weibo Text Archiver"
+    png_path = ROOT / "assets" / "app_icon.png"
+    ico_path = ROOT / "assets" / "app_icon.ico"
+    assert png_path.is_file()
+    assert ico_path.is_file()
+    assert resource_path("assets/app_icon.png").resolve() == png_path.resolve()
+
+    png_header = png_path.read_bytes()[:24]
+    assert png_header[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", png_header[16:24]) == (512, 512)
+
+    ico = ico_path.read_bytes()
+    reserved, image_type, count = struct.unpack("<HHH", ico[:6])
+    assert (reserved, image_type) == (0, 1)
+    sizes = set()
+    for index in range(count):
+        width_byte, height_byte = struct.unpack_from("BB", ico, 6 + index * 16)
+        width = width_byte or 256
+        height = height_byte or 256
+        if width == height:
+            sizes.add(width)
+    assert {16, 24, 32, 48, 64, 128, 256} <= sizes
+
+    generator = ROOT / "tools" / "generate_icon.py"
+    result = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    spec = (ROOT / "weibo_text_archiver.spec").read_text(encoding="utf-8")
+    assert "console=False" in spec
+    assert "exclude_binaries=True" in spec
+    assert "COLLECT(" in spec
+    assert "onefile" not in spec.lower()
+    assert "assets/app_icon.png" not in spec  # Native Path joins remain portable.
+    assert '"assets" / "app_icon.png"' in spec
+    assert '"assets" / "app_icon.ico"' in spec
+    assert '"PIL"' in spec
+
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    for ignored in (".venv-build/", "/build/", "/dist/", "/release/"):
+        assert ignored in gitignore
+
+    requirements = (ROOT / "requirements-build.txt").read_text(encoding="utf-8")
+    assert "PyInstaller==" in requirements
+    assert "Pillow==" in requirements
+
+    runtime_imports = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "weibo_archive").glob("*.py")
+    )
+    assert "from PIL" not in runtime_imports
+    assert "import PIL" not in runtime_imports
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# Weibo Text Archiver\n")
+    assert not any("\u4e00" <= character <= "\u9fff" for character in readme)
+    assert not (ROOT / "README_先看.txt").exists()
+    assert not (ROOT / "docs" / "ROADMAP.md").exists()
+    assert not (ROOT / "启动微博文字导出器.bat").exists()
+    assert not (ROOT / "环境检查.bat").exists()
+    assert (ROOT / "docs" / "ARCHITECTURE.md").is_file()
+    assert (ROOT / "docs" / "SOURCE_NOTES.md").is_file()
+    assert (ROOT / "THIRD_PARTY_NOTICES.txt").is_file()
+
+    app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    for chinese_ui_text in ("扫码登录 / 更新", "导出内容", "试抓 50 条"):
+        assert chinese_ui_text in app_source
 
 
 def test_parser_contract():
@@ -1237,7 +1317,7 @@ def test_redaction():
 
 
 def test_dependency_audit():
-    forbidden_imports = {"requests", "playwright", "selenium", "subprocess"}
+    forbidden_imports = {"PIL", "requests", "playwright", "selenium", "subprocess"}
     bad_imports = []
 
     for path in (ROOT / "weibo_archive").glob("*.py"):
@@ -1776,6 +1856,7 @@ def main():
     suite = [
         ("startup import", test_startup_import),
         ("Alpha4 version and no-console GUI launcher", test_alpha4_version_and_gui_launcher),
+        ("Windows preview packaging contract", test_windows_preview_packaging_contract),
         ("raw parser contract", test_parser_contract),
         ("frozen model boundary", test_model_boundary),
         ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),
@@ -1824,7 +1905,7 @@ def main():
     for name, fn in suite:
         fn()
         print(f"[PASS] {name}")
-    print("\nALL V7 TESTS PASSED")
+    print("\nALL TESTS PASSED")
 
 
 if __name__ == "__main__":

@@ -23,13 +23,13 @@ from .export_options import (
 from .exporter import export_markdown
 from .models import ArchiveIntegrity, FetchRange, RangeMode, Termination
 from .network import Cancelled, NetworkError, RateLimited
-from .paths import COOKIE_FILE, DEFAULT_OUTPUT_DIR
+from .paths import APP_ICON_PNG, COOKIE_FILE, DEFAULT_OUTPUT_DIR
 from .security import redact_text, save_detailed_error
 from .storage import save_normalized_archive
 from .tasking import TaskManager, TaskState
 
 
-APP_TITLE = "Weibo Archive"
+APP_TITLE = "Weibo Text Archiver"
 APP_SUBTITLE = "微博文字备份 / AI Archive"
 DEFAULT_WINDOW_WIDTH = 860
 DEFAULT_COMPACT_HEIGHT = 760
@@ -85,6 +85,16 @@ def _centered_child_geometry(
     return width, height, x, y
 
 
+def _load_app_icon(window, icon_path: Path = APP_ICON_PNG):
+    """Set the tracked icon when available; retain Tk's default on failure."""
+    try:
+        icon = tk.PhotoImage(master=window, file=str(icon_path))
+        window.iconphoto(True, icon)
+        return icon
+    except (OSError, tk.TclError):
+        return None
+
+
 def extract_uid(value: str) -> str:
     import re
     m = re.search(r"(?<!\d)(\d{5,})(?!\d)", (value or "").strip())
@@ -128,6 +138,7 @@ def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._app_icon_image = _load_app_icon(self)
         self.title(f"{APP_TITLE} · {VERSION_DISPLAY}")
         self.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_COMPACT_HEIGHT}")
         self.minsize(780, 650)

@@ -11,7 +11,7 @@ def _show_startup_error() -> None:
         root = tk.Tk()
         root.withdraw()
         messagebox.showerror(
-            "微博文字导出器",
+            "Weibo Text Archiver",
             "程序启动失败。\n\n"
             "请使用诊断启动方式查看详细信息：\n"
             "python -m weibo_archive.app",

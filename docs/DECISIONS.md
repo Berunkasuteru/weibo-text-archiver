@@ -2,7 +2,7 @@
 
 Last updated: 2026-08-13
 
-This document records durable product and engineering decisions for 微博文字导出器 V7.
+This document records durable product and engineering decisions for Weibo Text Archiver.
 Do not reverse these decisions casually. If a decision changes, update this file with the reason.
 
 ## D001 — Correctness over silent success

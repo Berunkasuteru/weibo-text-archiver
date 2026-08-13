@@ -4,9 +4,9 @@ Last updated: 2026-08-13
 
 ## Current project
 
-- Product: 微博文字导出器
+- Product: Weibo Text Archiver
 - Platform: Windows
-- Current development stage: 0.4.0 completed / accepted (pre-1.0)
+- Current development stage: 0.4.1 Windows Preview candidate / pending acceptance
 - Current branch: `main`
 - Current accepted tag: `v0.4.0`
 - Current accepted commit: `Initial public release`

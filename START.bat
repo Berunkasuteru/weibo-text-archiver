@@ -2,11 +2,11 @@
 setlocal
 cd /d "%~dp0"
 set PYTHONUTF8=1
-title Weibo Archive - Diagnostic Console
+title Weibo Text Archiver - Diagnostic Console
 
 echo.
 echo ================================================
-echo Weibo Archive - Diagnostic Console
+echo Weibo Text Archiver - Diagnostic Console
 echo ================================================
 echo Independent core - no GitHub runtime download
 echo No pip install - no browser automation

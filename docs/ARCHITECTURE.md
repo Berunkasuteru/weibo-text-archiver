@@ -1,4 +1,4 @@
-# Weibo Archive V7 Architecture
+# Weibo Text Archiver Architecture
 
 V7 的目标不是“把 V6 拆成很多文件”，而是建立几个可以长期守住的边界。
 

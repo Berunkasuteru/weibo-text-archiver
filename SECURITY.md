@@ -1,57 +1,46 @@
-# Security Model — V7 Alpha 1
+# Security Model
 
 ## Network
 
-V7 只使用 Python 标准库 HTTPS stack，并使用系统默认 TLS 验证。
+Weibo Text Archiver uses the Python standard-library HTTPS stack and the system default TLS certificate verification.
 
-项目代码禁止：
+Project code must not use:
 
 ```python
 verify=False
 ssl._create_unverified_context()
 ```
 
-如果证书验证失败，宁可任务失败，也不降级到不安全连接。
+Certificate verification failures stop the task rather than falling back to an insecure connection.
 
-## Secrets
+## Credentials and diagnostics
 
-日志和 `last_error.txt` 会脱敏：
+Diagnostic logs and `last_error.txt` redact known credential fields, including:
 
-- SUB
-- SUBP
-- SSOLoginState
-- X-CSRF-TOKEN
-- alt / token-like query values
+- `SUB`
+- `SUBP`
+- `SSOLoginState`
+- CSRF headers and tokens
+- alternate or token-like query values
 
-**Alpha 1 仍沿用 V6 的 `%LOCALAPPDATA%\WeiboTextExporter\cookie.txt` 明文 Cookie，目的是先验证新抓取核心。**
-
-正式 V7 发行前计划迁移为 Windows DPAPI 用户作用域存储；解密失败视为未登录并重新扫码。
-
-不要发送：
+Version 0.4.1 stores the Weibo login cookie locally at:
 
 ```text
 %LOCALAPPDATA%\WeiboTextExporter\cookie.txt
 ```
 
+The cookie is currently stored as plaintext for compatibility with earlier local versions. Users should never share this file. A future credential-storage change must fail safely and require a new login if stored credentials cannot be read.
+
 ## Local archive privacy
 
-`v7_cache/<uid>/last_success.json` 是 normalized archive：
-- Alpha4 起显式使用 `schema_version: 1`
-- 不含 Cookie
-- 不含请求头
-- 不保存图片/视频 URL
-- 不保存 long-text attempt diagnostics、响应正文或完整 query
-- 包含微博正文及明确标记的 timeline preview，因此本身属于用户的个人归档数据
+`v7_cache/<uid>/last_success.json` is a normalized local archive with `schema_version: 1`. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
 
-无 `schema_version` 的旧缓存属于 legacy/unversioned。当前缓存仍为 write-only；
-未来 Alpha5 不得把旧缓存静默解释为可信 mother archive。
-
-请像对待最终 Markdown 一样对待这个缓存文件。
+It does contain post text and any explicitly marked timeline preview, so it remains personal archive data and should be protected like the exported Markdown files. Unversioned legacy cache files must not be silently treated as a trusted archive source.
 
 ## Privileges
 
-程序不需要管理员权限，不安装服务，不写系统目录，不修改防火墙。
+The application does not require administrator privileges, install a service, modify the firewall, or write to system directories.
 
 ## Telemetry
 
-V7 Alpha 1 没有遥测、统计上传或自动更新检查。
+Version 0.4.1 includes no telemetry, usage-statistics upload, or automatic update check.

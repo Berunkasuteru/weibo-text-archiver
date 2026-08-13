@@ -1,0 +1,22 @@
+﻿Third-Party Notices
+===================
+
+Bundled third-party code:
+
+1. python-qrcode
+   Purpose: encode the Weibo Passport scan URL as a QR matrix.
+   License:
+   THIRD_PARTY_LICENSES/python-qrcode_LICENSE.txt
+
+The application does not download or execute dataabc/weibo-crawler at runtime,
+and the weibo-crawler source is not bundled under weibo_archive/.
+
+Endpoint compatibility work refers to publicly observable Weibo mobile behavior
+and field/endpoint usage documented by open-source projects. The network client,
+parser, models, task orchestration, and exporter in this project are independently
+implemented.
+
+Weibo web and mobile endpoints are not stable public APIs controlled by this
+project and may change. Parser contract tests are therefore kept separate from
+Markdown golden tests so endpoint compatibility changes do not silently alter
+the archive format.

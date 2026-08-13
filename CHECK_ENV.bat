@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 set PYTHONUTF8=1
-title Weibo Archive - Environment Check
+title Weibo Text Archiver - Environment Check
 
 where py >nul 2>nul
 if %errorlevel%==0 (
