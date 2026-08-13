@@ -100,6 +100,7 @@ def _inject_full_provenance(
     text: str,
     archive: Archive,
     options: ExportOptions | None = None,
+    selection_notice: str | None = None,
 ) -> str:
     lines = text.splitlines()
     if not lines:
@@ -112,6 +113,8 @@ def _inject_full_provenance(
     ]
     if options is not None:
         meta.append(f"> 输出配置：{options_provenance(options)}")
+    if selection_notice:
+        meta.append(f"> 自定义筛选：{selection_notice}")
     integrity = archive.integrity
     if integrity.incomplete_records:
         meta.append(
@@ -129,6 +132,7 @@ def _inject_ai_provenance(
     text: str,
     archive: Archive,
     options: ExportOptions | None = None,
+    selection_notice: str | None = None,
 ) -> str:
     lines = text.splitlines()
     if not lines:
@@ -140,6 +144,8 @@ def _inject_ai_provenance(
     inserted = [meta]
     if options is not None:
         inserted.append("输出配置：" + options_provenance(options))
+    if selection_notice:
+        inserted.append("自定义筛选：" + selection_notice)
     integrity = archive.integrity
     if integrity.incomplete_records:
         inserted.append(
@@ -204,6 +210,7 @@ def export_markdown(
     filename_suffix: str,
     *,
     before_commit: Callable[[], None] | None = None,
+    selection_notice: str | None = None,
 ) -> tuple[Path, dict]:
     if filename_suffix not in _ALLOWED_FILENAME_SUFFIXES:
         raise ValueError("未知 Markdown 文件名类型。")
@@ -228,9 +235,9 @@ def export_markdown(
         )
 
     if options.layout is ExportLayout.FULL:
-        text = _inject_full_provenance(text, archive, options)
+        text = _inject_full_provenance(text, archive, options, selection_notice)
     else:
-        text = _inject_ai_provenance(text, archive, options)
+        text = _inject_ai_provenance(text, archive, options, selection_notice)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_name = md.safe_filename(username)

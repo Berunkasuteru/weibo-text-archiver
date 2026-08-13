@@ -12,13 +12,19 @@ from . import VERSION_DISPLAY
 from .auth import begin_qr_login, poll_qr_login, qr_matrix, save_cookies
 from .client import WeiboClient
 from .export_options import (
+    CustomFilterOptions,
+    CustomFilterReport,
     DateFormat,
     ExportLayout,
     ExportOptions,
     ExportPreset,
-    filename_suffix_for_selection,
-    options_for_preset,
+    ExportSelection,
+    build_export_selections,
+    filter_archive,
+    filter_report_notice,
+    filter_summary,
     options_summary,
+    parse_filter_terms,
 )
 from .exporter import export_markdown
 from .models import ArchiveIntegrity, FetchRange, RangeMode, Termination
@@ -157,8 +163,11 @@ class App(tk.Tk):
         self.range_mode_var = tk.StringVar(value=RangeMode.ALL.value)
         self.recent_count_var = tk.StringVar(value="1000")
         self.since_date_var = tk.StringVar(value="")
-        self.export_preset_var = tk.StringVar(value=ExportPreset.FULL_ARCHIVE.value)
+        self.full_output_var = tk.BooleanVar(value=True)
+        self.ai_output_var = tk.BooleanVar(value=False)
+        self.custom_output_var = tk.BooleanVar(value=False)
         self.custom_options = ExportOptions()
+        self.custom_filter = CustomFilterOptions()
         self.content_summary_var = tk.StringVar()
         self.login_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
@@ -307,28 +316,27 @@ class App(tk.Tk):
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(7, 0))
 
-        # Content
-        self._section_label("CONTENT")
+        # Output selection
+        self._section_label("OUTPUT")
         content_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         content_card.pack(fill="x", pady=(4, 14))
 
         preset_row = ttk.Frame(content_card)
         preset_row.pack(fill="x")
-        self.preset_buttons = []
-        for text, value in (
-            ("完整归档（推荐）", ExportPreset.FULL_ARCHIVE.value),
-            ("AI 精简", ExportPreset.AI_COMPACT.value),
-            ("自定义", ExportPreset.CUSTOM.value),
+        self.output_buttons = []
+        for text, variable in (
+            ("完整归档（推荐）", self.full_output_var),
+            ("AI Compact", self.ai_output_var),
+            ("自定义导出", self.custom_output_var),
         ):
-            button = ttk.Radiobutton(
+            button = ttk.Checkbutton(
                 preset_row,
                 text=text,
-                variable=self.export_preset_var,
-                value=value,
+                variable=variable,
                 command=self._update_content_controls,
             )
             button.pack(side="left", padx=(0, 18))
-            self.preset_buttons.append(button)
+            self.output_buttons.append(button)
 
         content_detail = ttk.Frame(content_card)
         content_detail.pack(fill="x", pady=(8, 0))
@@ -345,8 +353,8 @@ class App(tk.Tk):
         )
         self.custom_settings_btn.pack(side="right", padx=(8, 0))
 
-        # Output
-        self._section_label("OUTPUT")
+        # Save location
+        self._section_label("SAVE TO")
         output_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         output_card.pack(fill="x", pady=(4, 14))
         output_row = ttk.Frame(output_card)
@@ -553,24 +561,33 @@ class App(tk.Tk):
             self.range_hint_var.set("按新→旧抓取，确认进入起始日期以前后停止；置顶旧微博不会触发提前结束。")
 
     def _update_content_controls(self):
-        preset = ExportPreset(self.export_preset_var.get())
-        if preset is ExportPreset.FULL_ARCHIVE:
-            self.content_summary_var.set("完整排版 · 来源、位置、转评赞 · 日期时间到分钟")
-        elif preset is ExportPreset.AI_COMPACT:
-            self.content_summary_var.set("AI 精简排版 · 保留正文和核心元数据 · 日期时间到分钟")
-        else:
-            self.content_summary_var.set(options_summary(self.custom_options))
+        selected = []
+        if self.full_output_var.get():
+            selected.append("完整归档")
+        if self.ai_output_var.get():
+            selected.append("AI Compact")
+        if self.custom_output_var.get():
+            selected.append(
+                "自定义："
+                + options_summary(self.custom_options)
+                + " · "
+                + filter_summary(self.custom_filter)
+            )
+        self.content_summary_var.set(
+            "；".join(selected) if selected else "请至少选择一种输出。"
+        )
 
         running = self.tasks.state in (
             TaskState.AUTHENTICATING,
             TaskState.FETCHING,
             TaskState.EXPORTING,
         )
-        state = "normal" if preset is ExportPreset.CUSTOM and not running else "disabled"
+        state = "normal" if self.custom_output_var.get() and not running else "disabled"
         self.custom_settings_btn.configure(state=state)
 
     def _open_custom_settings(self):
         current = self.custom_options
+        current_filter = self.custom_filter
         win = tk.Toplevel(self)
         win.withdraw()
         win.title("自定义导出内容")
@@ -585,6 +602,14 @@ class App(tk.Tk):
         location_var = tk.BooleanVar(value=current.include_location)
         engagement_var = tk.BooleanVar(value=current.include_engagement)
         date_var = tk.StringVar(value=current.date_format.value)
+        original_var = tk.BooleanVar(value=current_filter.include_original)
+        repost_var = tk.BooleanVar(value=current_filter.include_reposts)
+        filter_start_var = tk.StringVar(
+            value=current_filter.start_date.isoformat() if current_filter.start_date else ""
+        )
+        filter_end_var = tk.StringVar(
+            value=current_filter.end_date.isoformat() if current_filter.end_date else ""
+        )
 
         ttk.Label(body, text="排版", style="Section.TLabel").pack(anchor="w")
         layout_row = ttk.Frame(body)
@@ -601,6 +626,51 @@ class App(tk.Tk):
             variable=layout_var,
             value=ExportLayout.AI.value,
         ).pack(side="left", padx=(18, 0))
+
+        ttk.Label(body, text="内容类型", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        type_row = ttk.Frame(body)
+        type_row.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(type_row, text="原创", variable=original_var).pack(side="left")
+        ttk.Checkbutton(type_row, text="转发", variable=repost_var).pack(
+            side="left", padx=(18, 0)
+        )
+
+        ttk.Label(body, text="关键词（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        keyword_text = tk.Text(body, height=3, width=52, wrap="word")
+        keyword_text.pack(fill="x", pady=(4, 0))
+        keyword_text.insert("1.0", "，".join(current_filter.keywords))
+        ttk.Label(
+            body,
+            text="多个关键词可用英文逗号、中文逗号或换行分隔；可直接输入 #话题#。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(body, text="二次日期筛选（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        filter_date_row = ttk.Frame(body)
+        filter_date_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(filter_date_row, text="开始").pack(side="left")
+        ttk.Entry(
+            filter_date_row,
+            width=12,
+            textvariable=filter_start_var,
+        ).pack(side="left", padx=(6, 14))
+        ttk.Label(filter_date_row, text="结束").pack(side="left")
+        ttk.Entry(
+            filter_date_row,
+            width=12,
+            textvariable=filter_end_var,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            body,
+            text="格式 YYYY-MM-DD；只筛选本次已抓取记录，不会再次联网。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
 
         ttk.Label(body, text="可选元数据", style="Section.TLabel").pack(anchor="w")
         ttk.Checkbutton(body, text="来源 / 设备", variable=source_var).pack(anchor="w", pady=(4, 0))
@@ -634,14 +704,37 @@ class App(tk.Tk):
         ttk.Button(actions, text="取消", command=win.destroy).pack(side="right")
 
         def save():
-            self.custom_options = ExportOptions(
-                layout=ExportLayout(layout_var.get()),
-                include_source=source_var.get(),
-                include_location=location_var.get(),
-                include_engagement=engagement_var.get(),
-                date_format=DateFormat(date_var.get()),
-            )
-            self.export_preset_var.set(ExportPreset.CUSTOM.value)
+            def optional_date(raw: str, label: str) -> date | None:
+                value = raw.strip()
+                if not value:
+                    return None
+                try:
+                    return date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ValueError(f"{label}请按 YYYY-MM-DD 填写。") from exc
+
+            try:
+                custom_options = ExportOptions(
+                    layout=ExportLayout(layout_var.get()),
+                    include_source=source_var.get(),
+                    include_location=location_var.get(),
+                    include_engagement=engagement_var.get(),
+                    date_format=DateFormat(date_var.get()),
+                )
+                custom_filter = CustomFilterOptions(
+                    include_original=original_var.get(),
+                    include_reposts=repost_var.get(),
+                    keywords=parse_filter_terms(keyword_text.get("1.0", "end")),
+                    start_date=optional_date(filter_start_var.get(), "开始日期"),
+                    end_date=optional_date(filter_end_var.get(), "结束日期"),
+                )
+            except (TypeError, ValueError) as exc:
+                messagebox.showwarning("自定义设置有误", str(exc), parent=win)
+                return
+
+            self.custom_options = custom_options
+            self.custom_filter = custom_filter
+            self.custom_output_var.set(True)
             self._update_content_controls()
             win.destroy()
 
@@ -665,7 +758,7 @@ class App(tk.Tk):
             self.export_btn,
             self.login_btn,
             self.clear_login_btn,
-            *self.preset_buttons,
+            *self.output_buttons,
         ):
             try:
                 widget.configure(state="disabled" if running else "normal")
@@ -753,7 +846,13 @@ class App(tk.Tk):
                     self.tasks.terminal(generation, TaskState.DONE)
                     self._set_running(False)
                     integrity = payload["integrity"]
-                    if integrity.incomplete_records:
+                    if payload["failures"]:
+                        self.status_var.set("Export complete · output warning")
+                        self.progress_detail_var.set(
+                            f"已生成 {len(payload['outputs'])} 个文件；"
+                            f"{len(payload['failures'])} 个本地输出失败。"
+                        )
+                    elif integrity.incomplete_records:
                         self.status_var.set("Export complete · integrity warning")
                         self.progress_detail_var.set(
                             "导出已完成；"
@@ -1002,11 +1101,14 @@ class App(tk.Tk):
         if folder:
             self.output_var.set(folder)
 
-    def _selected_export_options(self) -> tuple[ExportOptions, str]:
-        preset = ExportPreset(self.export_preset_var.get())
-        options = options_for_preset(preset, self.custom_options)
-        filename_suffix = filename_suffix_for_selection(preset, options)
-        return options, filename_suffix
+    def _selected_export_selections(self) -> tuple[ExportSelection, ...]:
+        return build_export_selections(
+            include_full=self.full_output_var.get(),
+            include_ai=self.ai_output_var.get(),
+            include_custom=self.custom_output_var.get(),
+            custom_options=self.custom_options,
+            custom_filter=self.custom_filter,
+        )
 
     def start_export(self, *, trial: bool):
         uid = extract_uid(self.uid_var.get())
@@ -1020,7 +1122,7 @@ class App(tk.Tk):
 
         try:
             fetch_range = self._selected_range(trial)
-            export_options, filename_suffix = self._selected_export_options()
+            export_selections = self._selected_export_selections()
         except ValueError as exc:
             messagebox.showwarning("导出设置有误", str(exc))
             return
@@ -1055,8 +1157,7 @@ class App(tk.Tk):
                 uid,
                 fetch_range,
                 output_dir,
-                export_options,
-                filename_suffix,
+                export_selections,
             ),
             daemon=True,
         )
@@ -1069,8 +1170,7 @@ class App(tk.Tk):
         uid: str,
         fetch_range: FetchRange,
         output_dir: Path,
-        export_options: ExportOptions,
-        filename_suffix: str,
+        export_selections: tuple[ExportSelection, ...],
     ):
         terminal_sent = False
         try:
@@ -1101,13 +1201,64 @@ class App(tk.Tk):
                 if cancel.is_set():
                     raise Cancelled("任务已取消。")
 
-            output_path, stats = export_markdown(
-                archive,
-                output_dir,
-                export_options,
-                filename_suffix,
-                before_commit=before_commit,
-            )
+            outputs = []
+            failures = []
+            for selection in export_selections:
+                if cancel.is_set():
+                    raise Cancelled("任务已取消。")
+
+                render_archive = archive
+                filter_report: CustomFilterReport | None = None
+                selection_notice = None
+                if selection.preset is ExportPreset.CUSTOM:
+                    render_archive, filter_report = filter_archive(
+                        archive,
+                        selection.custom_filter,
+                    )
+                    selection_notice = filter_report_notice(filter_report)
+
+                try:
+                    output_path, stats = export_markdown(
+                        render_archive,
+                        output_dir,
+                        selection.options,
+                        selection.filename_suffix,
+                        before_commit=before_commit,
+                        selection_notice=selection_notice,
+                    )
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    safe_error = redact_text(exc)
+                    failures.append(
+                        {
+                            "label": selection.label,
+                            "error": safe_error,
+                        }
+                    )
+                    self._worker_log(
+                        generation,
+                        f"{selection.label} 本地输出失败：{safe_error}",
+                    )
+                    continue
+
+                outputs.append(
+                    {
+                        "label": selection.label,
+                        "path": output_path,
+                        "options": selection.options,
+                        "stats": stats,
+                        "filter_report": filter_report,
+                    }
+                )
+                self._worker_log(
+                    generation,
+                    f"已生成 {selection.label}：{output_path.name}",
+                )
+
+            if not outputs:
+                failed_labels = "、".join(item["label"] for item in failures)
+                raise RuntimeError(f"所有本地输出均失败：{failed_labels}")
 
             report = archive.report
             summary = {
@@ -1115,9 +1266,8 @@ class App(tk.Tk):
                 "report": report,
                 "integrity": archive.integrity,
                 "count": len(archive.posts),
-                "output_path": output_path,
-                "export_options": export_options,
-                "stats": stats,
+                "outputs": outputs,
+                "failures": failures,
             }
             self._emit(generation, "done", summary)
             terminal_sent = True
@@ -1186,9 +1336,8 @@ class App(tk.Tk):
         profile = result["profile"]
         report = result["report"]
         integrity: ArchiveIntegrity = result["integrity"]
-        stats = result["stats"]
-        output_path: Path = result["output_path"]
-        export_options: ExportOptions = result["export_options"]
+        outputs = result["outputs"]
+        failures = result["failures"]
 
         if report.termination is Termination.NATURAL:
             termination = "自然结束"
@@ -1220,8 +1369,25 @@ class App(tk.Tk):
                 f"账号资料显示微博：{report.profile_statuses_count:,}（仅供参考，不等于可访问总量）"
             )
 
-        lines.append("输出配置：" + options_summary(export_options))
-        lines.append(f"文件大小：{stats['output_bytes'] / 1024:.1f} KB")
+        lines.append("")
+        lines.append("已生成：")
+        for output in outputs:
+            stats = output["stats"]
+            output_line = (
+                f"{output['label']}：{stats['count']:,} 条 · "
+                f"{stats['output_bytes'] / 1024:.1f} KB"
+            )
+            filter_report: CustomFilterReport | None = output["filter_report"]
+            if filter_report is not None:
+                output_line += " · " + filter_report_notice(filter_report)
+            lines.append(output_line)
+            lines.append(f"  {output['path'].name}")
+
+        if failures:
+            lines.append("")
+            lines.append("未生成：")
+            for failure in failures:
+                lines.append(f"{failure['label']}：{failure['error']}")
 
         win = tk.Toplevel(self)
         win.withdraw()
@@ -1234,9 +1400,13 @@ class App(tk.Tk):
         ttk.Label(
             body,
             text=(
-                "✓ 导出完成（含完整性提醒）"
-                if integrity.incomplete_records
-                else "✓ 导出完成"
+                "✓ 导出完成（部分输出失败）"
+                if failures
+                else (
+                    "✓ 导出完成（含完整性提醒）"
+                    if integrity.incomplete_records
+                    else "✓ 导出完成"
+                )
             ),
             font=("Microsoft YaHei UI", 15, "bold"),
         ).pack(anchor="w")
@@ -1245,14 +1415,6 @@ class App(tk.Tk):
             text="\n".join(lines),
             justify="left",
         ).pack(anchor="w", pady=(10, 0))
-        ttk.Label(
-            body,
-            text=output_path.name,
-            style="Muted.TLabel",
-            wraplength=540,
-            justify="left",
-        ).pack(anchor="w", pady=(10, 0))
-
         def launch(target: Path):
             ok, error = launch_with_system(target)
             if not ok:
@@ -1264,14 +1426,17 @@ class App(tk.Tk):
         ttk.Button(
             actions,
             text="打开导出文件夹",
-            command=lambda: launch(output_path.parent),
+            command=lambda: launch(outputs[0]["path"].parent),
         ).pack(side="right", padx=(0, 8))
-        ttk.Button(
-            actions,
-            text="打开文件",
-            style="Primary.TButton",
-            command=lambda: launch(output_path),
-        ).pack(side="right", padx=(0, 8))
+        for index, output in enumerate(reversed(outputs)):
+            path = output["path"]
+            text = "打开文件" if len(outputs) == 1 else f"打开{output['label']}"
+            ttk.Button(
+                actions,
+                text=text,
+                style="Primary.TButton" if index == 0 else "Quiet.TButton",
+                command=lambda target=path: launch(target),
+            ).pack(side="right", padx=(0, 8))
         self._center_child_window(win)
 
     def _on_close(self):

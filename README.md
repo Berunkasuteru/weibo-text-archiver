@@ -5,7 +5,7 @@ A local Windows tool for exporting Weibo posts into trustworthy Markdown archive
 ## What it does
 
 - Exports Weibo posts to Markdown.
-- Provides Full Archive, AI Compact, and Custom export modes.
+- Generates any combination of Full Archive, AI Compact, and Custom outputs from one fetch.
 - Supports full snapshots, recent-post limits, date-based ranges, and a 20-post test export.
 - Retrieves long-text content through explicitly supported paths.
 - Marks narrowly proven unavailable content as incomplete instead of presenting a timeline preview as full text.
@@ -51,7 +51,11 @@ python -m weibo_archive.app
 
 - **Full Archive** preserves the complete supported Markdown record.
 - **AI Compact** uses explicit attribution markers and compact metadata intended for LLM analysis.
-- **Custom** lets users choose selected metadata fields and date precision while retaining required archive text and dates.
+- **Custom** lets users choose selected metadata fields and date precision, then locally filter the fetched records by original/repost type, keyword, and an optional inclusive date slice.
+
+Custom keywords are case-insensitive for ASCII and use substring matching. Multiple keywords use OR; type, keyword, and date categories combine with AND. Searchable text includes the target account's available text and available repost-source text. An incomplete preview may help select a record, but remains explicitly unverified and never becomes complete.
+
+The model has no reliable structured hashtag field, so this beta does not provide a separate hashtag filter. A literal `#topic#` can still be entered as a keyword. Records with unknown timestamps remain eligible when no Custom date filter is active; with a date filter they are excluded from the confirmed slice and reported separately.
 
 ## Privacy and security
 
@@ -75,7 +79,7 @@ python environment_check.py
 python tests/run_tests.py
 ```
 
-The current suite contains 48 offline regression checks.
+The current suite contains 50 offline regression checks.
 
 ## Build
 

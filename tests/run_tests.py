@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import FrozenInstanceError, asdict, fields, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,12 +26,17 @@ from weibo_archive.client import (
 from weibo_archive.export_options import (
     AI_COMPACT_OPTIONS,
     FULL_ARCHIVE_OPTIONS,
+    CustomFilterOptions,
     DateFormat,
     ExportLayout,
     ExportOptions,
     ExportPreset,
+    build_export_selections,
     filename_suffix_for_selection,
+    filter_archive,
+    filter_report_notice,
     options_for_preset,
+    parse_filter_terms,
 )
 from weibo_archive.exporter import (
     archive_to_legacy_data,
@@ -197,8 +202,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.4.3"
-    assert VERSION_DISPLAY == "0.4.3"
+    assert __version__ == "0.5.0-beta.1"
+    assert VERSION_DISPLAY == "0.5.0-beta.1"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -233,7 +238,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.4.3"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.0-beta.1"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -1186,6 +1191,287 @@ def test_export_options_resolution_and_snapshot():
     assert later_gui_value.include_source is True
 
 
+def test_custom_filter_contract():
+    archive = build_alpha4_archive()
+    repost, incomplete_original, complete_original = archive.posts
+    complete_original = replace(
+        complete_original,
+        text="AI and #ChatGPT# research",
+    )
+    unknown_time = replace(
+        incomplete_original,
+        id="1000",
+        bid="b0",
+        created_at=None,
+        text_preview="未知时间的 GPT 列表预览",
+    )
+    archive = replace(
+        archive,
+        posts=(repost, incomplete_original, complete_original, unknown_time),
+    )
+    original_integrity = archive.integrity
+
+    originals, _ = filter_archive(
+        archive,
+        CustomFilterOptions(include_original=True, include_reposts=False),
+    )
+    assert [post.id for post in originals.posts] == ["1002", "1001", "1000"]
+
+    reposts, _ = filter_archive(
+        archive,
+        CustomFilterOptions(include_original=False, include_reposts=True),
+    )
+    assert [post.id for post in reposts.posts] == ["1003"]
+
+    all_posts, _ = filter_archive(archive, CustomFilterOptions())
+    assert all_posts.posts == archive.posts
+    assert unknown_time in all_posts.posts
+
+    try:
+        CustomFilterOptions(include_original=False, include_reposts=False)
+    except ValueError as exc:
+        assert "至少选择一种" in str(exc)
+    else:
+        raise AssertionError("empty content-type selection must be rejected")
+
+    chinese, chinese_report = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("原文列表",)),
+    )
+    assert [post.id for post in chinese.posts] == ["1003"]
+    assert chinese.posts[0].retweet.content_state is ContentState.INCOMPLETE
+    with tempfile.TemporaryDirectory(prefix="weibo_custom_filter_export_") as td:
+        output, stats = export_markdown(
+            chinese,
+            Path(td),
+            ExportOptions(),
+            "自定义_完整",
+            selection_notice=filter_report_notice(chinese_report),
+        )
+        rendered = output.read_text(encoding="utf-8")
+        assert stats["count"] == 1
+        assert "自定义筛选：匹配 1 / 本次抓取 4" in rendered
+        assert "全文无法验证" in rendered
+
+    ascii_match, _ = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("chatgpt",)),
+    )
+    assert [post.id for post in ascii_match.posts] == ["1001"]
+
+    keyword_or, _ = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("不存在", "顶层列表")),
+    )
+    assert [post.id for post in keyword_or.posts] == ["1002"]
+
+    type_and_keyword, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            include_original=True,
+            include_reposts=False,
+            keywords=("原文列表",),
+        ),
+    )
+    assert type_and_keyword.posts == ()
+    assert parse_filter_terms("AI, ai，中文\n#话题#") == ("AI", "中文", "#话题#")
+
+    date_slice, report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            start_date=date(2026, 8, 12),
+            end_date=date(2026, 8, 12),
+        ),
+    )
+    assert [post.id for post in date_slice.posts] == ["1002"]
+    assert report.fetched_count == 4
+    assert report.matched_count == 1
+    assert report.unknown_timestamp_count == 1
+    assert "1 条记录时间未知" in filter_report_notice(report)
+
+    boundary, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            start_date=date(2026, 8, 11),
+            end_date=date(2026, 8, 13),
+        ),
+    )
+    assert [post.id for post in boundary.posts] == ["1003", "1002", "1001"]
+    assert archive.integrity == original_integrity
+    assert archive.posts[0] is repost
+    assert archive.posts[1].content_state is ContentState.INCOMPLETE
+    assert archive.posts[0].retweet.content_state is ContentState.INCOMPLETE
+
+
+def test_multi_output_fetch_once_and_isolation():
+    import threading
+    import weibo_archive.app as app_module
+
+    archive = build_alpha4_archive()
+    custom_filter = CustomFilterOptions(
+        include_original=True,
+        include_reposts=False,
+        keywords=("第一条",),
+    )
+    two_outputs = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=False,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+    one_output = build_export_selections(
+        include_full=True,
+        include_ai=False,
+        include_custom=False,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+    three_outputs = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=True,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+
+    try:
+        build_export_selections(
+            include_full=False,
+            include_ai=False,
+            include_custom=False,
+            custom_options=ExportOptions(),
+            custom_filter=custom_filter,
+        )
+    except ValueError as exc:
+        assert "至少选择一种输出" in str(exc)
+    else:
+        raise AssertionError("an empty output selection must be rejected")
+
+    class FakeWorker:
+        def __init__(self):
+            self.events = []
+            self.logs = []
+
+        def _emit(self, generation, kind, payload=None):
+            self.events.append((generation, kind, payload))
+
+        def _worker_log(self, generation, text):
+            self.logs.append((generation, text))
+
+    original_values = (
+        app_module.COOKIE_FILE,
+        app_module.WeiboClient,
+        app_module.save_normalized_archive,
+        app_module.export_markdown,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="weibo_multi_export_") as td:
+            folder = Path(td)
+            cookie_file = folder / "cookie.txt"
+            cookie_file.write_text("SUB=offline-fixture", encoding="utf-8")
+            app_module.COOKIE_FILE = cookie_file
+
+            def run(selections, failing_suffix=None):
+                fetch_calls = []
+                saved_archives = []
+                rendered = []
+
+                class FakeClient:
+                    def __init__(self, **_kwargs):
+                        pass
+
+                    def fetch(self, uid, fetch_range):
+                        fetch_calls.append((uid, fetch_range))
+                        return archive
+
+                def fake_export(
+                    render_archive,
+                    output_dir,
+                    options,
+                    filename_suffix,
+                    *,
+                    before_commit=None,
+                    selection_notice=None,
+                ):
+                    if before_commit:
+                        before_commit()
+                    if filename_suffix == failing_suffix:
+                        raise OSError("fixture write failure")
+                    rendered.append(
+                        (
+                            filename_suffix,
+                            render_archive,
+                            tuple(post.id for post in render_archive.posts),
+                            selection_notice,
+                        )
+                    )
+                    path = output_dir / f"{filename_suffix}.md"
+                    return path, {
+                        "count": len(render_archive.posts),
+                        "output_bytes": 10,
+                        "output_chars": 10,
+                        "layout": options.layout.value,
+                    }
+
+                app_module.WeiboClient = FakeClient
+                app_module.save_normalized_archive = saved_archives.append
+                app_module.export_markdown = fake_export
+                worker = FakeWorker()
+                app_module.App._export_worker(
+                    worker,
+                    1,
+                    threading.Event(),
+                    archive.profile.id,
+                    FetchRange.trial(20),
+                    folder,
+                    selections,
+                )
+                done = [event for event in worker.events if event[1] == "done"]
+                assert len(done) == 1
+                return fetch_calls, saved_archives, rendered, done[0][2]
+
+            fetch_calls, saved, rendered, result = run(one_output)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 1 and rendered[0][1] is archive
+            assert len(result["outputs"]) == 1 and not result["failures"]
+
+            fetch_calls, saved, rendered, result = run(two_outputs)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 2
+            assert rendered[0][1] is archive and rendered[1][1] is archive
+            assert all(ids == ("1003", "1002", "1001") for _, _, ids, _ in rendered)
+            assert len(result["outputs"]) == 2 and not result["failures"]
+
+            fetch_calls, saved, rendered, result = run(three_outputs)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 3
+            assert rendered[0][1] is archive and rendered[1][1] is archive
+            assert rendered[0][2] == rendered[1][2] == ("1003", "1002", "1001")
+            assert rendered[2][2] == ("1001",)
+            assert "匹配 1 / 本次抓取 3" in rendered[2][3]
+            assert len(result["outputs"]) == 3 and not result["failures"]
+
+            fetch_calls, _, rendered, result = run(
+                two_outputs,
+                failing_suffix="AI精简版",
+            )
+            assert len(fetch_calls) == 1
+            assert len(rendered) == 1
+            assert [item["label"] for item in result["outputs"]] == ["完整归档"]
+            assert [item["label"] for item in result["failures"]] == ["AI Compact"]
+    finally:
+        (
+            app_module.COOKIE_FILE,
+            app_module.WeiboClient,
+            app_module.save_normalized_archive,
+            app_module.export_markdown,
+        ) = original_values
+
+
 def test_alpha3_field_policy_applies_to_main_and_repost():
     from weibo_archive import markdown_v5
 
@@ -2013,6 +2299,8 @@ def main():
         ("Alpha4 AI incomplete retweet dedup", test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview),
         ("0.4.2 AI Compact attribution schema", test_ai_compact_attribution_and_field_schema),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
+        ("0.5 custom filter contract", test_custom_filter_contract),
+        ("0.5 multi-output fetch-once contract", test_multi_output_fetch_once_and_isolation),
         ("Alpha3 document-wide field policy", test_alpha3_field_policy_applies_to_main_and_repost),
         ("Alpha3 normalized archive independence", test_export_does_not_mutate_normalized_archive),
         ("Alpha4 normalized cache semantics", test_alpha4_normalized_cache_contains_only_stable_semantics),

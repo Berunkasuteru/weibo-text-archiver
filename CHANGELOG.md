@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0-beta.1
+
+- Added fetch-once multi-output selection for Full Archive, AI Compact, and Custom Markdown.
+- Added local Custom filters for original/repost type, OR keywords, and an inclusive date slice.
+- Reports Custom matched/fetched counts and timestamps that cannot be evaluated by an active date filter.
+- Keeps Full and AI outputs independent from Custom filtering and preserves existing archive-integrity semantics.
+- Deferred a separate hashtag filter because the normalized model has no reliable structured hashtag field.
+
 ## 0.4.3
 
 - Standardized the Windows Release asset as `WeiboTextArchiver_Windows.zip` while retaining a versioned directory inside the archive.
