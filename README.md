@@ -19,15 +19,27 @@ The application never treats a visible timeline preview as verified full text. I
 
 ## Windows
 
-The Windows preview targets Windows 10/11 x64.
+The Windows package targets Windows 10/11 x64 and does not require a Python installation.
 
-For the packaged Windows preview, download the Windows ZIP from Releases, extract it, and run:
+### Download from GitHub Releases
+
+Download `WeiboTextArchiver_Windows.zip` from the latest GitHub Release, extract it, and run:
 
 ```text
 WeiboTextArchiver.exe
 ```
 
-No Python installation is required for the packaged application.
+### Download from Command Prompt
+
+To save the latest regular release in the current Command Prompt directory:
+
+```cmd
+curl.exe -fL -o WeiboTextArchiver_Windows.zip https://github.com/Berunkasuteru/weibo-text-archiver/releases/latest/download/WeiboTextArchiver_Windows.zip
+```
+
+The downloaded ZIP is saved in the directory currently open in Command Prompt.
+
+### Run from source
 
 To run from source with Python 3:
 

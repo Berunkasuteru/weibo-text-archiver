@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3
+
+- Standardized the Windows Release asset as `WeiboTextArchiver_Windows.zip` while retaining a versioned directory inside the archive.
+- Added a direct Command Prompt download example for the latest regular GitHub Release.
+
 ## 0.4.2
 
 - Improved AI Compact attribution between account text and repost sources.

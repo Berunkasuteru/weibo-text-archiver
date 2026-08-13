@@ -22,7 +22,7 @@ from weibo_archive import __version__  # noqa: E402
 BUNDLE_NAME = f"WeiboTextArchiver_{__version__}_Windows"
 BUNDLE_DIR = DIST_DIR / BUNDLE_NAME
 EXE_PATH = BUNDLE_DIR / "WeiboTextArchiver.exe"
-ZIP_NAME = f"{BUNDLE_NAME}.zip"
+ZIP_NAME = "WeiboTextArchiver_Windows.zip"
 ZIP_PATH = RELEASE_DIR / ZIP_NAME
 
 

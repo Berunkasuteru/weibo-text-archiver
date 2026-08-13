@@ -1,4 +1,4 @@
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 # All user-visible version text derives from this single source.
 VERSION_DISPLAY = __version__
