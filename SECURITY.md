@@ -23,7 +23,7 @@ Diagnostic logs and `last_error.txt` redact known credential fields, including:
 - CSRF headers and tokens
 - alternate or token-like query values
 
-Version 0.4.1 stores the Weibo login cookie locally at:
+The application stores the Weibo login cookie locally at:
 
 ```text
 %LOCALAPPDATA%\WeiboTextExporter\cookie.txt
@@ -43,4 +43,4 @@ The application does not require administrator privileges, install a service, mo
 
 ## Telemetry
 
-Version 0.4.1 includes no telemetry, usage-statistics upload, or automatic update check.
+The application includes no telemetry, usage-statistics upload, or automatic update check.

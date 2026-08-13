@@ -462,20 +462,27 @@ def build_ai_markdown(
     summary_parts.append(f"重复原文省略{duplicate_retweets}次")
     out.append("摘要：" + "｜".join(summary_parts))
 
-    if options is None:
-        out.append("格式：R=转发 C=评论 L=点赞；S*=发布来源；I=图片数 V=视频媒体数 A=头条文章；地=发布位置；RT*=已保存的转发原文编号。")
-    else:
-        format_parts = []
-        if options.include_engagement:
-            format_parts.append("R=转发 C=评论 L=点赞")
-        if options.include_source:
-            format_parts.append("S*=发布来源")
-        format_parts.append("I=图片数 V=视频媒体数 A=头条文章")
-        if options.include_location:
-            format_parts.append("地=发布位置")
-        format_parts.append("RT*=已保存的转发原文编号")
-        out.append("格式：" + "；".join(format_parts) + "。")
-    out.append("语境提醒：I/V/A 只表示媒体存在，媒体内容未导出；分析带媒体微博时，不要把文字当作完整语境。")
+    format_parts = ["W=目标账号顶层正文", "RT*=转发原文编号"]
+    if options is None or options.include_source:
+        format_parts.append("S*=发布来源")
+    if options is None or options.include_location:
+        format_parts.append("P=发布位置")
+    format_parts.append("I=图片数 V=视频媒体数 A=头条文章")
+    if options is None or options.include_engagement:
+        format_parts.append("R=转发 C=评论 L=点赞")
+    out.append("格式：" + "；".join(format_parts) + "。")
+    out.append(
+        "ATTRIBUTION: W = target account's top-level text; "
+        "RT = nested repost source and must not be directly attributed to the target account."
+    )
+    out.append(
+        "MEDIA: I/V/A > 0 = referenced media exists but is not included; "
+        "text must not be treated as complete context."
+    )
+    out.append("REFERENCE: =RT* = reference to an already emitted repost source.")
+    out.append(
+        "INCOMPLETE: PREVIEW_ONLY is an unverified timeline preview and must not be treated as full text."
+    )
 
     if source_rows:
         source_text = "；".join(
@@ -497,11 +504,11 @@ def build_ai_markdown(
 
         require_incomplete_id(item)
         item_incomplete = is_incomplete(item)
-        meta = [when]
+        meta = ["W", when]
         if source_code and (options is None or options.include_source):
             meta.append(source_code)
         if location and (options is None or options.include_location):
-            meta.append(f"地={location}")
+            meta.append(f"P={location}")
         media = compact_media(item)
         if media:
             meta.append(media)
@@ -546,7 +553,7 @@ def build_ai_markdown(
                             rt_label_parts.append(rt_source_code)
                         rt_location = normalize_text(rt.get("location"))
                         if options.include_location and rt_location:
-                            rt_label_parts.append(f"地={rt_location}")
+                            rt_label_parts.append(f"P={rt_location}")
                     rt_media = compact_media(rt)
                     if rt_media:
                         rt_label_parts.append(rt_media)

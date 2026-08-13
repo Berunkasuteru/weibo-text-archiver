@@ -651,7 +651,7 @@ class WeiboClient:
 
         raise InvalidResponse(
             "微博列表返回了非空卡片，但其中没有可识别微博。"
-            "为避免误判为自然结束，V7 已停止导出。"
+            "为避免误判为自然结束，导出已停止。"
         )
 
     def _rest_if_needed(self):
@@ -785,7 +785,7 @@ class WeiboClient:
             if consecutive_no_new_pages >= 3:
                 raise InvalidResponse(
                     "连续 3 页没有出现新的微博 ID，分页似乎没有继续向历史推进。"
-                    "为避免无限循环或伪完整备份，V7 已停止。"
+                    "为避免无限循环或伪完整归档，导出已停止。"
                 )
 
             progress_count = (

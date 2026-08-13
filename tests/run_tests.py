@@ -48,6 +48,7 @@ from weibo_archive.models import (
     MediaInfo,
     IncompleteReason,
     Post,
+    RangeMode,
     Termination,
     UserProfile,
     calculate_archive_integrity,
@@ -64,6 +65,13 @@ from weibo_archive.network import (
 )
 from weibo_archive.security import redact_text
 from weibo_archive.tasking import TaskManager, TaskState
+
+
+class _HistoricalTrialRange(FetchRange):
+    """Preserve accepted Full Archive golden provenance as historical test input."""
+
+    def label(self) -> str:
+        return "试抓50条"
 
 
 def build_archive() -> Archive:
@@ -116,7 +124,7 @@ def build_archive() -> Archive:
                 media=MediaInfo(),
             ),
         ),
-        fetch_range=FetchRange.trial(50),
+        fetch_range=_HistoricalTrialRange(RangeMode.TRIAL, limit=50),
         report=FetchReport(
             pages_fetched=1,
             requests_made=7,
@@ -189,8 +197,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.4.1"
-    assert VERSION_DISPLAY == "0.4.1"
+    assert __version__ == "0.4.2"
+    assert VERSION_DISPLAY == "0.4.2"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -219,10 +227,36 @@ def test_alpha4_version_and_gui_launcher():
 
 
 def test_windows_preview_packaging_contract():
-    from weibo_archive.app import APP_TITLE
+    from weibo_archive import VERSION_DISPLAY
+    from weibo_archive.app import APP_TITLE, TEST_EXPORT_LIMIT, App
+    from weibo_archive.models import RangeMode
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.4.2"
+    assert TEST_EXPORT_LIMIT == 20
+    trial_range = App._selected_range(object(), True)
+    assert trial_range.mode is RangeMode.TRIAL
+    assert trial_range.limit == 20
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    formal_controls = type(
+        "FormalRangeControls",
+        (),
+        {
+            "range_mode_var": Value(RangeMode.RECENT.value),
+            "recent_count_var": Value("37"),
+        },
+    )()
+    formal_range = App._selected_range(formal_controls, False)
+    assert formal_range.mode is RangeMode.RECENT
+    assert formal_range.limit == 37
     png_path = ROOT / "assets" / "app_icon.png"
     ico_path = ROOT / "assets" / "app_icon.ico"
     assert png_path.is_file()
@@ -294,8 +328,19 @@ def test_windows_preview_packaging_contract():
     assert (ROOT / "THIRD_PARTY_NOTICES.txt").is_file()
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
-    for chinese_ui_text in ("扫码登录 / 更新", "导出内容", "试抓 50 条"):
+    for chinese_ui_text in (
+        "扫码登录 / 更新",
+        "导出内容",
+        "测试导出",
+        "开始导出 →",
+        "清除登录信息",
+    ):
         assert chinese_ui_text in app_source
+    for obsolete_action in ("试抓 50 条", "开始备份 →", 'text="清除登录"'):
+        assert obsolete_action not in app_source
+    client_source = (ROOT / "weibo_archive" / "client.py").read_text(encoding="utf-8")
+    assert "V7 " not in app_source
+    assert "V7 " not in client_source
 
 
 def test_parser_contract():
@@ -935,7 +980,10 @@ def test_exporter_golden():
     expected_full = (ROOT / "tests/golden/model_full.md").read_text(encoding="utf-8")
     expected_ai = (ROOT / "tests/golden/model_ai.md").read_text(encoding="utf-8")
 
-    full_text, ai_text = render_legacy_markdown(archive)
+    full_text, _ = render_legacy_markdown(archive)
+    _, ai_text = render_legacy_markdown(
+        replace(archive, fetch_range=FetchRange.trial(20))
+    )
     assert full_text == expected_full
     assert ai_text == expected_ai
 
@@ -972,10 +1020,16 @@ def test_alpha3_exporter_goldens_and_single_output():
             for existing in output_dir.glob("*.md"):
                 existing.unlink()
             expected = (ROOT / "tests/golden" / golden_name).read_text(encoding="utf-8")
-            output, stats = export_markdown(archive, output_dir, options, suffix)
+            render_archive = (
+                replace(archive, fetch_range=FetchRange.trial(20))
+                if options.layout is ExportLayout.AI
+                else archive
+            )
+            output, stats = export_markdown(render_archive, output_dir, options, suffix)
             assert output.read_text(encoding="utf-8") == expected
             assert stats["count"] == 3
-            assert "试抓50条" in output.name
+            expected_range = "测试导出20条" if options.layout is ExportLayout.AI else "测试导出50条"
+            assert expected_range in output.name
             assert list(output_dir.glob("*.md")) == [output]
 
 
@@ -989,7 +1043,12 @@ def test_alpha4_incomplete_full_and_ai_goldens():
         output_dir = Path(td)
         for options, suffix, golden_name in cases:
             expected = (ROOT / "tests/golden" / golden_name).read_text(encoding="utf-8")
-            output, stats = export_markdown(archive, output_dir, options, suffix)
+            render_archive = (
+                replace(archive, fetch_range=FetchRange.trial(20))
+                if options.layout is ExportLayout.AI
+                else archive
+            )
+            output, stats = export_markdown(render_archive, output_dir, options, suffix)
             rendered = output.read_text(encoding="utf-8")
             assert rendered == expected
             assert stats["count"] == 3
@@ -1012,11 +1071,76 @@ def test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview():
         AI_COMPACT_OPTIONS,
     )
     assert text.count("CONTENT=INCOMPLETE") == 1
-    assert text.count("PREVIEW_ONLY") == 1
+    assert text.count("PREVIEW_ONLY") == 2  # one rule plus one record marker
+    assert text.count(">[PREVIEW_ONLY｜全文无法验证]") == 1
     assert "当前没有可保存的列表预览" in text
     assert ">[=RT1]" in text
     assert stats["unique_retweets"] == 1
     assert stats["duplicate_retweets"] == 1
+
+
+def test_ai_compact_attribution_and_field_schema():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    posts = list(archive.posts)
+    posts[1] = replace(
+        posts[1],
+        media=MediaInfo(images=3, videos=2, article=True),
+    )
+    data = archive_to_legacy_data(replace(archive, posts=tuple(posts)))
+    text, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+
+    assert "ATTRIBUTION: W = target account's top-level text;" in text
+    assert "RT = nested repost source and must not be directly attributed" in text
+    assert (
+        "MEDIA: I/V/A > 0 = referenced media exists but is not included; "
+        "text must not be treated as complete context."
+    ) in text
+    assert "REFERENCE: =RT* = reference to an already emitted repost source." in text
+    assert (
+        "INCOMPLETE: PREVIEW_ONLY is an unverified timeline preview "
+        "and must not be treated as full text."
+    ) in text
+    assert "来源字典：S1=" in text
+    assert "摘要：共3条" in text
+    assert stats["count"] == 3
+    assert stats["unique_retweets"] == 1
+
+    lines = text.splitlines()
+    rich_top = next(line for line in lines if "P=上海" in line)
+    assert rich_top == "[W｜2026-08-12 18:30｜S1｜P=上海｜I3 V2 A1｜R3 C0 L21]"
+    repost = next(line for line in lines if line.startswith(">[RT1"))
+    assert repost == ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R12 C8 L99]"
+    assert all(line.startswith("[W｜") for line in lines if line.startswith("[W"))
+    assert "｜地=" not in text
+    assert "地=发布位置" not in text
+
+    incomplete_data = archive_to_legacy_data(build_alpha4_archive())
+    incomplete_text, _, _ = markdown_v5.build_ai_markdown(
+        incomplete_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R3 C0 L21｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R12 C8 L99｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert incomplete_text.count("PREVIEW_ONLY") == 3  # one rule plus two records
+
+    empty_post = replace(archive.posts[1], text="")
+    empty_data = archive_to_legacy_data(replace(archive, posts=(empty_post,)))
+    empty_text, _, empty_stats = markdown_v5.build_ai_markdown(
+        empty_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R3 C0 L21]" in empty_text
+    assert "仅媒体1条" in empty_text
+    assert "[PREVIEW_ONLY｜" not in empty_text
+    assert empty_stats["media_only_posts"] == 1
 
 
 def test_export_options_resolution_and_snapshot():
@@ -1096,13 +1220,13 @@ def test_alpha3_field_policy_applies_to_main_and_repost():
         "R=转发",
         "R1 C1 L5",
         "R12 C8 L99",
-        "｜地=上海",
-        "｜地=北京",
-        "｜地=广州",
+        "｜P=上海",
+        "｜P=北京",
+        "｜P=广州",
     ):
         assert hidden not in ai_text
     assert "所在地=北京" in ai_text
-    assert "[2026-08-13]" in ai_text
+    assert "[W｜2026-08-13]" in ai_text
     assert "[RT1｜@原作者｜2026-08-10｜I1]" in ai_text
     assert "这是转发时写的评论。" in ai_text
     assert "这是被转发的原文。" in ai_text
@@ -1209,14 +1333,14 @@ def test_completion_integrity_warning_text():
 
 
 def test_atomic_export_preserves_existing_final_on_cancel_or_failure():
-    archive = build_alpha3_archive()
+    archive = replace(build_alpha3_archive(), fetch_range=FetchRange.trial(20))
 
     class SimulatedCancel(Exception):
         pass
 
     with tempfile.TemporaryDirectory(prefix="weibo_v7_atomic_") as td:
         output_dir = Path(td)
-        final = output_dir / "测试用户_1234567890_试抓50条_完整.md"
+        final = output_dir / "测试用户_1234567890_测试导出20条_完整.md"
         final.write_text("existing user archive", encoding="utf-8")
 
         def cancel_before_commit():
@@ -1376,7 +1500,7 @@ def test_alpha4_recovery_and_diagnostic_layer_guards():
 
 def test_range_semantics():
     from datetime import date
-    from weibo_archive.models import RangeMode
+    from weibo_archive.app import TEST_EXPORT_LIMIT
 
     all_range = FetchRange.all()
     assert all_range.mode is RangeMode.ALL
@@ -1386,10 +1510,11 @@ def test_range_semantics():
     assert recent.limit == 1000
     assert recent.label() == "最近1000条"
 
-    trial = FetchRange.trial(50)
+    trial = FetchRange.trial(TEST_EXPORT_LIMIT)
     assert trial.mode is RangeMode.TRIAL
-    assert trial.limit == 50
-    assert trial.label() == "试抓50条"
+    assert trial.limit == 20
+    assert trial.label() == "测试导出20条"
+    assert FetchRange.trial() == trial
 
     since = FetchRange.since_date(date(2024, 1, 1))
     assert since.mode is RangeMode.SINCE
@@ -1879,6 +2004,7 @@ def main():
         ("Alpha3 exporter goldens and single output", test_alpha3_exporter_goldens_and_single_output),
         ("Alpha4 incomplete exporter goldens", test_alpha4_incomplete_full_and_ai_goldens),
         ("Alpha4 AI incomplete retweet dedup", test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview),
+        ("0.4.2 AI Compact attribution schema", test_ai_compact_attribution_and_field_schema),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
         ("Alpha3 document-wide field policy", test_alpha3_field_policy_applies_to_main_and_repost),
         ("Alpha3 normalized archive independence", test_export_does_not_mutate_normalized_archive),

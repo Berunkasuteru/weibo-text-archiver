@@ -149,7 +149,7 @@ class FetchRange:
         return cls(RangeMode.RECENT, limit=count)
 
     @classmethod
-    def trial(cls, count: int = 50) -> "FetchRange":
+    def trial(cls, count: int = 20) -> "FetchRange":
         return cls(RangeMode.TRIAL, limit=count)
 
     @classmethod
@@ -160,7 +160,7 @@ class FetchRange:
         if self.mode is RangeMode.ALL:
             return "全量快照"
         if self.mode is RangeMode.TRIAL:
-            return f"试抓{self.limit or 50}条"
+            return f"测试导出{self.limit or 20}条"
         if self.mode is RangeMode.RECENT:
             return f"最近{self.limit or 0}条"
         if self.mode is RangeMode.SINCE and self.since:

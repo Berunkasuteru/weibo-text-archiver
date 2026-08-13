@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.2
+
+- Improved AI Compact attribution between account text and repost sources.
+- Normalized compact location metadata and strengthened media/incomplete-context rules.
+- Renamed GUI actions around the export workflow.
+- Reduced the test export from 50 posts to 20 posts.
+- Removed stale user-visible V7 wording.
+
 ## 0.4.1
 
 ### Windows packaging

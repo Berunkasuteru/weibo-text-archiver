@@ -88,7 +88,7 @@ def _range_filename_label(archive: Archive) -> str:
         end = archive.report.newest_reached or archive.fetched_at
         return f"全量快照_截至{end:%Y%m%d}"
     if r.mode is RangeMode.TRIAL:
-        return f"试抓{r.limit or 50}条"
+        return f"测试导出{r.limit or 20}条"
     if r.mode is RangeMode.RECENT:
         return f"近{r.limit or len(archive.posts)}条"
     if r.mode is RangeMode.SINCE and r.since:

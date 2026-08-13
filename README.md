@@ -6,7 +6,7 @@ A local Windows tool for exporting Weibo posts into trustworthy Markdown archive
 
 - Exports Weibo posts to Markdown.
 - Provides Full Archive, AI Compact, and Custom export modes.
-- Supports full snapshots, recent-post limits, date-based ranges, and a 50-post trial.
+- Supports full snapshots, recent-post limits, date-based ranges, and a 20-post test export.
 - Retrieves long-text content through explicitly supported paths.
 - Marks narrowly proven unavailable content as incomplete instead of presenting a timeline preview as full text.
 - Reports archive integrity separately from pagination completion.
@@ -21,7 +21,7 @@ The application never treats a visible timeline preview as verified full text. I
 
 The Windows preview targets Windows 10/11 x64.
 
-For version 0.4.1, download the Windows ZIP from Releases, extract it, and run:
+For the packaged Windows preview, download the Windows ZIP from Releases, extract it, and run:
 
 ```text
 WeiboTextArchiver.exe
@@ -38,7 +38,7 @@ python -m weibo_archive.app
 ## Export modes
 
 - **Full Archive** preserves the complete supported Markdown record.
-- **AI Compact** keeps all post text in a denser, model-friendly structure.
+- **AI Compact** uses explicit attribution markers and compact metadata intended for LLM analysis.
 - **Custom** lets users choose selected metadata fields and date precision while retaining required archive text and dates.
 
 ## Privacy and security
@@ -63,7 +63,7 @@ python environment_check.py
 python tests/run_tests.py
 ```
 
-The current suite contains 47 offline regression checks.
+The current suite contains 48 offline regression checks.
 
 ## Build
 

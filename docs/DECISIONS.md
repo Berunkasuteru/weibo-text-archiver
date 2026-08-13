@@ -268,8 +268,6 @@ Chat histories are temporary and tool-specific.
 
 Long-lived collaboration should use:
 
-- `AGENTS.md` for agent rules
-- `PROJECT_STATE.md` for current status
 - `DECISIONS.md` for durable decisions
 - investigation documents for evidence
 - Git diff/commits for code history

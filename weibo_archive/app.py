@@ -30,7 +30,8 @@ from .tasking import TaskManager, TaskState
 
 
 APP_TITLE = "Weibo Text Archiver"
-APP_SUBTITLE = "微博文字备份 / AI Archive"
+APP_SUBTITLE = "微博文字导出 / AI Archive"
+TEST_EXPORT_LIMIT = 20
 DEFAULT_WINDOW_WIDTH = 860
 DEFAULT_COMPACT_HEIGHT = 760
 
@@ -225,7 +226,7 @@ class App(tk.Tk):
         ttk.Label(account, textvariable=self.login_var).pack(side="left")
         self.clear_login_btn = ttk.Button(
             account,
-            text="清除登录",
+            text="清除登录信息",
             style="Quiet.TButton",
             command=self.clear_login,
         )
@@ -365,7 +366,7 @@ class App(tk.Tk):
         actions.pack(fill="x", pady=(2, 10))
         self.trial_btn = ttk.Button(
             actions,
-            text="试抓 50 条",
+            text="测试导出",
             style="Quiet.TButton",
             command=lambda: self.start_export(trial=True),
         )
@@ -382,7 +383,7 @@ class App(tk.Tk):
 
         self.export_btn = ttk.Button(
             actions,
-            text="开始备份 →",
+            text="开始导出 →",
             style="Primary.TButton",
             command=lambda: self.start_export(trial=False),
         )
@@ -745,7 +746,7 @@ class App(tk.Tk):
                     self._set_running(False)
                     self._refresh_login_status()
                     self.status_var.set("Ready")
-                    self.progress_detail_var.set("登录成功，可以开始备份。")
+                    self.progress_detail_var.set("登录成功，可以开始导出。")
                     messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
 
                 elif kind == "done":
@@ -753,15 +754,15 @@ class App(tk.Tk):
                     self._set_running(False)
                     integrity = payload["integrity"]
                     if integrity.incomplete_records:
-                        self.status_var.set("Archive complete · integrity warning")
+                        self.status_var.set("Export complete · integrity warning")
                         self.progress_detail_var.set(
-                            "备份已完成；"
+                            "导出已完成；"
                             f"其中 {integrity.incomplete_records:,} 条记录"
                             "含无法验证的历史内容。"
                         )
                     else:
-                        self.status_var.set("Archive complete")
-                        self.progress_detail_var.set("本次备份已完成并写入 Markdown。")
+                        self.status_var.set("Export complete")
+                        self.progress_detail_var.set("本次导出已完成并写入 Markdown。")
                     self._show_completion(payload)
                     self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
 
@@ -895,7 +896,7 @@ class App(tk.Tk):
         self._set_running(True)
         self.status_var.set("Authenticating")
         self.progress_detail_var.set("正在连接微博 Passport…")
-        self._append_log("\n=== V7 QR AUTH ===\n")
+        self._append_log("\n=== WEIBO TEXT ARCHIVER QR AUTH ===\n")
 
         self.worker = threading.Thread(
             target=self._login_worker,
@@ -936,7 +937,7 @@ class App(tk.Tk):
             terminal_sent = True
 
         except Exception as exc:
-            detail = save_detailed_error("V7 扫码登录", exc)
+            detail = save_detailed_error("扫码登录", exc)
             friendly = "微博扫码登录没有完成。\n\n" + redact_text(exc)
             self._emit(generation, "error", (friendly, detail))
             terminal_sent = True
@@ -944,12 +945,12 @@ class App(tk.Tk):
         finally:
             if not terminal_sent and self.tasks.accepts(generation):
                 exc = RuntimeError("登录任务异常结束，未产生终态。")
-                detail = save_detailed_error("V7 登录终态保护", exc)
+                detail = save_detailed_error("登录终态保护", exc)
                 self._emit(generation, "error", (str(exc), detail))
 
     def clear_login(self):
         if not messagebox.askyesno(
-            "清除登录",
+            "清除登录信息",
             "删除本工具保存的微博登录状态？\n\n不会影响手机微博或浏览器登录。",
         ):
             return
@@ -966,7 +967,7 @@ class App(tk.Tk):
 
     def _selected_range(self, trial: bool) -> FetchRange:
         if trial:
-            return FetchRange.trial(50)
+            return FetchRange.trial(TEST_EXPORT_LIMIT)
 
         mode = RangeMode(self.range_mode_var.get())
         if mode is RangeMode.ALL:
@@ -1014,7 +1015,7 @@ class App(tk.Tk):
             return
 
         if not COOKIE_FILE.exists():
-            messagebox.showwarning("需要登录", "V7 不再匿名尝试抓取。请先扫码登录。")
+            messagebox.showwarning("需要登录", "本工具不再匿名尝试抓取。请先扫码登录。")
             return
 
         try:
@@ -1040,10 +1041,10 @@ class App(tk.Tk):
         self._set_running(True)
         self.status_var.set("Fetching")
         self.progress_detail_var.set(
-            f"{fetch_range.label()} · 正在启动 V7 独立抓取核心…"
+            f"{fetch_range.label()} · 正在启动独立抓取核心…"
         )
         self._append_log(
-            f"\n=== V7 ARCHIVE · UID {uid} · {fetch_range.label()} ===\n"
+            f"\n=== WEIBO TEXT ARCHIVER · UID {uid} · {fetch_range.label()} ===\n"
         )
 
         self.worker = threading.Thread(
@@ -1126,20 +1127,20 @@ class App(tk.Tk):
             terminal_sent = True
 
         except RateLimited as exc:
-            detail = save_detailed_error("V7 微博访问限制", exc)
+            detail = save_detailed_error("微博访问限制", exc)
             self._emit(
                 generation,
                 "error",
                 (
                     str(exc)
-                    + "\n\nV7 不会在这种情况下生成“看起来完整”的备份。",
+                    + "\n\n本工具不会在这种情况下生成“看起来完整”的导出文件。",
                     detail,
                 ),
             )
             terminal_sent = True
 
         except NetworkError as exc:
-            detail = save_detailed_error("V7 网络请求", exc)
+            detail = save_detailed_error("网络请求", exc)
             self._emit(
                 generation,
                 "error",
@@ -1148,18 +1149,18 @@ class App(tk.Tk):
             terminal_sent = True
 
         except Exception as exc:
-            detail = save_detailed_error("V7 导出", exc)
+            detail = save_detailed_error("导出", exc)
             self._emit(
                 generation,
                 "error",
-                ("V7 导出没有完成。\n\n" + redact_text(exc), detail),
+                ("导出没有完成。\n\n" + redact_text(exc), detail),
             )
             terminal_sent = True
 
         finally:
             if not terminal_sent and self.tasks.accepts(generation):
                 exc = RuntimeError("导出任务异常结束，未产生终态。")
-                detail = save_detailed_error("V7 导出终态保护", exc)
+                detail = save_detailed_error("导出终态保护", exc)
                 self._emit(generation, "error", (str(exc), detail))
 
     def stop_current(self):
@@ -1224,7 +1225,7 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         win.withdraw()
-        win.title("备份完成")
+        win.title("导出完成")
         win.transient(self)
         win.resizable(False, False)
 
@@ -1233,9 +1234,9 @@ class App(tk.Tk):
         ttk.Label(
             body,
             text=(
-                "✓ 备份完成（含完整性提醒）"
+                "✓ 导出完成（含完整性提醒）"
                 if integrity.incomplete_records
-                else "✓ 备份完成"
+                else "✓ 导出完成"
             ),
             font=("Microsoft YaHei UI", 15, "bold"),
         ).pack(anchor="w")
