@@ -1,0 +1,27 @@
+{
+  "ok": 1,
+  "data": {
+    "cards": [
+      {
+        "card_group": [
+          {
+            "item_name": "所在地",
+            "item_content": "北京"
+          },
+          {
+            "item_name": "注册时间",
+            "item_content": "2020-01-02"
+          },
+          {
+            "item_name": "大学",
+            "item_content": "测试大学"
+          },
+          {
+            "item_name": "公司",
+            "item_content": "测试公司"
+          }
+        ]
+      }
+    ]
+  }
+}

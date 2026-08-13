@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build / packaging
+build/
+dist/
+*.spec
+*.exe
+*.msi
+
+# Test / coverage caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local AI tool settings
+.claude/settings.local.json
+
+# Local runtime data
+cookie.txt
+*.cookie
+last_error.txt
+environment_check.txt
+_json_cache/
+cache/
+runtime/
+temp/
+tmp/
+
+# Weibo exporter local/generated data
+_weibo_crawler/
+browser_profile/
+browser_path.txt
+*.log
+
+# User export backups
+*.md.bak
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Never commit secrets
+*.pem
+*.pfx
+*.p12
+*.key
+# Public repository local secrets and runtime artifacts
+.env
+.env.*
+!.env.example
+.claude/
+cookie*.txt
+cookies*.json
+credentials*.json
+v7_cache/
+last_success.json
+last_success.json.tmp
+*.tmp
+*.bak
+*.har
+*.sqlite
+*.sqlite3
+*.db
+*.pickle
+*.pkl
+/微博文字备份/
+/exports/

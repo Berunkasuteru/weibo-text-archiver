@@ -1,0 +1,20 @@
+﻿第三方组件与接口说明
+====================
+
+随包分发的第三方代码：
+
+1. python-qrcode
+   用途：把微博 Passport 返回的扫码 URL 编码成二维码矩阵。
+   许可证：
+   THIRD_PARTY_LICENSES/python-qrcode_LICENSE.txt
+
+V7 Alpha 1 不再随运行流程下载或执行 dataabc/weibo-crawler。
+weibo_archive/ 目录中没有打包 weibo-crawler 源码。
+
+V7 的接口兼容工作参考了公开可见的微博移动端接口行为和开源项目中
+已经验证过的字段/端点使用方式，但 V7 的网络层、parser、模型层和任务编排
+均在本项目中独立实现。
+
+微博网页/移动端接口不是本工具控制的公开稳定 API，未来可能变化。
+因此 V7 把 parser contract tests 与 Markdown golden tests 分开：
+接口变化时优先修改 client/parser，不让 exporter 跟着漂移。
