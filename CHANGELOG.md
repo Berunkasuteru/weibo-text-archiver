@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.0-beta.2
 
 - Preserve source timestamp offsets without exporter-machine conversion and mark offset-free or relative timestamp provenance explicitly.
 - Keep missing engagement counts distinct from explicit zero in Full Archive and AI 分析版 output.
