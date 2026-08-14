@@ -517,26 +517,11 @@ def build_ai_markdown(
         format_parts.append("R=转发 C=评论 L=点赞")
     out.append("格式：" + "；".join(format_parts) + "。")
     out.append(
-        "STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/presence "
-        "of a structural nested RT, not character-level authorship."
-    )
-    out.append(
         "ATTRIBUTION: RT is a nested repost-source record attributed to its recorded author "
         "metadata; SELF requires exact non-empty UID equality. W may contain preserved quoted text."
     )
     out.append(
         "TEXT_CHAIN: //@ text is preserved but unparsed and cannot verify identity or attribution."
-    )
-    out.append(
-        "P: Weibo-displayed publication-location metadata for its containing record; P alone "
-        "does not prove event location, residence, a specific visit, or timezone."
-    )
-    out.append(
-        "TIME: known source offset is preserved; no offset means timezone provenance is unknown; "
-        "TIME is not necessarily the target account's local civil time."
-    )
-    out.append(
-        "ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero."
     )
     out.append(
         "MEDIA: I/V/A belong to their containing record; referenced media is not included, "
@@ -545,6 +530,25 @@ def build_ai_markdown(
     out.append(
         "CONTENT: PREVIEW_ONLY is INCOMPLETE and not full text; TEXT=EMPTY is a verified "
         "complete empty body, not unavailable content."
+    )
+    out.append(
+        "TIME: known source offset is preserved; no offset means timezone provenance is unknown; "
+        "TIME is not necessarily the target account's local civil time."
+    )
+    out.append(
+        "P: Weibo-displayed publication-location metadata for its containing record; P alone "
+        "does not prove event location, residence, a specific visit, or timezone."
+    )
+    out.append(
+        "STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/presence "
+        "of a structural nested RT, not character-level authorship."
+    )
+    out.append(
+        "ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero."
+    )
+    out.append(
+        "ABSENT: Missing I/V/A means canonical zero/false. Missing S/P means unavailable or "
+        "not emitted by this export configuration, not \"no source/location\"."
     )
     out.append("SOURCE_IDS=file-local: S* and RT* identifiers apply only within this file.")
     out.append(

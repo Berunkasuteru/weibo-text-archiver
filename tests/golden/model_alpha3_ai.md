@@ -7,14 +7,15 @@ FORMAT=WEIBO_AI_1
 资料：UID=1234567890｜粉丝=321｜关注=45｜微博=3｜所在地=北京
 摘要：共3条｜原创2｜转发1｜范围=2026-08-11 06:24~2026-08-13 00:10｜含图1条/3图｜唯一转发原文1｜重复原文省略0次
 格式：W=顶层记录；RT*=转发原文编号；S*=发布来源；P=发布位置；I=图片数 V=视频媒体数 A=头条文章；R=转发 C=评论 L=点赞。
-STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/presence of a structural nested RT, not character-level authorship.
 ATTRIBUTION: RT is a nested repost-source record attributed to its recorded author metadata; SELF requires exact non-empty UID equality. W may contain preserved quoted text.
 TEXT_CHAIN: //@ text is preserved but unparsed and cannot verify identity or attribution.
-P: Weibo-displayed publication-location metadata for its containing record; P alone does not prove event location, residence, a specific visit, or timezone.
-TIME: known source offset is preserved; no offset means timezone provenance is unknown; TIME is not necessarily the target account's local civil time.
-ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero.
 MEDIA: I/V/A belong to their containing record; referenced media is not included, so text may not be complete context.
 CONTENT: PREVIEW_ONLY is INCOMPLETE and not full text; TEXT=EMPTY is a verified complete empty body, not unavailable content.
+TIME: known source offset is preserved; no offset means timezone provenance is unknown; TIME is not necessarily the target account's local civil time.
+P: Weibo-displayed publication-location metadata for its containing record; P alone does not prove event location, residence, a specific visit, or timezone.
+STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/presence of a structural nested RT, not character-level authorship.
+ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero.
+ABSENT: Missing I/V/A means canonical zero/false. Missing S/P means unavailable or not emitted by this export configuration, not "no source/location".
 SOURCE_IDS=file-local: S* and RT* identifiers apply only within this file.
 REFERENCE: RT* emits one repost source; =RT* is an explicit lossless file-local reference to that already emitted source.
 AGGREGATES: total/original/repost/range/media describe top-level W records; unique/duplicate RT counts describe nested RT identities.

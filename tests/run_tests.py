@@ -1139,8 +1139,30 @@ def test_ai_compact_attribution_and_field_schema():
     assert "referenced media is not included" in text
     assert "PREVIEW_ONLY is INCOMPLETE and not full text" in text
     assert "TEXT=EMPTY is a verified complete empty body" in text
+    assert (
+        'ABSENT: Missing I/V/A means canonical zero/false. Missing S/P means unavailable or '
+        'not emitted by this export configuration, not "no source/location".'
+    ) in text
     assert "SOURCE_IDS=file-local" in text
     assert "=RT* is an explicit lossless file-local reference" in text
+    rule_order = [
+        "ATTRIBUTION:",
+        "TEXT_CHAIN:",
+        "MEDIA:",
+        "CONTENT:",
+        "TIME:",
+        "P:",
+        "STRUCTURE:",
+        "ENGAGEMENT:",
+        "ABSENT:",
+        "SOURCE_IDS=",
+        "REFERENCE:",
+        "AGGREGATES:",
+    ]
+    assert [text.index(f"\n{rule}") for rule in rule_order] == sorted(
+        text.index(f"\n{rule}") for rule in rule_order
+    )
+    assert "TIME_TZ=" not in text
     assert "来源字典：S1=" in text
     assert "来源3种" not in text
     assert "客户端(" not in text
@@ -1241,6 +1263,9 @@ def test_semantic_time_provenance_and_presentation_contract():
     assert "日期：2026-08-10 12:00+08:00" in full
     assert "[W｜2026-08-13 00:10+08:00｜" in ai
     assert "2026-08-10 12:00+08:00" in ai
+    rules_start = ai.index("ATTRIBUTION:")
+    rules_end = ai.index("\n", ai.index("AGGREGATES:"))
+    assert "+08:00" not in ai[rules_start:rules_end]
 
     nonlocal_source = "Thu Aug 13 00:10:00 -1000 2026"
     nonlocal_time, provenance = parse_created_at_fact(nonlocal_source)
