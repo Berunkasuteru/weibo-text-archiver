@@ -701,7 +701,8 @@ class App(tk.Tk):
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(18, 0))
-        ttk.Button(actions, text="取消", command=win.destroy).pack(side="right")
+        for column in range(2):
+            actions.columnconfigure(column, weight=1, uniform="custom_actions")
 
         def save():
             def optional_date(raw: str, label: str) -> date | None:
@@ -743,7 +744,18 @@ class App(tk.Tk):
             text="保存设置",
             style="Primary.TButton",
             command=save,
-        ).pack(side="right", padx=(0, 8))
+        ).grid(row=0, column=0, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="取消",
+            style="Primary.TButton",
+            command=win.destroy,
+        ).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=4,
+        )
         self._center_child_window(win)
         win.grab_set()
 
@@ -1422,21 +1434,34 @@ class App(tk.Tk):
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(18, 0))
-        ttk.Button(actions, text="关闭", command=win.destroy).pack(side="right")
-        ttk.Button(
-            actions,
-            text="打开导出文件夹",
-            command=lambda: launch(outputs[0]["path"].parent),
-        ).pack(side="right", padx=(0, 8))
-        for index, output in enumerate(reversed(outputs)):
+        action_count = len(outputs) + 2
+        for column in range(action_count):
+            actions.columnconfigure(column, weight=1, uniform="completion_actions")
+
+        for index, output in enumerate(outputs):
             path = output["path"]
             text = "打开文件" if len(outputs) == 1 else f"打开{output['label']}"
             ttk.Button(
                 actions,
                 text=text,
-                style="Primary.TButton" if index == 0 else "Quiet.TButton",
+                style=(
+                    "Primary.TButton"
+                    if index == len(outputs) - 1
+                    else "Quiet.TButton"
+                ),
                 command=lambda target=path: launch(target),
-            ).pack(side="right", padx=(0, 8))
+            ).grid(row=0, column=index, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="打开导出文件夹",
+            command=lambda: launch(outputs[0]["path"].parent),
+        ).grid(row=0, column=len(outputs), sticky="ew", padx=4)
+        ttk.Button(actions, text="关闭", command=win.destroy).grid(
+            row=0,
+            column=len(outputs) + 1,
+            sticky="ew",
+            padx=4,
+        )
         self._center_child_window(win)
 
     def _on_close(self):
