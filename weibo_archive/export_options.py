@@ -92,7 +92,7 @@ class ExportSelection:
         if self.preset is ExportPreset.FULL_ARCHIVE:
             return "完整归档"
         if self.preset is ExportPreset.AI_COMPACT:
-            return "AI Compact"
+            return "AI 分析版"
         return "自定义筛选"
 
 
@@ -127,10 +127,10 @@ def filename_suffix_for_selection(
         return "完整"
     if preset is ExportPreset.AI_COMPACT:
         if options != AI_COMPACT_OPTIONS:
-            raise ValueError("AI 精简预设与输出配置不一致。")
-        return "AI精简版"
+            raise ValueError("AI 分析版预设与输出配置不一致。")
+        return "AI分析版"
     if preset is ExportPreset.CUSTOM:
-        return "自定义_完整" if options.layout is ExportLayout.FULL else "自定义_AI精简"
+        return "自定义_完整" if options.layout is ExportLayout.FULL else "自定义_AI分析"
     raise ValueError("未知导出内容预设。")
 
 
@@ -258,7 +258,7 @@ def filter_report_notice(report: CustomFilterReport) -> str:
 
 
 def options_summary(options: ExportOptions) -> str:
-    layout = "完整排版" if options.layout is ExportLayout.FULL else "AI 精简排版"
+    layout = "完整排版" if options.layout is ExportLayout.FULL else "AI 分析排版"
     included = []
     if options.include_source:
         included.append("来源")
@@ -274,7 +274,7 @@ def options_summary(options: ExportOptions) -> str:
 
 
 def options_provenance(options: ExportOptions) -> str:
-    layout = "完整" if options.layout is ExportLayout.FULL else "AI精简"
+    layout = "完整" if options.layout is ExportLayout.FULL else "AI分析"
     source = "包含" if options.include_source else "省略"
     location = "包含" if options.include_location else "省略"
     engagement = "包含" if options.include_engagement else "省略"

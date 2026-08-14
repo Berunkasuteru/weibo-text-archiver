@@ -1,7 +1,7 @@
-# 测试用户｜AI精简版
+# 测试用户｜AI 分析版
 FORMAT=WEIBO_AI_1
 导出：测试导出20条｜终止=达到指定条数｜快照（导出机器本地）=2026-08-13 02:00
-输出配置：排版=AI精简｜来源/设备=包含｜发布位置=包含｜转评赞=包含｜日期=YYYY-MM-DD HH:mm
+输出配置：排版=AI分析｜来源/设备=包含｜发布位置=包含｜转评赞=包含｜日期=YYYY-MM-DD HH:mm
 完整性：TOTAL=3｜COMPLETE_RECORDS=1｜INCOMPLETE_RECORDS=2｜TOP_INCOMPLETE=1｜RETWEET_INCOMPLETE=1
 
 简介：V7 模型→渲染器回归样本

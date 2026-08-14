@@ -5,7 +5,7 @@ A local Windows tool for exporting Weibo posts into trustworthy Markdown archive
 ## What it does
 
 - Exports Weibo posts to Markdown.
-- Generates any combination of Full Archive, AI Compact, and Custom outputs from one fetch.
+- Generates any combination of Full Archive, AI 分析版, and Custom outputs from one fetch.
 - Supports full snapshots, recent-post limits, date-based ranges, and a 20-post test export.
 - Retrieves long-text content through explicitly supported paths.
 - Marks narrowly proven unavailable content as incomplete instead of presenting a timeline preview as full text.
@@ -50,7 +50,7 @@ python -m weibo_archive.app
 ## Export modes
 
 - **Full Archive** preserves the complete supported Markdown record.
-- **AI Compact** uses explicit attribution markers and compact metadata intended for LLM analysis.
+- **AI 分析版** preserves the same verified body facts as Full Archive while strengthening structure, deduplication, and semantic labels for AI analysis.
 - **Custom** lets users choose selected metadata fields and date precision, then locally filter the fetched records by original/repost type, keyword, and an optional inclusive date slice.
 
 Custom keywords are case-insensitive for ASCII and use substring matching. Multiple keywords use OR; type, keyword, and date categories combine with AND. Searchable text includes the target account's available text and available repost-source text. An incomplete preview may help select a record, but remains explicitly unverified and never becomes complete.

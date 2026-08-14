@@ -341,7 +341,12 @@ def test_windows_preview_packaging_contract():
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# Weibo Text Archiver\n")
-    assert not any("\u4e00" <= character <= "\u9fff" for character in readme)
+    assert "AI 分析版" in readme
+    readme_without_mode_name = readme.replace("AI 分析版", "")
+    assert not any(
+        "\u4e00" <= character <= "\u9fff"
+        for character in readme_without_mode_name
+    )
     assert not (ROOT / "README_先看.txt").exists()
     assert not (ROOT / "docs" / "ROADMAP.md").exists()
     assert not (ROOT / "启动微博文字导出器.bat").exists()
@@ -1027,7 +1032,7 @@ def test_alpha3_exporter_goldens_and_single_output():
         ),
         (
             AI_COMPACT_OPTIONS,
-            "AI精简版",
+            "AI分析版",
             "model_alpha3_ai.md",
         ),
         (
@@ -1066,7 +1071,7 @@ def test_alpha4_incomplete_full_and_ai_goldens():
     archive = build_alpha4_archive()
     cases = (
         (FULL_ARCHIVE_OPTIONS, "完整", "model_alpha4_incomplete_full.md"),
-        (AI_COMPACT_OPTIONS, "AI精简版", "model_alpha4_incomplete_ai.md"),
+        (AI_COMPACT_OPTIONS, "AI分析版", "model_alpha4_incomplete_ai.md"),
     )
     with tempfile.TemporaryDirectory(prefix="weibo_v7_alpha4_export_") as td:
         output_dir = Path(td)
@@ -1669,7 +1674,7 @@ def test_export_options_resolution_and_snapshot():
     assert filename_suffix_for_selection(
         ExportPreset.AI_COMPACT,
         AI_COMPACT_OPTIONS,
-    ) == "AI精简版"
+    ) == "AI分析版"
 
     custom = ExportOptions(
         layout=ExportLayout.AI,
@@ -1680,7 +1685,7 @@ def test_export_options_resolution_and_snapshot():
     )
     snapshot = options_for_preset(ExportPreset.CUSTOM, custom)
     assert snapshot is custom
-    assert filename_suffix_for_selection(ExportPreset.CUSTOM, snapshot) == "自定义_AI精简"
+    assert filename_suffix_for_selection(ExportPreset.CUSTOM, snapshot) == "自定义_AI分析"
     assert "preset" not in {field.name for field in fields(ExportOptions)}
 
     try:
@@ -1962,12 +1967,12 @@ def test_multi_output_fetch_once_and_isolation():
 
             fetch_calls, _, rendered, result = run(
                 two_outputs,
-                failing_suffix="AI精简版",
+                failing_suffix="AI分析版",
             )
             assert len(fetch_calls) == 1
             assert len(rendered) == 1
             assert [item["label"] for item in result["outputs"]] == ["完整归档"]
-            assert [item["label"] for item in result["failures"]] == ["AI Compact"]
+            assert [item["label"] for item in result["failures"]] == ["AI 分析版"]
     finally:
         (
             app_module.COOKIE_FILE,

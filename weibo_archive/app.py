@@ -326,7 +326,7 @@ class App(tk.Tk):
         self.output_buttons = []
         for text, variable in (
             ("完整归档（推荐）", self.full_output_var),
-            ("AI Compact", self.ai_output_var),
+            ("AI 分析版", self.ai_output_var),
             ("自定义导出", self.custom_output_var),
         ):
             button = ttk.Checkbutton(
@@ -565,7 +565,7 @@ class App(tk.Tk):
         if self.full_output_var.get():
             selected.append("完整归档")
         if self.ai_output_var.get():
-            selected.append("AI Compact")
+            selected.append("AI 分析版")
         if self.custom_output_var.get():
             selected.append(
                 "自定义："
@@ -622,7 +622,7 @@ class App(tk.Tk):
         ).pack(side="left")
         ttk.Radiobutton(
             layout_row,
-            text="AI 精简",
+            text="AI 分析版",
             variable=layout_var,
             value=ExportLayout.AI.value,
         ).pack(side="left", padx=(18, 0))

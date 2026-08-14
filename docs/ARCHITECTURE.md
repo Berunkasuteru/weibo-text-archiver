@@ -145,7 +145,7 @@ Alpha 1 暂未完成：
 Alpha 3 的边界是 UX polish：
 
 - frozen `ExportOptions` 是单个导出任务的展示策略快照；
-- 完整归档、AI 精简、自定义一次只生成一个主 Markdown；
+- 完整归档、AI 分析版、自定义一次只生成一个主 Markdown；
 - legacy/default renderer 调用仍保持 Alpha2/V5 golden 不变；
 - 完成窗口只在用户点击后调用 Windows 打开能力；
 - 不改变抓取、长微博、分页、认证或任务 generation 语义。

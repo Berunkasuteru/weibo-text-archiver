@@ -12,9 +12,9 @@ from .models import Archive, ContentState, Post, RangeMode, Termination
 
 _ALLOWED_FILENAME_SUFFIXES = {
     "完整",
-    "AI精简版",
+    "AI分析版",
     "自定义_完整",
-    "自定义_AI精简",
+    "自定义_AI分析",
 }
 
 

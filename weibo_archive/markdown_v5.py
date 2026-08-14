@@ -405,7 +405,7 @@ def build_ai_markdown(
     options: ExportOptions | None = None,
 ) -> tuple[str, str, dict]:
     """
-    生成 AI 精简版：
+    生成 AI 分析版：
     - 用户资料只出现一次
     - 时间去秒
     - 发布来源字典化
@@ -455,7 +455,7 @@ def build_ai_markdown(
             unique_retweets += 1
 
     out = []
-    out.append(f"# {username}｜AI精简版")
+    out.append(f"# {username}｜AI 分析版")
     out.append("FORMAT=WEIBO_AI_1")
     out.append("")
 
