@@ -100,7 +100,10 @@ content_state = INCOMPLETE
 顶层微博与转发原文分别拥有状态。其他网络、认证、schema、ID mismatch
 或混合失败仍然 fail closed，绝不能把列表页预览当完整正文。
 
-normalized cache 从 Alpha4 起带 `schema_version: 1`。无版本旧缓存属于
+normalized cache 从 0.5.0 起写入 `schema_version: 2`，保存 source timestamp
+provenance、已知 UTC offset 和 optional author UID。版本 1 已经丢失 source
+offset 与 author UID，未来不得静默按版本 2 语义读取。当前应用只写 cache，
+不从 cache 恢复 Archive；本次不迁移或删除旧文件。无版本旧缓存仍属于
 legacy/unversioned，未来不得静默当作可信 mother archive 读取。
 
 ## Runtime dependency policy

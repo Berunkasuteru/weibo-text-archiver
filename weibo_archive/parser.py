@@ -11,7 +11,9 @@ from .models import (
     IncompleteReason,
     MediaInfo,
     Post,
+    TimestampProvenance,
     UserProfile,
+    normalize_optional_uid,
 )
 
 
@@ -40,42 +42,59 @@ def parse_count(value: Any) -> Optional[int]:
         return None
 
 
-def parse_created_at(value: Any, now: Optional[datetime] = None) -> Optional[datetime]:
+def parse_created_at_fact(
+    value: Any,
+    now: Optional[datetime] = None,
+) -> tuple[Optional[datetime], TimestampProvenance]:
     if value is None:
-        return None
+        return None, TimestampProvenance.UNKNOWN
     s = str(value).strip()
     if not s:
-        return None
-    now = now or datetime.now()
+        return None, TimestampProvenance.UNKNOWN
 
     try:
         dt = parsedate_to_datetime(s)
-        if dt.tzinfo is not None:
-            dt = dt.astimezone().replace(tzinfo=None)
-        return dt
+        provenance = (
+            TimestampProvenance.SOURCE_OFFSET
+            if dt.utcoffset() is not None
+            else TimestampProvenance.SOURCE_WALL
+        )
+        return dt, provenance
     except Exception:
         pass
 
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
-            return datetime.strptime(s, fmt)
+            return datetime.strptime(s, fmt), TimestampProvenance.SOURCE_WALL
         except ValueError:
             pass
 
+    now = now or datetime.now()
+    if now.utcoffset() is not None:
+        # The raw relative value did not provide an offset. Keep only the supplied
+        # wall clock and mark the result as unverified rather than inventing one.
+        now = now.replace(tzinfo=None)
+
     if "刚刚" in s:
-        return now
+        return now, TimestampProvenance.RELATIVE_UNVERIFIED
 
     if "分钟" in s:
         try:
-            return now - timedelta(minutes=int(s.split("分钟", 1)[0]))
+            return (
+                now - timedelta(minutes=int(s.split("分钟", 1)[0])),
+                TimestampProvenance.RELATIVE_UNVERIFIED,
+            )
         except ValueError:
-            return None
+            return None, TimestampProvenance.UNKNOWN
 
     if "小时" in s:
         try:
-            return now - timedelta(hours=int(s.split("小时", 1)[0]))
+            return (
+                now - timedelta(hours=int(s.split("小时", 1)[0])),
+                TimestampProvenance.RELATIVE_UNVERIFIED,
+            )
         except ValueError:
-            return None
+            return None, TimestampProvenance.UNKNOWN
 
     if s.startswith("昨天"):
         clock = s.replace("昨天", "").strip()
@@ -83,12 +102,21 @@ def parse_created_at(value: Any, now: Optional[datetime] = None) -> Optional[dat
         if clock:
             try:
                 h, m = clock.split(":", 1)
-                return base.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+                return (
+                    base.replace(
+                        hour=int(h), minute=int(m), second=0, microsecond=0
+                    ),
+                    TimestampProvenance.RELATIVE_UNVERIFIED,
+                )
             except Exception:
                 pass
-        return base
+        return base, TimestampProvenance.RELATIVE_UNVERIFIED
 
-    return None
+    return None, TimestampProvenance.UNKNOWN
+
+
+def parse_created_at(value: Any, now: Optional[datetime] = None) -> Optional[datetime]:
+    return parse_created_at_fact(value, now)[0]
 
 
 def _media_info(raw: dict, article_from_text: bool) -> MediaInfo:
@@ -143,6 +171,8 @@ def parse_post(
 
     user = raw.get("user") or {}
     author = str(user.get("screen_name") or "") if isinstance(user, dict) else ""
+    raw_author_id = user.get("id") if isinstance(user, dict) else None
+    author_id = normalize_optional_uid(raw_author_id)
 
     location = str(
         raw.get("region_name")
@@ -163,15 +193,18 @@ def parse_post(
         )
 
     edit_count = parse_count(raw.get("edit_count")) or 0
+    created_at, created_at_provenance = parse_created_at_fact(raw.get("created_at"))
 
     return Post(
         id=str(raw.get("id") or raw.get("mid") or ""),
         bid=str(raw.get("bid") or ""),
-        created_at=parse_created_at(raw.get("created_at")),
+        created_at=created_at,
+        created_at_provenance=created_at_provenance,
         text=None if incomplete_reason is not None else visible_text,
         source=strip_html(raw.get("source") or ""),
         location=location,
         author=author,
+        author_id=author_id,
         engagement=Engagement(
             reposts=parse_count(raw.get("reposts_count")),
             comments=parse_count(raw.get("comments_count")),

@@ -30,7 +30,7 @@ def save_normalized_archive(archive: Archive) -> Path:
     temp = folder / "last_success.json.tmp"
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         **asdict(archive),
         "integrity": asdict(archive.integrity),
     }

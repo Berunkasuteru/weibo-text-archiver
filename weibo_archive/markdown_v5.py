@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 from .export_options import DateFormat, ExportLayout, ExportOptions
+from .models import normalize_optional_uid
 
 # Frozen V5-compatible renderer.
 # V7 deliberately keeps this rendering surface stable while replacing the crawler beneath it.
@@ -38,8 +40,67 @@ def display_time(item: dict) -> str:
     return value
 
 
+def _display_datetime(item: dict) -> datetime | None:
+    value = display_time(item)
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _offset_text(value: datetime) -> str:
+    raw = value.strftime("%z")
+    return f"{raw[:3]}:{raw[3:]}" if raw else ""
+
+
+def _render_time(
+    item: dict,
+    *,
+    date_only: bool,
+    ai_layout: bool,
+) -> str:
+    value = display_time(item)
+    if not value:
+        return "时间未知"
+
+    parsed = _display_datetime(item)
+    provenance = str(item.get("created_at_provenance") or "")
+    if parsed is None:
+        rendered = value
+    elif date_only:
+        rendered = parsed.strftime("%Y-%m-%d")
+        if provenance == "source_offset":
+            offset = _offset_text(parsed)
+            if offset:
+                rendered += (
+                    f" TZ={offset}"
+                    if ai_layout
+                    else f"（来源偏移 {offset}）"
+                )
+    else:
+        rendered = parsed.isoformat(sep=" ", timespec="minutes")
+
+    if provenance == "relative_unverified":
+        rendered += (
+            " TIME_BASIS=RELATIVE_UNVERIFIED"
+            if ai_layout
+            else "（由相对时间解析；时区依据未验证）"
+        )
+    return rendered
+
+
 def sort_key(item: dict):
-    # 微博数字 id 基本按时间递增；拿不到时退回时间字符串
+    parsed = _display_datetime(item)
+    if parsed is not None:
+        wall = parsed.replace(tzinfo=None) if parsed.utcoffset() is not None else parsed
+        try:
+            identity = (1, int(item.get("id", 0)))
+        except (TypeError, ValueError):
+            identity = (0, str(item.get("id") or item.get("bid") or ""))
+        return (2, wall, identity)
+
     try:
         return (1, int(item.get("id", 0)))
     except (TypeError, ValueError):
@@ -57,14 +118,14 @@ def safe_filename(name: str) -> str:
     return name or "微博用户"
 
 
-def safe_count(value) -> str:
+def safe_count(value, *, unknown: str = "未知") -> str:
     """把转发/评论/点赞数统一转成适合 Markdown 显示的文本。"""
     if value is None or value == "":
-        return "0"
+        return unknown
     try:
         return str(int(value))
     except (TypeError, ValueError):
-        return str(value).strip() or "0"
+        return str(value).strip() or unknown
 
 
 def engagement_line(item: dict) -> str:
@@ -112,38 +173,17 @@ def post_meta_line(item: dict, options: ExportOptions | None = None) -> str:
 
 
 def compact_time(item: dict) -> str:
-    """AI 版时间保留到分钟，去掉秒；无法识别的格式原样保留。"""
-    value = display_time(item)
-    if not value:
-        return "时间未知"
-
-    # 常见格式：2026-08-12 18:30:25 / 2026-08-12T18:30:25
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?", value)
-    if m:
-        return f"{m.group(1)} {m.group(2)}"
-
-    # 某些情况下可能已经只有分钟
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})", value)
-    if m:
-        return f"{m.group(1)} {m.group(2)}"
-
-    return value
+    """AI timestamp: source wall clock to minutes, preserving a known offset."""
+    return _render_time(item, date_only=False, ai_layout=True)
 
 
 def option_time(item: dict, options: ExportOptions) -> str:
     """Render a post timestamp without changing its model value or sort key."""
-    value = display_time(item)
-    if not value:
-        return "时间未知"
-
-    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[ T](\d{2}:\d{2})(?::\d{2})?)?", value)
-    if not match:
-        return value
-    if options.date_format is DateFormat.DATE_ONLY:
-        return match.group(1)
-    if match.group(2):
-        return f"{match.group(1)} {match.group(2)}"
-    return match.group(1)
+    return _render_time(
+        item,
+        date_only=options.date_format is DateFormat.DATE_ONLY,
+        ai_layout=options.layout is ExportLayout.AI,
+    )
 
 
 def count_media_values(value, separator=None) -> int:
@@ -257,9 +297,9 @@ def media_summary(items: list[dict]) -> dict:
 def compact_engagement(item: dict) -> str:
     """AI 版互动数字：R=转发 C=评论 L=点赞。"""
     return (
-        f"R{safe_count(item.get('reposts_count'))} "
-        f"C{safe_count(item.get('comments_count'))} "
-        f"L{safe_count(item.get('attitudes_count'))}"
+        f"R={safe_count(item.get('reposts_count'), unknown='UNKNOWN')} "
+        f"C={safe_count(item.get('comments_count'), unknown='UNKNOWN')} "
+        f"L={safe_count(item.get('attitudes_count'), unknown='UNKNOWN')}"
     )
 
 
@@ -287,12 +327,12 @@ def build_source_dictionary(
     items: list[dict],
     *,
     include_retweets: bool = False,
-) -> tuple[dict[str, str], list[tuple[str, str, int]]]:
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
     """
     高频来源优先分配短代码 S1/S2...
     返回：
       source_to_code: {"iPhone客户端": "S1", ...}
-      rows: [("S1", "iPhone客户端", 123), ...]
+      rows: [("S1", "iPhone客户端"), ...]
     """
     counts = {}
     first_seen = {}
@@ -315,7 +355,7 @@ def build_source_dictionary(
     for i, source in enumerate(ordered, start=1):
         code = f"S{i}"
         source_to_code[source] = code
-        rows.append((code, source, counts[source]))
+        rows.append((code, source))
 
     return source_to_code, rows
 
@@ -334,6 +374,16 @@ def retweet_key(retweet: dict) -> str:
     author = normalize_text(retweet.get("screen_name"))
     body = normalize_text(retweet.get("text"))
     return f"text:{author}\n{body}"
+
+
+def is_verified_self_retweet(retweet: dict, target_uid: str) -> bool:
+    author_id = normalize_optional_uid(retweet.get("author_id"))
+    normalized_target = normalize_optional_uid(target_uid)
+    return bool(
+        author_id is not None
+        and normalized_target is not None
+        and author_id == normalized_target
+    )
 
 
 def get_date_range(
@@ -397,9 +447,6 @@ def build_ai_markdown(
         rt = item.get("retweet")
         if not isinstance(rt, dict):
             continue
-        rt_text = normalize_text(rt.get("text"))
-        if not rt_text and not is_incomplete(rt):
-            continue
         key = retweet_key(rt)
         if key in seen_keys:
             duplicate_retweets += 1
@@ -409,6 +456,7 @@ def build_ai_markdown(
 
     out = []
     out.append(f"# {username}｜AI精简版")
+    out.append("FORMAT=WEIBO_AI_1")
     out.append("")
 
     description = clean_profile_value(user.get("description"))
@@ -442,9 +490,6 @@ def build_ai_markdown(
     ]
     if oldest and newest:
         summary_parts.append(f"范围={oldest}~{newest}")
-    if options is None or options.include_source:
-        summary_parts.append(f"来源{len(source_rows)}种")
-
     if media_stats["posts_with_images"]:
         summary_parts.append(
             f"含图{media_stats['posts_with_images']}条/{media_stats['total_images']}图"
@@ -462,7 +507,7 @@ def build_ai_markdown(
     summary_parts.append(f"重复原文省略{duplicate_retweets}次")
     out.append("摘要：" + "｜".join(summary_parts))
 
-    format_parts = ["W=目标账号顶层正文", "RT*=转发原文编号"]
+    format_parts = ["W=顶层记录", "RT*=转发原文编号"]
     if options is None or options.include_source:
         format_parts.append("S*=发布来源")
     if options is None or options.include_location:
@@ -472,22 +517,49 @@ def build_ai_markdown(
         format_parts.append("R=转发 C=评论 L=点赞")
     out.append("格式：" + "；".join(format_parts) + "。")
     out.append(
-        "ATTRIBUTION: W = target account's top-level text; "
-        "RT = nested repost source and must not be directly attributed to the target account."
+        "STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/presence "
+        "of a structural nested RT, not character-level authorship."
     )
     out.append(
-        "MEDIA: I/V/A > 0 = referenced media exists but is not included; "
-        "text must not be treated as complete context."
+        "ATTRIBUTION: RT is a nested repost-source record attributed to its recorded author "
+        "metadata; SELF requires exact non-empty UID equality. W may contain preserved quoted text."
     )
-    out.append("REFERENCE: =RT* = reference to an already emitted repost source.")
     out.append(
-        "INCOMPLETE: PREVIEW_ONLY is an unverified timeline preview and must not be treated as full text."
+        "TEXT_CHAIN: //@ text is preserved but unparsed and cannot verify identity or attribution."
+    )
+    out.append(
+        "P: Weibo-displayed publication-location metadata for its containing record; P alone "
+        "does not prove event location, residence, a specific visit, or timezone."
+    )
+    out.append(
+        "TIME: known source offset is preserved; no offset means timezone provenance is unknown; "
+        "TIME is not necessarily the target account's local civil time."
+    )
+    out.append(
+        "ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero."
+    )
+    out.append(
+        "MEDIA: I/V/A belong to their containing record; referenced media is not included, "
+        "so text may not be complete context."
+    )
+    out.append(
+        "CONTENT: PREVIEW_ONLY is INCOMPLETE and not full text; TEXT=EMPTY is a verified "
+        "complete empty body, not unavailable content."
+    )
+    out.append("SOURCE_IDS=file-local: S* and RT* identifiers apply only within this file.")
+    out.append(
+        "REFERENCE: RT* emits one repost source; =RT* is an explicit lossless file-local "
+        "reference to that already emitted source."
+    )
+    out.append(
+        "AGGREGATES: total/original/repost/range/media describe top-level W records; "
+        "unique/duplicate RT counts describe nested RT identities."
     )
 
     if source_rows:
         source_text = "；".join(
-            f"{code}={source}({count})"
-            for code, source, count in source_rows
+            f"{code}={source}"
+            for code, source in source_rows
         )
         out.append("来源字典：" + source_text)
 
@@ -533,48 +605,51 @@ def build_ai_markdown(
             require_incomplete_id(rt)
             rt_incomplete = is_incomplete(rt)
             rt_text = normalize_text(rt.get("text"))
-            if rt_text or rt_incomplete:
-                key = retweet_key(rt)
-                rt_name = normalize_text(rt.get("screen_name"))
+            key = retweet_key(rt)
+            rt_name = normalize_text(rt.get("screen_name"))
 
-                if key not in rt_key_to_code:
-                    rt_counter += 1
-                    rt_code = f"RT{rt_counter}"
-                    rt_key_to_code[key] = rt_code
+            if key not in rt_key_to_code:
+                rt_counter += 1
+                rt_code = f"RT{rt_counter}"
+                rt_key_to_code[key] = rt_code
 
-                    rt_label_parts = [rt_code]
-                    if rt_name:
-                        rt_label_parts.append(f"@{rt_name}")
-                    if options is not None:
-                        rt_label_parts.append(option_time(rt, options))
-                        rt_source = normalize_text(rt.get("source"))
-                        rt_source_code = source_to_code.get(rt_source, "")
-                        if options.include_source and rt_source_code:
-                            rt_label_parts.append(rt_source_code)
-                        rt_location = normalize_text(rt.get("location"))
-                        if options.include_location and rt_location:
-                            rt_label_parts.append(f"P={rt_location}")
-                    rt_media = compact_media(rt)
-                    if rt_media:
-                        rt_label_parts.append(rt_media)
-                    if options is None or options.include_engagement:
-                        rt_label_parts.append(compact_engagement(rt))
-                    if rt_incomplete:
-                        rt_label_parts.append("CONTENT=INCOMPLETE")
-                    out.append(">" + "[" + "｜".join(rt_label_parts) + "]")
-                    if rt_incomplete:
-                        out.append(">[PREVIEW_ONLY｜全文无法验证]")
-                        preview = incomplete_preview(rt)
-                        out.append(
-                            quote_markdown(preview)
-                            if preview
-                            else "> 当前没有可保存的列表预览。"
-                        )
-                    else:
-                        out.append(quote_markdown(rt_text))
-                else:
-                    rt_code = rt_key_to_code[key]
-                    out.append(f">[={rt_code}]")
+                rt_label_parts = [rt_code]
+                if is_verified_self_retweet(rt, uid):
+                    rt_label_parts.append("SELF")
+                if rt_name:
+                    rt_label_parts.append(f"@{rt_name}")
+                if options is not None:
+                    rt_label_parts.append(option_time(rt, options))
+                    rt_source = normalize_text(rt.get("source"))
+                    rt_source_code = source_to_code.get(rt_source, "")
+                    if options.include_source and rt_source_code:
+                        rt_label_parts.append(rt_source_code)
+                    rt_location = normalize_text(rt.get("location"))
+                    if options.include_location and rt_location:
+                        rt_label_parts.append(f"P={rt_location}")
+                rt_media = compact_media(rt)
+                if rt_media:
+                    rt_label_parts.append(rt_media)
+                if options is None or options.include_engagement:
+                    rt_label_parts.append(compact_engagement(rt))
+                if rt_incomplete:
+                    rt_label_parts.append("CONTENT=INCOMPLETE")
+                elif not rt_text:
+                    rt_label_parts.append("TEXT=EMPTY")
+                out.append(">" + "[" + "｜".join(rt_label_parts) + "]")
+                if rt_incomplete:
+                    out.append(">[PREVIEW_ONLY｜全文无法验证]")
+                    preview = incomplete_preview(rt)
+                    out.append(
+                        quote_markdown(preview)
+                        if preview
+                        else "> 当前没有可保存的列表预览。"
+                    )
+                elif rt_text:
+                    out.append(quote_markdown(rt_text))
+            else:
+                rt_code = rt_key_to_code[key]
+                out.append(f">[={rt_code}]")
 
         out.append("")
 
@@ -584,7 +659,6 @@ def build_ai_markdown(
         "retweet_post_count": retweet_post_count,
         "unique_retweets": unique_retweets,
         "duplicate_retweets": duplicate_retweets,
-        "source_count": len(source_rows),
         "oldest": oldest,
         "newest": newest,
         **media_stats,
@@ -693,34 +767,37 @@ def build_markdown(
             rt_incomplete = is_incomplete(retweet)
             rt_name = normalize_text(retweet.get("screen_name"))
             rt_text = normalize_text(retweet.get("text"))
-            if rt_text or rt_incomplete:
-                rt_media = full_media_line(retweet)
-                label = f"转发原文 · @{rt_name}" if rt_name else "转发原文"
-                label_parts = [label]
-                if options is not None:
-                    label_parts.append(f"日期：{option_time(retweet, options)}")
-                    rt_meta = post_meta_line(retweet, options)
-                    if rt_meta:
-                        label_parts.append(rt_meta)
-                if rt_media:
-                    label_parts.append(rt_media)
-                if options is None or options.include_engagement:
-                    label_parts.append(engagement_line(retweet))
-                if rt_incomplete:
-                    label_parts.append("【全文无法验证】")
-                out.append("**" + " · ".join(label_parts) + "**")
-                out.append("")
-                if rt_incomplete:
-                    preview = incomplete_preview(retweet)
-                    notice = "当前无法取得并验证完整转发原文。"
-                    if preview:
-                        notice += "\n\n以下仅为列表中仍可见的预览，不是完整正文：\n\n" + preview
-                    else:
-                        notice += "\n\n当前没有可保存的列表预览。"
-                    out.append(quote_markdown(notice))
+            rt_media = full_media_line(retweet)
+            label = f"转发原文 · @{rt_name}" if rt_name else "转发原文"
+            label_parts = [label]
+            if is_verified_self_retweet(retweet, uid):
+                label_parts.append("已验证为目标账号自转发")
+            if options is not None:
+                label_parts.append(f"日期：{option_time(retweet, options)}")
+                rt_meta = post_meta_line(retweet, options)
+                if rt_meta:
+                    label_parts.append(rt_meta)
+            if rt_media:
+                label_parts.append(rt_media)
+            if options is None or options.include_engagement:
+                label_parts.append(engagement_line(retweet))
+            if rt_incomplete:
+                label_parts.append("【全文无法验证】")
+            elif not rt_text:
+                label_parts.append("【已验证正文为空】")
+            out.append("**" + " · ".join(label_parts) + "**")
+            out.append("")
+            if rt_incomplete:
+                preview = incomplete_preview(retweet)
+                notice = "当前无法取得并验证完整转发原文。"
+                if preview:
+                    notice += "\n\n以下仅为列表中仍可见的预览，不是完整正文：\n\n" + preview
                 else:
-                    out.append(quote_markdown(rt_text))
-                out.append("")
+                    notice += "\n\n当前没有可保存的列表预览。"
+                out.append(quote_markdown(notice))
+            elif rt_text:
+                out.append(quote_markdown(rt_text))
+            out.append("")
 
         out.append("---")
         out.append("")

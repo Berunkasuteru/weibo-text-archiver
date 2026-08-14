@@ -29,15 +29,38 @@ class IncompleteReason(str, Enum):
     CONTENT_UNAVAILABLE = "content_unavailable"
 
 
+class TimestampProvenance(str, Enum):
+    SOURCE_OFFSET = "source_offset"
+    SOURCE_WALL = "source_wall"
+    RELATIVE_UNVERIFIED = "relative_unverified"
+    UNKNOWN = "unknown"
+
+
+def normalize_optional_uid(value) -> Optional[str]:
+    """Return a normalized non-zero identity, or None when identity is absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) and value == 0:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if normalized.isdigit() and not normalized.strip("0"):
+        return None
+    return normalized
+
+
 @dataclass(frozen=True)
 class Post:
     id: str
     bid: str
     created_at: Optional[datetime]
+    created_at_provenance: TimestampProvenance
     text: Optional[str]
     source: str
     location: str
     author: str
+    author_id: Optional[str]
     engagement: Engagement
     media: MediaInfo
     retweet: Optional["Post"] = None
@@ -48,6 +71,26 @@ class Post:
     incomplete_reason: Optional[IncompleteReason] = None
 
     def __post_init__(self) -> None:
+        if self.author_id is not None and (
+            not isinstance(self.author_id, str)
+            or normalize_optional_uid(self.author_id) != self.author_id
+        ):
+            raise ValueError("author_id must be a normalized non-zero string or None")
+        if not isinstance(self.created_at_provenance, TimestampProvenance):
+            raise TypeError("created_at_provenance must be a TimestampProvenance")
+        if self.created_at_provenance is TimestampProvenance.UNKNOWN:
+            if self.created_at is not None:
+                raise ValueError("unknown timestamp provenance requires created_at=None")
+        else:
+            if not isinstance(self.created_at, datetime):
+                raise ValueError("known timestamp provenance requires a datetime")
+            aware = self.created_at.utcoffset() is not None
+            if self.created_at_provenance is TimestampProvenance.SOURCE_OFFSET:
+                if not aware:
+                    raise ValueError("source-offset timestamp must be timezone-aware")
+            elif aware:
+                raise ValueError("offset-unknown timestamp must be timezone-naive")
+
         if not isinstance(self.content_state, ContentState):
             raise TypeError("content_state must be a ContentState")
 
@@ -190,7 +233,7 @@ class Archive:
     posts: tuple[Post, ...]
     fetch_range: FetchRange
     report: FetchReport
-    fetched_at: datetime = field(default_factory=datetime.now)
+    fetched_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
 
     @property
     def integrity(self) -> ArchiveIntegrity:

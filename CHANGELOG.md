@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+- Preserve source timestamp offsets without exporter-machine conversion and mark offset-free or relative timestamp provenance explicitly.
+- Keep missing engagement counts distinct from explicit zero in Full Archive and AI Compact output.
+- Preserve complete empty-body repost relations and their verified metadata instead of dropping the RT block.
+- Store optional author UIDs and mark self-reposts only after exact non-empty UID equality.
+- Add the defensive `FORMAT=WEIBO_AI_1` contract while removing source-count and source-frequency aggregates.
+- Bump normalized cache writes to schema version 2 for timestamp provenance and optional author identity.
+
 ## 0.5.0-beta.1
 
 - Added fetch-once multi-output selection for Full Archive, AI Compact, and Custom Markdown.

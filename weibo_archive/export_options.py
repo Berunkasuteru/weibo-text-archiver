@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
 
-from .models import Archive, Post
+from .models import Archive, Post, TimestampProvenance
 
 
 class ExportLayout(str, Enum):
@@ -204,7 +204,14 @@ def filter_archive(
             continue
 
         if options.time_filter_active:
-            if post.created_at is None:
+            if (
+                post.created_at is None
+                or post.created_at_provenance
+                not in {
+                    TimestampProvenance.SOURCE_OFFSET,
+                    TimestampProvenance.SOURCE_WALL,
+                }
+            ):
                 unknown_timestamp_count += 1
                 continue
             post_date = post.created_at.date()
@@ -244,7 +251,7 @@ def filter_report_notice(report: CustomFilterReport) -> str:
     notice = f"匹配 {report.matched_count} / 本次抓取 {report.fetched_count}"
     if report.unknown_timestamp_count:
         notice += (
-            f"；{report.unknown_timestamp_count} 条记录时间未知，"
+            f"；{report.unknown_timestamp_count} 条记录时间未知或依据未验证，"
             "无法用于时间筛选"
         )
     return notice

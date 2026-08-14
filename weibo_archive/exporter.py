@@ -19,14 +19,20 @@ _ALLOWED_FILENAME_SUFFIXES = {
 
 
 def _post_to_legacy(post: Post) -> dict:
-    when = post.created_at.strftime("%Y-%m-%d %H:%M:%S") if post.created_at else ""
+    when = (
+        post.created_at.isoformat(sep=" ", timespec="seconds")
+        if post.created_at
+        else ""
+    )
     result = {
         "id": post.id,
         "bid": post.bid,
         "screen_name": post.author,
+        "author_id": post.author_id,
         "text": post.text,
         "created_at": when.replace(" ", "T") if when else "",
         "full_created_at": when,
+        "created_at_provenance": post.created_at_provenance.value,
         "source": post.source,
         "location": post.location,
         "reposts_count": post.engagement.reposts,
@@ -109,7 +115,8 @@ def _inject_full_provenance(
         "",
         f"> 导出范围：{archive.fetch_range.label()}",
         f"> 抓取终止：{_termination_label(archive)}",
-        f"> 快照时间：{archive.fetched_at:%Y-%m-%d %H:%M}",
+        "> 快照时间（导出机器本地）："
+        + archive.fetched_at.isoformat(sep=" ", timespec="minutes"),
     ]
     if options is not None:
         meta.append(f"> 输出配置：{options_provenance(options)}")
@@ -139,7 +146,8 @@ def _inject_ai_provenance(
         return text
     meta = (
         f"导出：{archive.fetch_range.label()}｜终止={_termination_label(archive)}"
-        f"｜快照={archive.fetched_at:%Y-%m-%d %H:%M}"
+        "｜快照（导出机器本地）="
+        + archive.fetched_at.isoformat(sep=" ", timespec="minutes")
     )
     inserted = [meta]
     if options is not None:

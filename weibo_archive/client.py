@@ -5,7 +5,7 @@ import random
 import re
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from json import JSONDecoder
 from typing import Callable, Optional
 
@@ -17,6 +17,7 @@ from .models import (
     FetchReport,
     IncompleteReason,
     Post,
+    TimestampProvenance,
     Termination,
 )
 from .network import (
@@ -28,7 +29,12 @@ from .network import (
     SafeRequestDiagnostic,
     classify_non_json_response,
 )
-from .parser import extract_mblogs, parse_created_at, parse_post, parse_profile
+from .parser import (
+    extract_mblogs,
+    parse_created_at_fact,
+    parse_post,
+    parse_profile,
+)
 
 
 API_CONTAINER = "https://m.weibo.cn/api/container/getIndex"
@@ -143,8 +149,27 @@ def _noop_progress(message: str, data: Optional[dict] = None):
     pass
 
 
-def _created_at_of(raw: dict) -> Optional[datetime]:
-    return parse_created_at(raw.get("created_at"))
+_ABSOLUTE_TIME_PROVENANCE = {
+    TimestampProvenance.SOURCE_OFFSET,
+    TimestampProvenance.SOURCE_WALL,
+}
+
+
+def _created_at_fact_of(
+    raw: dict,
+) -> tuple[Optional[datetime], TimestampProvenance]:
+    return parse_created_at_fact(raw.get("created_at"))
+
+
+def _source_wall_value(value: datetime) -> datetime:
+    """Comparable presentation clock; never mutates the canonical timestamp."""
+    return value.replace(tzinfo=None) if value.utcoffset() is not None else value
+
+
+def _post_presentation_sort_key(post: Post):
+    if post.created_at is None:
+        return (0, datetime.min, post.id)
+    return (1, _source_wall_value(post.created_at), post.id)
 
 
 def _is_long(raw: dict) -> bool:
@@ -677,7 +702,7 @@ class WeiboClient:
         consecutive_no_new_pages = 0
         termination: Termination | None = None
         timeline_candidates = 0
-        crawl_frontier: datetime | None = None
+        crawl_frontier: date | None = None
         limited_range = (
             fetch_range.mode in (RangeMode.RECENT, RangeMode.TRIAL)
             and bool(fetch_range.limit)
@@ -706,10 +731,14 @@ class WeiboClient:
                 for raw in mblogs
                 if not _is_pinned(raw) and _raw_user_id(raw) in ("", uid)
             ]
-            page_dates = [_created_at_of(raw) for raw in timeline_mblogs]
-            known_dates = [d for d in page_dates if d is not None]
-            if known_dates:
-                page_frontier = min(known_dates)
+            page_time_facts = [_created_at_fact_of(raw) for raw in timeline_mblogs]
+            absolute_dates = [
+                value.date()
+                for value, provenance in page_time_facts
+                if value is not None and provenance in _ABSOLUTE_TIME_PROVENANCE
+            ]
+            if absolute_dates:
+                page_frontier = min(absolute_dates)
                 crawl_frontier = (
                     page_frontier
                     if crawl_frontier is None
@@ -717,17 +746,17 @@ class WeiboClient:
                 )
 
             # A since-date range can stop without hydrating pages that are wholly older.
-            if fetch_range.mode is RangeMode.SINCE and fetch_range.since and known_dates:
-                page_dates_complete = len(known_dates) == len(timeline_mblogs)
-                if (
-                    page_dates_complete
-                    and all(d.date() < fetch_range.since for d in known_dates)
+            if fetch_range.mode is RangeMode.SINCE and fetch_range.since:
+                page_dates_complete = bool(absolute_dates) and (
+                    len(absolute_dates) == len(timeline_mblogs)
+                )
+                if page_dates_complete and all(
+                    d < fetch_range.since for d in absolute_dates
                 ):
                     consecutive_old_pages += 1
                 else:
-                    # Unknown timestamps must not help trigger an early stop.
-                    # They are retained because silently discarding them could lose
-                    # a post whose date format changed.
+                    # Relative/unknown timestamps must break, not merely avoid
+                    # incrementing, a run of pages used as early-stop proof.
                     consecutive_old_pages = 0
 
                 # Two consecutive wholly-old timeline pages avoid treating one
@@ -749,11 +778,12 @@ class WeiboClient:
                 if raw_id and raw_id in posts_by_id:
                     continue
 
-                created_at = _created_at_of(raw)
+                created_at, created_at_provenance = _created_at_fact_of(raw)
                 if (
                     fetch_range.mode is RangeMode.SINCE
                     and fetch_range.since
                     and created_at is not None
+                    and created_at_provenance in _ABSOLUTE_TIME_PROVENANCE
                     and created_at.date() < fetch_range.since
                 ):
                     continue
@@ -813,7 +843,7 @@ class WeiboClient:
 
         posts = sorted(
             posts_by_id.values(),
-            key=lambda p: (p.created_at or datetime.min, p.id),
+            key=_post_presentation_sort_key,
             reverse=True,
         )
 
@@ -825,8 +855,11 @@ class WeiboClient:
                 "没有取得可导出的微博正文。可能是账号没有公开内容、Cookie 失效或接口受限。"
             )
 
-        oldest = min((p.created_at for p in posts if p.created_at), default=None)
-        newest = max((p.created_at for p in posts if p.created_at), default=None)
+        dated_posts = [p for p in posts if p.created_at is not None]
+        oldest_post = min(dated_posts, key=_post_presentation_sort_key, default=None)
+        newest_post = max(dated_posts, key=_post_presentation_sort_key, default=None)
+        oldest = oldest_post.created_at if oldest_post is not None else None
+        newest = newest_post.created_at if newest_post is not None else None
 
         assert termination is not None
         report = FetchReport(

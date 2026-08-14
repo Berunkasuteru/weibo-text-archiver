@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import FrozenInstanceError, asdict, fields, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +22,7 @@ from weibo_archive.client import (
     IncompleteContent,
     WeiboClient,
     _embedded_status_from_detail,
+    _post_presentation_sort_key,
 )
 from weibo_archive.export_options import (
     AI_COMPACT_OPTIONS,
@@ -54,11 +55,17 @@ from weibo_archive.models import (
     IncompleteReason,
     Post,
     RangeMode,
+    TimestampProvenance,
     Termination,
     UserProfile,
     calculate_archive_integrity,
 )
-from weibo_archive.parser import extract_mblogs, parse_post, parse_profile
+from weibo_archive.parser import (
+    extract_mblogs,
+    parse_created_at_fact,
+    parse_post,
+    parse_profile,
+)
 from weibo_archive.network import (
     Cancelled,
     HttpClient,
@@ -95,17 +102,19 @@ def build_archive() -> Archive:
             Post(
                 id="1003", bid="b3",
                 created_at=datetime(2026, 8, 13, 0, 10),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
                 text="这是转发时写的评论。",
                 source="iPhone客户端", location="",
-                author="测试用户",
+                author="测试用户", author_id="1234567890",
                 engagement=Engagement(1, 1, 5),
                 media=MediaInfo(),
                 retweet=Post(
                     id="9001", bid="rb1",
                     created_at=datetime(2026, 8, 10, 12, 0),
+                    created_at_provenance=TimestampProvenance.SOURCE_WALL,
                     text="这是被转发的原文。",
                     source="", location="",
-                    author="原作者",
+                    author="原作者", author_id="987654321",
                     engagement=Engagement(12, 8, 99),
                     media=MediaInfo(images=1),
                 ),
@@ -113,18 +122,20 @@ def build_archive() -> Archive:
             Post(
                 id="1002", bid="b2",
                 created_at=datetime(2026, 8, 12, 18, 30),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
                 text="带图片的微博。",
                 source="iPhone客户端", location="上海",
-                author="测试用户",
+                author="测试用户", author_id="1234567890",
                 engagement=Engagement(3, 0, 21),
                 media=MediaInfo(images=3),
             ),
             Post(
                 id="1001", bid="b1",
                 created_at=datetime(2026, 8, 11, 6, 24),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
                 text="第一条原创微博。",
                 source="微博网页版", location="北京",
-                author="测试用户",
+                author="测试用户", author_id="1234567890",
                 engagement=Engagement(None, 2, 10),
                 media=MediaInfo(),
             ),
@@ -370,8 +381,14 @@ def test_parser_contract():
     assert len(mblogs) == 3
 
     posts = [parse_post(x) for x in mblogs]
+    assert posts[0].author_id == "1234567890"
+    assert posts[0].created_at_provenance is TimestampProvenance.SOURCE_OFFSET
+    assert posts[0].created_at.isoformat() == "2026-08-13T00:10:00+08:00"
     assert posts[0].retweet is not None
     assert posts[0].retweet.author == "原作者"
+    assert posts[0].retweet.author_id == "987654321"
+    assert posts[0].retweet.created_at_provenance is TimestampProvenance.SOURCE_OFFSET
+    assert posts[0].retweet.created_at.isoformat() == "2026-08-10T12:00:00+08:00"
     assert posts[0].retweet.media.images == 1
 
     assert posts[1].media.images == 3
@@ -1107,27 +1124,30 @@ def test_ai_compact_attribution_and_field_schema():
         AI_COMPACT_OPTIONS,
     )
 
-    assert "ATTRIBUTION: W = target account's top-level text;" in text
-    assert "RT = nested repost source and must not be directly attributed" in text
-    assert (
-        "MEDIA: I/V/A > 0 = referenced media exists but is not included; "
-        "text must not be treated as complete context."
-    ) in text
-    assert "REFERENCE: =RT* = reference to an already emitted repost source." in text
-    assert (
-        "INCOMPLETE: PREVIEW_ONLY is an unverified timeline preview "
-        "and must not be treated as full text."
-    ) in text
+    assert "FORMAT=WEIBO_AI_1" in text
+    assert "STRUCTURE: W is a top-level rendered record;" in text
+    assert "SELF requires exact non-empty UID equality" in text
+    assert "//@ text is preserved but unparsed" in text
+    assert "P alone does not prove event location" in text
+    assert "known source offset is preserved" in text
+    assert "UNKNOWN is not zero" in text
+    assert "referenced media is not included" in text
+    assert "PREVIEW_ONLY is INCOMPLETE and not full text" in text
+    assert "TEXT=EMPTY is a verified complete empty body" in text
+    assert "SOURCE_IDS=file-local" in text
+    assert "=RT* is an explicit lossless file-local reference" in text
     assert "来源字典：S1=" in text
+    assert "来源3种" not in text
+    assert "客户端(" not in text
     assert "摘要：共3条" in text
     assert stats["count"] == 3
     assert stats["unique_retweets"] == 1
 
     lines = text.splitlines()
     rich_top = next(line for line in lines if "P=上海" in line)
-    assert rich_top == "[W｜2026-08-12 18:30｜S1｜P=上海｜I3 V2 A1｜R3 C0 L21]"
+    assert rich_top == "[W｜2026-08-12 18:30｜S1｜P=上海｜I3 V2 A1｜R=3 C=0 L=21]"
     repost = next(line for line in lines if line.startswith(">[RT1"))
-    assert repost == ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R12 C8 L99]"
+    assert repost == ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99]"
     assert all(line.startswith("[W｜") for line in lines if line.startswith("[W"))
     assert "｜地=" not in text
     assert "地=发布位置" not in text
@@ -1138,8 +1158,8 @@ def test_ai_compact_attribution_and_field_schema():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R3 C0 L21｜CONTENT=INCOMPLETE]" in incomplete_text
-    assert ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R12 C8 L99｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99｜CONTENT=INCOMPLETE]" in incomplete_text
     assert incomplete_text.count("PREVIEW_ONLY") == 3  # one rule plus two records
 
     empty_post = replace(archive.posts[1], text="")
@@ -1149,10 +1169,494 @@ def test_ai_compact_attribution_and_field_schema():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R3 C0 L21]" in empty_text
+    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21]" in empty_text
     assert "仅媒体1条" in empty_text
     assert "[PREVIEW_ONLY｜" not in empty_text
     assert empty_stats["media_only_posts"] == 1
+
+
+def test_semantic_time_provenance_and_presentation_contract():
+    source = "Thu Aug 13 00:10:00 +0800 2026"
+    for simulated_local in (
+        datetime(2026, 8, 13, tzinfo=timezone.utc),
+        datetime(2026, 8, 13, tzinfo=timezone(timedelta(hours=8))),
+    ):
+        parsed, provenance = parse_created_at_fact(source, now=simulated_local)
+        assert parsed.isoformat() == "2026-08-13T00:10:00+08:00"
+        assert provenance is TimestampProvenance.SOURCE_OFFSET
+
+    wall, provenance = parse_created_at_fact("2026-08-13 00:10:00")
+    assert wall.isoformat() == "2026-08-13T00:10:00"
+    assert wall.tzinfo is None
+    assert provenance is TimestampProvenance.SOURCE_WALL
+
+    fixed_now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+    expected = {
+        "刚刚": datetime(2026, 8, 13, 12, 0),
+        "5分钟前": datetime(2026, 8, 13, 11, 55),
+        "5小时前": datetime(2026, 8, 13, 7, 0),
+        "昨天 05:30": datetime(2026, 8, 12, 5, 30),
+    }
+    for raw, expected_value in expected.items():
+        parsed, provenance = parse_created_at_fact(raw, now=fixed_now)
+        assert parsed == expected_value and parsed.tzinfo is None
+        assert provenance is TimestampProvenance.RELATIVE_UNVERIFIED
+    assert parse_created_at_fact("UNKNOWN") == (
+        None,
+        TimestampProvenance.UNKNOWN,
+    )
+
+    archive = build_alpha3_archive()
+    plus_eight = timezone(timedelta(hours=8))
+    top = replace(
+        archive.posts[0],
+        created_at=datetime(2026, 8, 13, 0, 10, tzinfo=plus_eight),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        retweet=replace(
+            archive.posts[0].retweet,
+            created_at=datetime(2026, 8, 10, 12, 0, tzinfo=plus_eight),
+            created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        ),
+    )
+    archive = replace(archive, posts=(top,))
+    data = archive_to_legacy_data(archive)
+    from weibo_archive import markdown_v5
+
+    full, _, _ = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    ai, _, _ = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "## 2026-08-13 00:10+08:00" in full
+    assert "日期：2026-08-10 12:00+08:00" in full
+    assert "[W｜2026-08-13 00:10+08:00｜" in ai
+    assert "2026-08-10 12:00+08:00" in ai
+
+    nonlocal_source = "Thu Aug 13 00:10:00 -1000 2026"
+    nonlocal_time, provenance = parse_created_at_fact(nonlocal_source)
+    assert nonlocal_time.isoformat() == "2026-08-13T00:10:00-10:00"
+    assert provenance is TimestampProvenance.SOURCE_OFFSET
+    minus_ten = replace(
+        top,
+        created_at=nonlocal_time,
+        created_at_provenance=provenance,
+        retweet=None,
+    )
+    nonlocal_data = archive_to_legacy_data(replace(archive, posts=(minus_ten,)))
+    nonlocal_full, _, _ = markdown_v5.build_markdown(
+        nonlocal_data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    nonlocal_ai, _, _ = markdown_v5.build_ai_markdown(
+        nonlocal_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "## 2026-08-13 00:10-10:00" in nonlocal_full
+    assert "[W｜2026-08-13 00:10-10:00｜" in nonlocal_ai
+
+    date_only = ExportOptions(layout=ExportLayout.AI, date_format=DateFormat.DATE_ONLY)
+    date_only_ai, _, _ = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        date_only,
+    )
+    assert "2026-08-13 TZ=+08:00" in date_only_ai
+
+    relative = replace(
+        top,
+        created_at=datetime(2026, 8, 13, 0, 10),
+        created_at_provenance=TimestampProvenance.RELATIVE_UNVERIFIED,
+    )
+    relative_data = archive_to_legacy_data(replace(archive, posts=(relative,)))
+    relative_ai, _, _ = markdown_v5.build_ai_markdown(
+        relative_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "TIME_BASIS=RELATIVE_UNVERIFIED" in relative_ai
+
+    later_wall_earlier_utc = replace(
+        top,
+        id="100",
+        created_at=datetime(
+            2026, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=14))
+        ),
+    )
+    earlier_wall_later_utc = replace(
+        top,
+        id="200",
+        created_at=datetime(
+            2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=-10))
+        ),
+    )
+    assert _post_presentation_sort_key(later_wall_earlier_utc) > (
+        _post_presentation_sort_key(earlier_wall_later_utc)
+    )
+    assert later_wall_earlier_utc.created_at.astimezone(timezone.utc) < (
+        earlier_wall_later_utc.created_at.astimezone(timezone.utc)
+    )
+    ordering_data = archive_to_legacy_data(
+        replace(
+            archive,
+            posts=(earlier_wall_later_utc, later_wall_earlier_utc),
+        )
+    )
+    ordering_ai, _, _ = markdown_v5.build_ai_markdown(
+        ordering_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    ordering_lines = [
+        line for line in ordering_ai.splitlines() if line.startswith("[W｜")
+    ]
+    assert "2026-08-13 10:00+14:00" in ordering_lines[0]
+    assert "2026-08-13 09:00-10:00" in ordering_lines[1]
+
+    mixed_offset = replace(
+        top,
+        id="9004",
+        created_at=datetime(
+            2099, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=14))
+        ),
+        retweet=None,
+    )
+    mixed_relative = replace(
+        top,
+        id="9003",
+        created_at=datetime(2026, 8, 13, 9, 30),
+        created_at_provenance=TimestampProvenance.RELATIVE_UNVERIFIED,
+        retweet=None,
+    )
+    mixed_wall = replace(
+        top,
+        id="9001",
+        created_at=datetime(2000, 8, 13, 9, 0),
+        created_at_provenance=TimestampProvenance.SOURCE_WALL,
+        retweet=None,
+    )
+    mixed_unknown = replace(
+        top,
+        id="9000",
+        created_at=None,
+        created_at_provenance=TimestampProvenance.UNKNOWN,
+        retweet=None,
+    )
+    mixed_posts = (mixed_wall, mixed_unknown, mixed_relative, mixed_offset)
+    mixed_order = sorted(
+        mixed_posts,
+        key=_post_presentation_sort_key,
+        reverse=True,
+    )
+    assert [post.id for post in mixed_order] == ["9004", "9003", "9001", "9000"]
+    assert mixed_offset.created_at.isoformat() == "2099-08-13T10:00:00+14:00"
+    assert mixed_wall.created_at.tzinfo is None
+    assert mixed_relative.created_at.tzinfo is None
+    assert mixed_unknown.created_at is None
+
+    mixed_archive = replace(archive, posts=mixed_posts)
+    mixed_data = archive_to_legacy_data(mixed_archive)
+    assert [
+        item["id"] for item in markdown_v5.prepare_items(mixed_data)
+    ] == ["9004", "9003", "9001", "9000"]
+    mixed_filtered, mixed_report = filter_archive(
+        mixed_archive,
+        CustomFilterOptions(
+            start_date=date(2099, 8, 13),
+            end_date=date(2099, 8, 13),
+        ),
+    )
+    assert [post.id for post in mixed_filtered.posts] == ["9004"]
+    assert mixed_report.unknown_timestamp_count == 2
+
+    import threading
+
+    class MixedTimeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.events = []
+            self.progress = lambda message, data=None: self.events.append((message, data))
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=4)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page == 1:
+                return [
+                    _fake_mblog(9104, "Thu Aug 13 10:00:00 +1400 2099"),
+                    _fake_mblog(9103, "5分钟前"),
+                    _fake_mblog(9101, "2000-08-13 09:00:00"),
+                    _fake_mblog(9100, "UNKNOWN"),
+                ], False
+            return [], True
+
+    mixed_client = MixedTimeClient()
+    fetched_mixed = mixed_client.fetch("1234567890", FetchRange.all())
+    assert [post.id for post in fetched_mixed.posts] == [
+        "9104",
+        "9103",
+        "9101",
+        "9100",
+    ]
+    assert fetched_mixed.report.newest_reached.isoformat() == (
+        "2099-08-13T10:00:00+14:00"
+    )
+    assert fetched_mixed.report.oldest_reached.isoformat() == "2000-08-13T09:00:00"
+    assert fetched_mixed.posts[0].created_at.utcoffset() == timedelta(hours=14)
+    assert fetched_mixed.posts[1].created_at_provenance is (
+        TimestampProvenance.RELATIVE_UNVERIFIED
+    )
+    progress_payloads = [
+        data
+        for message, data in mixed_client.events
+        if message.startswith("已获得") and data is not None
+    ]
+    assert progress_payloads[-1]["frontier"] == "2000-08-13"
+
+    since_mixed = MixedTimeClient().fetch(
+        "1234567890",
+        FetchRange.since_date(date(2100, 1, 1)),
+    )
+    assert {post.id for post in since_mixed.posts} == {"9103", "9100"}
+    assert since_mixed.report.termination is Termination.NATURAL
+
+    midnight = replace(
+        top,
+        created_at=datetime(2026, 8, 13, 0, 10, tzinfo=plus_eight),
+    )
+    filtered, report = filter_archive(
+        replace(archive, posts=(midnight, relative)),
+        CustomFilterOptions(
+            start_date=date(2026, 8, 13),
+            end_date=date(2026, 8, 13),
+        ),
+    )
+    assert filtered.posts == (midnight,)
+    assert report.unknown_timestamp_count == 1
+
+    snapshot = Archive(
+        profile=archive.profile,
+        posts=archive.posts,
+        fetch_range=archive.fetch_range,
+        report=archive.report,
+    )
+    assert snapshot.fetched_at.utcoffset() is not None
+
+
+def test_semantic_engagement_empty_rt_and_self_identity():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    base = archive.posts[0]
+    self_empty_rt = replace(
+        base.retweet,
+        id="self-empty",
+        text="",
+        author="目标账号别名",
+        author_id=archive.profile.id,
+        source="Android客户端",
+        location="广州",
+        engagement=Engagement(None, 0, 10),
+        media=MediaInfo(images=1),
+    )
+    first = replace(
+        base,
+        id="3001",
+        text="正文 //@同名: 保留原文",
+        engagement=Engagement(None, 0, 10),
+        retweet=self_empty_rt,
+    )
+    second = replace(base, id="3000", retweet=self_empty_rt)
+    semantic_archive = replace(archive, posts=(first, second))
+    data = archive_to_legacy_data(semantic_archive)
+
+    full, _, _ = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    ai, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "转 未知 · 评 0 · 赞 10" in full
+    assert "R=UNKNOWN C=0 L=10" in ai
+    assert "已验证为目标账号自转发" in full
+    assert ">[RT1｜SELF｜@目标账号别名｜" in ai
+    assert "【已验证正文为空】" in full
+    assert "TEXT=EMPTY" in ai
+    assert "Android客户端" in full and "P=广州" in ai and "I1" in ai
+    assert "//@同名: 保留原文" in full and "//@同名: 保留原文" in ai
+    assert ">[=RT1]" in ai
+    assert stats["unique_retweets"] == 1
+    assert stats["duplicate_retweets"] == 1
+    self_rt_line = next(line for line in ai.splitlines() if line.startswith(">[RT1"))
+    assert archive.profile.id not in self_rt_line
+
+    same_name_different_uid = replace(
+        self_empty_rt,
+        id="different-uid",
+        author="测试用户",
+        author_id="9999999999",
+    )
+    missing_uid = replace(
+        self_empty_rt,
+        id="missing-uid",
+        author="测试用户",
+        author_id=None,
+    )
+    ordinary_archive = replace(
+        archive,
+        posts=(
+            replace(base, id="4001", retweet=same_name_different_uid),
+            replace(base, id="4000", retweet=missing_uid),
+        ),
+    )
+    ordinary_ai, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(ordinary_archive),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "｜SELF｜" not in ordinary_ai
+    assert "9999999999" not in ordinary_ai
+
+    parsed = parse_post(
+        {
+            "id": "5000",
+            "created_at": "2026-08-13 00:10:00",
+            "text": "counts",
+            "comments_count": 0,
+            "attitudes_count": "0",
+            "user": {"screen_name": "用户"},
+        }
+    )
+    assert parsed.engagement == Engagement(None, 0, 0)
+    assert parsed.author_id is None
+
+    w_body = "正文🙂\n第二行//@某人:保留这段🚀"
+    rt_body = "转发正文🧭\n第二行//@另一人:原样保留✨"
+    body_post = replace(
+        base,
+        id="emoji-w",
+        text=w_body,
+        retweet=replace(base.retweet, id="emoji-rt", text=rt_body),
+    )
+    body_data = archive_to_legacy_data(replace(archive, posts=(body_post,)))
+    body_full, _, _ = markdown_v5.build_markdown(
+        body_data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    body_ai, _, _ = markdown_v5.build_ai_markdown(
+        body_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert w_body in body_full and w_body in body_ai
+    quoted_rt_body = "> 转发正文🧭\n> 第二行//@另一人:原样保留✨"
+    assert quoted_rt_body in body_full and quoted_rt_body in body_ai
+    assert "VIA" not in body_full and "VIA" not in body_ai
+
+
+def test_invalid_author_uid_contract():
+    from weibo_archive import markdown_v5, storage
+
+    no_nested = object()
+
+    def raw_post(author_id, *, nested_id=no_nested):
+        raw = {
+            "id": "uid-top",
+            "created_at": "2026-08-13 00:10:00",
+            "text": "正文",
+            "user": {"id": author_id, "screen_name": "测试用户"},
+        }
+        if nested_id is not no_nested:
+            raw["retweeted_status"] = {
+                "id": "uid-rt",
+                "created_at": "2026-08-12 00:10:00",
+                "text": "原文",
+                "user": {"id": nested_id, "screen_name": "测试用户"},
+            }
+        return raw
+
+    for invalid in (0, "0", "", "   ", None, False, "00000"):
+        assert parse_post(raw_post(invalid)).author_id is None
+
+    for invalid in (0, "0", None):
+        parsed = parse_post(raw_post("1234567890", nested_id=invalid))
+        assert parsed.author_id == "1234567890"
+        assert parsed.retweet is not None and parsed.retweet.author_id is None
+
+    valid = parse_post(raw_post(1234567890, nested_id="1234567890"))
+    assert valid.author_id == "1234567890"
+    assert valid.retweet.author_id == "1234567890"
+    assert markdown_v5.is_verified_self_retweet(
+        {"author_id": valid.retweet.author_id},
+        valid.author_id,
+    )
+
+    for invalid in (None, "", "0", "00000", False):
+        assert not markdown_v5.is_verified_self_retweet(
+            {"author_id": invalid},
+            "1234567890",
+        )
+        assert not markdown_v5.is_verified_self_retweet(
+            {"author_id": "1234567890"},
+            invalid,
+        )
+
+    base = build_alpha3_archive().posts[0]
+    for invalid in ("0", "00000", " 0 "):
+        try:
+            replace(base, author_id=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid canonical author_id accepted: {invalid!r}")
+
+    defensive_data = archive_to_legacy_data(build_alpha3_archive())
+    defensive_rt = defensive_data["weibo"][0]["retweet"]
+    defensive_rt["screen_name"] = defensive_data["user"]["screen_name"]
+    defensive_rt["author_id"] = "00000"
+    defensive_ai, _, _ = markdown_v5.build_ai_markdown(
+        defensive_data,
+        defensive_data["user"]["id"],
+        AI_COMPACT_OPTIONS,
+    )
+    assert "｜SELF｜" not in defensive_ai
+
+    cached_post = parse_post(raw_post(0, nested_id="00000"))
+    archive = replace(build_alpha3_archive(), posts=(cached_post,))
+    with tempfile.TemporaryDirectory(prefix="weibo_uid_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        try:
+            storage.CACHE_DIR = Path(td)
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["posts"][0]["author_id"] is None
+    assert payload["posts"][0]["retweet"]["author_id"] is None
 
 
 def test_export_options_resolution_and_snapshot():
@@ -1203,6 +1707,7 @@ def test_custom_filter_contract():
         id="1000",
         bid="b0",
         created_at=None,
+        created_at_provenance=TimestampProvenance.UNKNOWN,
         text_preview="未知时间的 GPT 列表预览",
     )
     archive = replace(
@@ -1511,8 +2016,8 @@ def test_alpha3_field_policy_applies_to_main_and_repost():
         "来源3种",
         "S*=发布来源",
         "R=转发",
-        "R1 C1 L5",
-        "R12 C8 L99",
+        "R=1 C=1 L=5",
+        "R=12 C=8 L=99",
         "｜P=上海",
         "｜P=北京",
         "｜P=广州",
@@ -1534,6 +2039,22 @@ def test_export_does_not_mutate_normalized_archive():
     from weibo_archive import markdown_v5, storage
 
     archive = build_alpha3_archive()
+    plus_eight = timezone(timedelta(hours=8))
+    first = replace(
+        archive.posts[0],
+        created_at=datetime(2026, 8, 13, 0, 10, 45, tzinfo=plus_eight),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        retweet=replace(
+            archive.posts[0].retweet,
+            created_at=datetime(2026, 8, 10, 12, 0, 37, tzinfo=plus_eight),
+            created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        ),
+    )
+    archive = replace(
+        archive,
+        posts=(first, *archive.posts[1:]),
+        fetched_at=datetime(2026, 8, 13, 2, 0, tzinfo=plus_eight),
+    )
     before = asdict(archive)
     data_before = archive_to_legacy_data(archive)
 
@@ -1550,7 +2071,7 @@ def test_export_does_not_mutate_normalized_archive():
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["integrity"] == {
         "total_posts": 3,
         "complete_records": 3,
@@ -1562,7 +2083,13 @@ def test_export_does_not_mutate_normalized_archive():
     assert payload["posts"][0]["text_preview"] is None
     assert payload["posts"][0]["incomplete_reason"] is None
     assert payload["posts"][0]["source"] == "iPhone客户端"
+    assert payload["posts"][0]["author_id"] == "1234567890"
+    assert payload["posts"][0]["created_at_provenance"] == "source_offset"
+    assert payload["posts"][0]["created_at"].endswith("+08:00")
+    restored = datetime.fromisoformat(payload["posts"][0]["created_at"])
+    assert restored == first.created_at and restored.utcoffset() == timedelta(hours=8)
     assert payload["posts"][0]["retweet"]["source"] == "Android客户端"
+    assert payload["posts"][0]["retweet"]["author_id"] == "987654321"
     assert payload["posts"][0]["retweet"]["location"] == "广州"
     assert payload["posts"][0]["retweet"]["engagement"]["likes"] == 99
 
@@ -1581,7 +2108,7 @@ def test_alpha4_normalized_cache_contains_only_stable_semantics():
         raw = cache_path.read_text(encoding="utf-8")
         payload = json.loads(raw)
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["integrity"]["incomplete_records"] == 2
     assert payload["posts"][0]["retweet"]["content_state"] == "incomplete"
     assert payload["posts"][0]["retweet"]["text"] is None
@@ -2270,6 +2797,66 @@ def test_since_unknown_date_cannot_trigger_early_stop():
     assert "89" not in ids
     assert archive.report.termination is Termination.NATURAL
 
+
+def test_relative_timestamp_cannot_prove_since_or_frontier():
+    import threading
+
+    boundary = date.today()
+    old = (boundary - timedelta(days=1)).strftime("%Y-%m-%d 12:00:00")
+    current = boundary.strftime("%Y-%m-%d 12:00:00")
+
+    class FakeClient(WeiboClient):
+        def __init__(self, pages):
+            self.cancel_event = threading.Event()
+            self.events = []
+            self.progress = lambda message, data=None: self.events.append((message, data))
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+            self.pages = pages
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page <= len(self.pages):
+                return self.pages[page - 1], False
+            return [], True
+
+    since_client = FakeClient(
+        [
+            [_fake_mblog(301, old)],
+            [_fake_mblog(302, "昨天 00:00")],
+            [_fake_mblog(303, old)],
+            [_fake_mblog(304, current)],
+        ]
+    )
+    archive = since_client.fetch(
+        "1234567890",
+        FetchRange.since_date(boundary),
+    )
+    assert {post.id for post in archive.posts} == {"302", "304"}
+    assert archive.report.termination is Termination.NATURAL
+
+    relative_only = FakeClient([[_fake_mblog(401, "5分钟前")]])
+    relative_only.fetch("1234567890", FetchRange.all())
+    progress_payloads = [
+        data
+        for message, data in relative_only.events
+        if message.startswith("已获得") and data is not None
+    ]
+    assert progress_payloads and progress_payloads[-1]["frontier"] is None
+
+
 def main():
     suite = [
         ("startup import", test_startup_import),
@@ -2298,6 +2885,9 @@ def main():
         ("Alpha4 incomplete exporter goldens", test_alpha4_incomplete_full_and_ai_goldens),
         ("Alpha4 AI incomplete retweet dedup", test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview),
         ("0.4.2 AI Compact attribution schema", test_ai_compact_attribution_and_field_schema),
+        ("0.5 semantic time provenance", test_semantic_time_provenance_and_presentation_contract),
+        ("0.5 semantic engagement, empty RT, and SELF", test_semantic_engagement_empty_rt_and_self_identity),
+        ("0.5 invalid author UID contract", test_invalid_author_uid_contract),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
         ("0.5 custom filter contract", test_custom_filter_contract),
         ("0.5 multi-output fetch-once contract", test_multi_output_fetch_once_and_isolation),
@@ -2320,6 +2910,7 @@ def main():
         ("ambiguous empty page fails closed", test_ambiguous_empty_page_fails_closed),
         ("unknown ok=0 fails closed", test_unknown_ok0_is_not_natural_end),
         ("since-date unknown timestamp guard", test_since_unknown_date_cannot_trigger_early_stop),
+        ("relative timestamp boundary guard", test_relative_timestamp_cannot_prove_since_or_frontier),
         ("security redaction", test_redaction),
         ("zero-runtime-dependency audit", test_dependency_audit),
     ]
