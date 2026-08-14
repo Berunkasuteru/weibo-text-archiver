@@ -205,6 +205,7 @@ class App(tk.Tk):
         style.configure("Status.TLabel", font=("Consolas", 9))
         style.configure("Primary.TButton", padding=(16, 8))
         style.configure("Quiet.TButton", padding=(10, 6))
+        style.configure("CompletionAction.TButton", padding=(16, 8))
         style.configure("Card.TFrame", relief="solid", borderwidth=1)
         style.configure("Muted.TLabel", foreground="#666666")
 
@@ -1444,19 +1445,21 @@ class App(tk.Tk):
             ttk.Button(
                 actions,
                 text=text,
-                style=(
-                    "Primary.TButton"
-                    if index == len(outputs) - 1
-                    else "Quiet.TButton"
-                ),
+                style="CompletionAction.TButton",
                 command=lambda target=path: launch(target),
             ).grid(row=0, column=index, sticky="ew", padx=4)
         ttk.Button(
             actions,
             text="打开导出文件夹",
+            style="CompletionAction.TButton",
             command=lambda: launch(outputs[0]["path"].parent),
         ).grid(row=0, column=len(outputs), sticky="ew", padx=4)
-        ttk.Button(actions, text="关闭", command=win.destroy).grid(
+        ttk.Button(
+            actions,
+            text="关闭",
+            style="CompletionAction.TButton",
+            command=win.destroy,
+        ).grid(
             row=0,
             column=len(outputs) + 1,
             sticky="ew",
