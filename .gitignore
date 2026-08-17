@@ -77,3 +77,4 @@ last_success.json.tmp
 *.pkl
 /微博文字备份/
 /exports/
+/Archives/
