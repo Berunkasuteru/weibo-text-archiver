@@ -376,6 +376,19 @@ def retweet_key(retweet: dict) -> str:
     return f"text:{author}\n{body}"
 
 
+def retweet_content_key(retweet: dict) -> tuple[str, str, str, str]:
+    """Identify the body snapshot that a lossless =RT reference may reuse."""
+    require_incomplete_id(retweet)
+    if is_incomplete(retweet):
+        return (
+            "incomplete",
+            "",
+            incomplete_preview(retweet),
+            normalize_text(retweet.get("incomplete_reason")),
+        )
+    return ("complete", normalize_text(retweet.get("text")), "", "")
+
+
 def is_verified_self_retweet(retweet: dict, target_uid: str) -> bool:
     author_id = normalize_optional_uid(retweet.get("author_id"))
     normalized_target = normalize_optional_uid(target_uid)
@@ -440,7 +453,7 @@ def build_ai_markdown(
     oldest, newest = get_date_range(items, options)
 
     # 预扫描转发原文，统计“唯一原文”和“重复引用”数量
-    seen_keys = set()
+    seen_content_by_key = {}
     unique_retweets = 0
     duplicate_retweets = 0
     for item in items:
@@ -448,11 +461,12 @@ def build_ai_markdown(
         if not isinstance(rt, dict):
             continue
         key = retweet_key(rt)
-        if key in seen_keys:
-            duplicate_retweets += 1
-        else:
-            seen_keys.add(key)
+        content_key = retweet_content_key(rt)
+        if key not in seen_content_by_key:
+            seen_content_by_key[key] = content_key
             unique_retweets += 1
+        elif content_key == seen_content_by_key[key]:
+            duplicate_retweets += 1
 
     out = []
     out.append(f"# {username}｜AI 分析版")
@@ -552,12 +566,14 @@ def build_ai_markdown(
     )
     out.append("SOURCE_IDS=file-local: S* and RT* identifiers apply only within this file.")
     out.append(
-        "REFERENCE: RT* emits one repost source; =RT* is an explicit lossless file-local "
-        "reference to that already emitted source."
+        "REFERENCE: RT* identifies a repost source and emits that occurrence's body; =RT* "
+        "omits only a body identical to the first RT* body; RT* may repeat when a body snapshot "
+        "differs. Metadata on every RT*/=RT* line belongs to that occurrence and must not be "
+        "inherited from another."
     )
     out.append(
-        "AGGREGATES: total/original/repost/range/media describe top-level W records; "
-        "unique/duplicate RT counts describe nested RT identities."
+        "AGGREGATES: total/original/repost/range/media describe top-level W records; unique RT "
+        "counts nested identities, while duplicate RT counts body-identical =RT references."
     )
 
     if source_rows:
@@ -570,7 +586,35 @@ def build_ai_markdown(
     out.append("")
 
     rt_key_to_code = {}
+    rt_key_to_content = {}
     rt_counter = 0
+
+    def retweet_label_parts(rt: dict, rt_code: str, *, reference: bool) -> list[str]:
+        parts = [f"={rt_code}" if reference else rt_code]
+        if is_verified_self_retweet(rt, uid):
+            parts.append("SELF")
+        rt_name = normalize_text(rt.get("screen_name"))
+        if rt_name:
+            parts.append(f"@{rt_name}")
+        if options is not None:
+            parts.append(option_time(rt, options))
+            rt_source = normalize_text(rt.get("source"))
+            rt_source_code = source_to_code.get(rt_source, "")
+            if options.include_source and rt_source_code:
+                parts.append(rt_source_code)
+            rt_location = normalize_text(rt.get("location"))
+            if options.include_location and rt_location:
+                parts.append(f"P={rt_location}")
+        rt_media = compact_media(rt)
+        if rt_media:
+            parts.append(rt_media)
+        if options is None or options.include_engagement:
+            parts.append(compact_engagement(rt))
+        if is_incomplete(rt):
+            parts.append("CONTENT=INCOMPLETE")
+        elif not normalize_text(rt.get("text")):
+            parts.append("TEXT=EMPTY")
+        return parts
 
     for item in items:
         when = compact_time(item) if options is None else option_time(item, options)
@@ -592,6 +636,8 @@ def build_ai_markdown(
             meta.append(compact_engagement(item))
         if item_incomplete:
             meta.append("CONTENT=INCOMPLETE")
+        elif not normalize_text(item.get("text")):
+            meta.append("TEXT=EMPTY")
 
         out.append("[" + "｜".join(meta) + "]")
 
@@ -610,37 +656,21 @@ def build_ai_markdown(
             rt_incomplete = is_incomplete(rt)
             rt_text = normalize_text(rt.get("text"))
             key = retweet_key(rt)
-            rt_name = normalize_text(rt.get("screen_name"))
+            content_key = retweet_content_key(rt)
 
             if key not in rt_key_to_code:
                 rt_counter += 1
                 rt_code = f"RT{rt_counter}"
                 rt_key_to_code[key] = rt_code
+                rt_key_to_content[key] = content_key
+                reference = False
+            else:
+                rt_code = rt_key_to_code[key]
+                reference = content_key == rt_key_to_content[key]
 
-                rt_label_parts = [rt_code]
-                if is_verified_self_retweet(rt, uid):
-                    rt_label_parts.append("SELF")
-                if rt_name:
-                    rt_label_parts.append(f"@{rt_name}")
-                if options is not None:
-                    rt_label_parts.append(option_time(rt, options))
-                    rt_source = normalize_text(rt.get("source"))
-                    rt_source_code = source_to_code.get(rt_source, "")
-                    if options.include_source and rt_source_code:
-                        rt_label_parts.append(rt_source_code)
-                    rt_location = normalize_text(rt.get("location"))
-                    if options.include_location and rt_location:
-                        rt_label_parts.append(f"P={rt_location}")
-                rt_media = compact_media(rt)
-                if rt_media:
-                    rt_label_parts.append(rt_media)
-                if options is None or options.include_engagement:
-                    rt_label_parts.append(compact_engagement(rt))
-                if rt_incomplete:
-                    rt_label_parts.append("CONTENT=INCOMPLETE")
-                elif not rt_text:
-                    rt_label_parts.append("TEXT=EMPTY")
-                out.append(">" + "[" + "｜".join(rt_label_parts) + "]")
+            rt_label_parts = retweet_label_parts(rt, rt_code, reference=reference)
+            out.append(">" + "[" + "｜".join(rt_label_parts) + "]")
+            if not reference:
                 if rt_incomplete:
                     out.append(">[PREVIEW_ONLY｜全文无法验证]")
                     preview = incomplete_preview(rt)
@@ -651,9 +681,6 @@ def build_ai_markdown(
                     )
                 elif rt_text:
                     out.append(quote_markdown(rt_text))
-            else:
-                rt_code = rt_key_to_code[key]
-                out.append(f">[={rt_code}]")
 
         out.append("")
 

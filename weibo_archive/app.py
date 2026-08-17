@@ -1469,11 +1469,12 @@ class App(tk.Tk):
 
         except RateLimited as exc:
             detail = save_detailed_error("微博访问限制", exc)
+            safe_error = redact_text(exc)
             self._emit(
                 generation,
                 "error",
                 (
-                    str(exc)
+                    safe_error
                     + "\n\n本工具不会在这种情况下生成“看起来完整”的导出文件。",
                     detail,
                 ),
@@ -1482,10 +1483,11 @@ class App(tk.Tk):
 
         except NetworkError as exc:
             detail = save_detailed_error("网络请求", exc)
+            safe_error = redact_text(exc)
             self._emit(
                 generation,
                 "error",
-                (str(exc) + "\n\n请检查网络或稍后重试。", detail),
+                (safe_error + "\n\n请检查网络或稍后重试。", detail),
             )
             terminal_sent = True
 

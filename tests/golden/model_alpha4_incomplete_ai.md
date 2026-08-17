@@ -18,8 +18,8 @@ STRUCTURE: W is a top-level rendered record; ORIGINAL/REPOST means absence/prese
 ENGAGEMENT: R/C/L belong to their containing W or RT; UNKNOWN is not zero.
 ABSENT: Missing I/V/A means canonical zero/false. Missing S/P means unavailable or not emitted by this export configuration, not "no source/location".
 SOURCE_IDS=file-local: S* and RT* identifiers apply only within this file.
-REFERENCE: RT* emits one repost source; =RT* is an explicit lossless file-local reference to that already emitted source.
-AGGREGATES: total/original/repost/range/media describe top-level W records; unique/duplicate RT counts describe nested RT identities.
+REFERENCE: RT* identifies a repost source and emits that occurrence's body; =RT* omits only a body identical to the first RT* body; RT* may repeat when a body snapshot differs. Metadata on every RT*/=RT* line belongs to that occurrence and must not be inherited from another.
+AGGREGATES: total/original/repost/range/media describe top-level W records; unique RT counts nested identities, while duplicate RT counts body-identical =RT references.
 来源字典：S1=iPhone客户端；S2=Android客户端；S3=微博网页版
 
 [W｜2026-08-13 00:10｜S1｜R=1 C=1 L=5]

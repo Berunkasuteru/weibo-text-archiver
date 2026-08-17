@@ -62,6 +62,7 @@ def _audit_bundle() -> None:
         "__pycache__",
         "tests",
         "cookie.txt",
+        "archives",
         "pil",
         "pillow",
     }

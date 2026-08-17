@@ -1,4 +1,4 @@
-__version__ = "0.5.0-beta.2"
+__version__ = "0.5.0-rc.2"
 
 # All user-visible version text derives from this single source.
 VERSION_DISPLAY = __version__

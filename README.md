@@ -115,7 +115,7 @@ python environment_check.py
 python tests/run_tests.py
 ```
 
-The current suite contains 56 offline regression checks.
+The current suite contains 57 offline regression checks.
 
 ## Build
 

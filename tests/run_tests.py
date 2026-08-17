@@ -213,8 +213,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.0-beta.2"
-    assert VERSION_DISPLAY == "0.5.0-beta.2"
+    assert __version__ == "0.5.0-rc.2"
+    assert VERSION_DISPLAY == "0.5.0-rc.2"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -249,7 +249,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.0-beta.2"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.0-rc.2"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -323,6 +323,32 @@ def test_windows_preview_packaging_contract():
     assert 'BUNDLE_NAME = f"WeiboTextArchiver_{__version__}_Windows"' in package_source
     assert 'ZIP_NAME = "WeiboTextArchiver_Windows.zip"' in package_source
     assert 'f"{digest}  {ZIP_NAME}\\n"' in package_source
+    assert '"archives"' in package_source
+
+    package_namespace = runpy.run_path(
+        str(ROOT / "tools" / "package_windows_release.py"),
+        run_name="package_audit_contract_test",
+    )
+    audit_bundle = package_namespace["_audit_bundle"]
+    with tempfile.TemporaryDirectory(prefix="weibo_package_audit_") as td:
+        bundle = Path(td) / "bundle"
+        bundle.mkdir()
+        executable = bundle / "WeiboTextArchiver.exe"
+        executable.write_bytes(b"MZ offline fixture")
+        (bundle / "README.md").write_text("legitimate documentation", encoding="utf-8")
+        audit_bundle.__globals__["BUNDLE_DIR"] = bundle
+        audit_bundle.__globals__["EXE_PATH"] = executable
+        audit_bundle()
+
+        runtime_archives = bundle / "aRcHiVeS"
+        runtime_archives.mkdir()
+        (runtime_archives / "private-export.md").write_text("private", encoding="utf-8")
+        try:
+            audit_bundle()
+        except RuntimeError as exc:
+            assert "aRcHiVeS" in str(exc)
+        else:
+            raise AssertionError("runtime Archives directory entered an audited bundle")
 
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     for ignored in (".venv-build/", "/build/", "/dist/", "/release/"):
@@ -1220,11 +1246,11 @@ def test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert text.count("CONTENT=INCOMPLETE") == 1
+    assert text.count("CONTENT=INCOMPLETE") == 2
     assert text.count("PREVIEW_ONLY") == 2  # one rule plus one record marker
     assert text.count(">[PREVIEW_ONLY｜全文无法验证]") == 1
     assert "当前没有可保存的列表预览" in text
-    assert ">[=RT1]" in text
+    assert any(line.startswith(">[=RT1｜") for line in text.splitlines())
     assert stats["unique_retweets"] == 1
     assert stats["duplicate_retweets"] == 1
 
@@ -1260,7 +1286,8 @@ def test_ai_compact_attribution_and_field_schema():
         'not emitted by this export configuration, not "no source/location".'
     ) in text
     assert "SOURCE_IDS=file-local" in text
-    assert "=RT* is an explicit lossless file-local reference" in text
+    assert "=RT* omits only a body identical to the first RT* body" in text
+    assert "must not be inherited from another" in text
     rule_order = [
         "ATTRIBUTION:",
         "TEXT_CHAIN:",
@@ -1312,7 +1339,7 @@ def test_ai_compact_attribution_and_field_schema():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21]" in empty_text
+    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21｜TEXT=EMPTY]" in empty_text
     assert "仅媒体1条" in empty_text
     assert "[PREVIEW_ONLY｜" not in empty_text
     assert empty_stats["media_only_posts"] == 1
@@ -1652,7 +1679,7 @@ def test_semantic_engagement_empty_rt_and_self_identity():
     assert "TEXT=EMPTY" in ai
     assert "Android客户端" in full and "P=广州" in ai and "I1" in ai
     assert "//@同名: 保留原文" in full and "//@同名: 保留原文" in ai
-    assert ">[=RT1]" in ai
+    assert any(line.startswith(">[=RT1｜") for line in ai.splitlines())
     assert stats["unique_retweets"] == 1
     assert stats["duplicate_retweets"] == 1
     self_rt_line = next(line for line in ai.splitlines() if line.startswith(">[RT1"))
@@ -1721,6 +1748,127 @@ def test_semantic_engagement_empty_rt_and_self_identity():
     quoted_rt_body = "> 转发正文🧭\n> 第二行//@另一人:原样保留✨"
     assert quoted_rt_body in body_full and quoted_rt_body in body_ai
     assert "VIA" not in body_full and "VIA" not in body_ai
+
+
+def test_ai_retweet_reference_is_lossless_per_occurrence():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    base = archive.posts[0]
+    shared_body = "shared repost body"
+    first_rt = replace(
+        base.retweet,
+        id="900",
+        created_at=datetime(2026, 8, 10, 10, 0),
+        text=shared_body,
+        author="Target Alias",
+        author_id=archive.profile.id,
+        source="Source A",
+        location="Place A",
+        engagement=Engagement(10, 2, 3),
+        media=MediaInfo(images=1),
+    )
+    second_rt = replace(
+        first_rt,
+        created_at=datetime(2026, 8, 9, 9, 0),
+        author="Other Snapshot Author",
+        author_id="9999999999",
+        source="Source B",
+        location="Place B",
+        engagement=Engagement(999, 888, 777),
+        media=MediaInfo(videos=2, article=True),
+    )
+    first = replace(
+        base,
+        id="7002",
+        created_at=datetime(2026, 8, 13, 1, 0),
+        retweet=first_rt,
+    )
+    second = replace(
+        base,
+        id="7001",
+        created_at=datetime(2026, 8, 12, 1, 0),
+        retweet=second_rt,
+    )
+    text, _, stats = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(replace(archive, posts=(first, second))),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+
+    source_dictionary = next(
+        line for line in text.splitlines() if line.startswith("来源字典：")
+    )
+    source_codes = dict(
+        entry.split("=", 1)
+        for entry in source_dictionary.removeprefix("来源字典：").split("；")
+    )
+    source_a_code = next(code for code, value in source_codes.items() if value == "Source A")
+    source_b_code = next(code for code, value in source_codes.items() if value == "Source B")
+
+    full_line = next(line for line in text.splitlines() if line.startswith(">[RT1｜"))
+    reference_line = next(
+        line for line in text.splitlines() if line.startswith(">[=RT1｜")
+    )
+    for fact in (
+        "SELF",
+        "@Target Alias",
+        "2026-08-10 10:00",
+        source_a_code,
+        "P=Place A",
+        "I1",
+        "R=10 C=2 L=3",
+    ):
+        assert fact in full_line
+    for fact in (
+        "@Other Snapshot Author",
+        "2026-08-09 09:00",
+        source_b_code,
+        "P=Place B",
+        "V2 A1",
+        "R=999 C=888 L=777",
+    ):
+        assert fact in reference_line
+    assert "SELF" not in reference_line
+    assert text.count(shared_body) == 1
+    assert stats["unique_retweets"] == 1
+    assert stats["duplicate_retweets"] == 1
+    assert "Metadata on every RT*/=RT* line belongs to that occurrence" in text
+    assert "must not be inherited from another" in text
+
+    complete_rt = replace(first_rt, id="901", text="verified complete body")
+    incomplete_rt = _as_incomplete(complete_rt, "unverified timeline preview")
+    complete_post = replace(first, id="7102", retweet=complete_rt)
+    incomplete_post = replace(second, id="7101", retweet=incomplete_rt)
+    variant_text, _, variant_stats = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(
+            replace(archive, posts=(complete_post, incomplete_post))
+        ),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    variant_lines = [
+        line for line in variant_text.splitlines() if line.startswith(">[RT1｜")
+    ]
+    assert len(variant_lines) == 2
+    assert not any(line.startswith(">[=RT1｜") for line in variant_text.splitlines())
+    assert "verified complete body" in variant_text
+    assert ">[PREVIEW_ONLY｜全文无法验证]" in variant_text
+    assert "> unverified timeline preview" in variant_text
+    assert any("CONTENT=INCOMPLETE" in line for line in variant_lines)
+    assert variant_stats["unique_retweets"] == 1
+    assert variant_stats["duplicate_retweets"] == 0
+
+    empty_top = replace(base, id="7200", text="", retweet=None, media=MediaInfo())
+    empty_text, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(replace(archive, posts=(empty_top,))),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    empty_header = next(line for line in empty_text.splitlines() if line.startswith("[W｜"))
+    assert "TEXT=EMPTY" in empty_header
+    assert "CONTENT=INCOMPLETE" not in empty_header
+    assert "[PREVIEW_ONLY｜" not in empty_text
 
 
 def test_invalid_author_uid_contract():
@@ -3059,6 +3207,7 @@ def main():
         ("0.4.2 AI Compact attribution schema", test_ai_compact_attribution_and_field_schema),
         ("0.5 semantic time provenance", test_semantic_time_provenance_and_presentation_contract),
         ("0.5 semantic engagement, empty RT, and SELF", test_semantic_engagement_empty_rt_and_self_identity),
+        ("0.5 lossless RT references and empty top-level W", test_ai_retweet_reference_is_lossless_per_occurrence),
         ("0.5 invalid author UID contract", test_invalid_author_uid_contract),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
         ("0.5 custom filter contract", test_custom_filter_contract),

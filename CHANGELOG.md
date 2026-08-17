@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-rc.2
+
+- Correct the visible and packaged version label after rc.1 retained the beta.2 internal version string.
+- Keep repeated RT references lossless by retaining each occurrence's metadata and re-emitting differing body snapshots.
+- Mark verified-empty top-level AI records explicitly with `TEXT=EMPTY`.
+- Reject runtime-generated `Archives` directories during release bundle auditing.
+
 ## 0.5.0-beta.2
 
 - Preserve source timestamp offsets without exporter-machine conversion and mark offset-free or relative timestamp provenance explicitly.

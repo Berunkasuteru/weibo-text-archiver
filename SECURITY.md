@@ -31,6 +31,8 @@ The application stores the Weibo login cookie locally at:
 
 The cookie is currently stored as plaintext for compatibility with earlier local versions. Users should never share this file. A future credential-storage change must fail safely and require a new login if stored credentials cannot be read.
 
+"Clear login information" removes saved login/session material only. It does not erase normalized archive caches or previously exported Markdown files.
+
 ## Local archive privacy
 
 `v7_cache/<uid>/last_success.json` is a normalized local archive. Version 2 stores source timestamp provenance, known UTC offsets, and optional author UIDs. Version 1 cannot recover the source offset or author UID and must not be silently interpreted with version 2 semantics. The application currently writes this cache but does not restore archives from it. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
