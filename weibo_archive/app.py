@@ -149,17 +149,19 @@ def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
 
 
 class ActivityIndicator(tk.Canvas):
-    """Small indeterminate two-ball indicator driven only by Tk's event loop."""
+    """Small indeterminate data-eater indicator driven only by Tk's event loop."""
 
     _INTERVAL_MS = 45
-    _LAST_FRAME = 32
+    _PASS_FRAMES = 56
+    _LAST_FRAME = _PASS_FRAMES * 2
+    _DOT_X = (46, 72, 98, 124, 150, 176, 202)
 
     def __init__(self, master):
         background = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
         super().__init__(
             master,
-            width=94,
-            height=14,
+            width=240,
+            height=16,
             background=background,
             borderwidth=0,
             highlightthickness=0,
@@ -191,7 +193,7 @@ class ActivityIndicator(tk.Canvas):
             except tk.TclError:
                 pass
         try:
-            self.delete("activity_ball")
+            self.delete("activity_item")
         except tk.TclError:
             pass
 
@@ -212,26 +214,63 @@ class ActivityIndicator(tk.Canvas):
             self._after_id = None
 
     def _draw_frame(self) -> None:
-        half_cycle = self._LAST_FRAME // 2
-        cycle_frame = self._frame % self._LAST_FRAME
-        progress = (
-            cycle_frame / half_cycle
-            if cycle_frame <= half_cycle
-            else (self._LAST_FRAME - cycle_frame) / half_cycle
+        pass_frame = self._frame % self._PASS_FRAMES
+        moving_right = self._frame < self._PASS_FRAMES
+        progress = pass_frame / (self._PASS_FRAMES - 1)
+        character_x = round(12 + 216 * progress) if moving_right else round(228 - 216 * progress)
+        center_y = 8
+        radius = 5
+        background = self.cget("background")
+
+        self.delete("activity_item")
+        visible_dots = (
+            (x for x in self._DOT_X if x > character_x + radius)
+            if moving_right
+            else (x for x in self._DOT_X if x < character_x - radius)
         )
-        left_x = 10 + round(34 * progress)
-        right_x = 84 - round(34 * progress)
-        radius = 3
-        self.delete("activity_ball")
-        for x, color in ((left_x, "#333333"), (right_x, "#777777")):
+        for x in visible_dots:
             self.create_oval(
-                x - radius,
-                7 - radius,
-                x + radius,
-                7 + radius,
-                fill=color,
+                x - 2,
+                center_y - 2,
+                x + 2,
+                center_y + 2,
+                fill="#888888",
                 outline="",
-                tags="activity_ball",
+                tags="activity_item",
+            )
+
+        self.create_oval(
+            character_x - radius,
+            center_y - radius,
+            character_x + radius,
+            center_y + radius,
+            fill="#444444",
+            outline="",
+            tags="activity_item",
+        )
+        mouth_direction = 1 if moving_right else -1
+        if (self._frame // 3) % 2 == 0:
+            mouth_edge = character_x + mouth_direction * (radius + 1)
+            self.create_polygon(
+                character_x,
+                center_y,
+                mouth_edge,
+                center_y - 4,
+                mouth_edge,
+                center_y + 4,
+                fill=background,
+                outline=background,
+                tags="activity_item",
+            )
+        else:
+            self.create_line(
+                character_x,
+                center_y,
+                character_x + mouth_direction * (radius + 1),
+                center_y,
+                fill=background,
+                width=1,
+                tags="activity_item",
             )
 
     def _on_destroy(self, event) -> None:
