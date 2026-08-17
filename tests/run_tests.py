@@ -371,6 +371,122 @@ def test_windows_preview_packaging_contract():
     assert "V7 " not in client_source
 
 
+def test_portable_archives_path_and_initial_output_defaults():
+    from weibo_archive.app import App
+    from weibo_archive.paths import (
+        application_dir,
+        default_output_dir,
+        fallback_output_dir,
+        prepare_output_dir,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
+        root = Path(td)
+        packaged_exe = root / "WeiboTextArchiver_0.5.0_Windows" / "WeiboTextArchiver.exe"
+        assert application_dir(
+            frozen=True,
+            executable=packaged_exe,
+        ) == packaged_exe.resolve().parent
+
+        source_root = root / "source"
+        source_root.mkdir()
+        preferred = default_output_dir(frozen=False, source_root=source_root)
+        assert preferred == source_root.resolve() / "Archives"
+        assert not preferred.exists()
+
+        blocked_preferred = root / "blocked-application" / "Archives"
+        blocked_preferred.parent.mkdir()
+        blocked_preferred.write_text("not a directory", encoding="utf-8")
+        fallback = fallback_output_dir(home=root / "home")
+        resolved = prepare_output_dir(blocked_preferred, fallback=fallback)
+        assert resolved == fallback
+        assert fallback.is_dir()
+
+        custom = root / "chosen-by-user"
+        unused_fallback = root / "must-not-be-used"
+        assert prepare_output_dir(custom) == custom
+        assert custom.is_dir()
+        assert not unused_fallback.exists()
+
+        blocked_custom = root / "blocked-custom"
+        blocked_custom.write_text("not a directory", encoding="utf-8")
+        try:
+            prepare_output_dir(blocked_custom)
+        except OSError as exc:
+            assert str(blocked_custom) in str(exc)
+        else:
+            raise AssertionError("a failing custom path must not silently use fallback")
+
+    paths_source = (ROOT / "weibo_archive" / "paths.py").read_text(encoding="utf-8")
+    assert "微博文字备份" not in paths_source
+    assert "Desktop" not in paths_source
+    for migration_operation in ("shutil", ".rename(", ".replace(", ".unlink("):
+        assert migration_operation not in paths_source
+
+    app = App()
+    try:
+        app.withdraw()
+        assert app.full_output_var.get() is True
+        assert app.ai_output_var.get() is True
+        assert app.custom_output_var.get() is False
+        assert Path(app.output_var.get()) == ROOT / "Archives"
+        selections = app._selected_export_selections()
+        assert tuple(selection.preset for selection in selections) == (
+            ExportPreset.FULL_ARCHIVE,
+            ExportPreset.AI_COMPACT,
+        )
+    finally:
+        app.destroy()
+
+
+def test_activity_indicator_lifecycle():
+    import time
+    import tkinter as tk
+
+    from weibo_archive.app import ActivityIndicator
+
+    root = tk.Tk()
+    root.withdraw()
+    indicator = ActivityIndicator(root)
+    indicator.pack()
+    root.update_idletasks()
+    try:
+        assert indicator._after_id is None
+        indicator.start()
+        first_after_id = indicator._after_id
+        assert first_after_id is not None
+        indicator.start()
+        assert indicator._after_id == first_after_id
+
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert indicator._frame > 0
+
+        indicator.stop()
+        stopped_frame = indicator._frame
+        assert indicator._after_id is None
+        assert indicator._running is False
+        deadline = time.monotonic() + 0.08
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert indicator._frame == stopped_frame
+
+        indicator.start()
+        assert indicator._after_id is not None
+        indicator.destroy()
+        deadline = time.monotonic() + 0.08
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert indicator._after_id is None
+        assert indicator._running is False
+    finally:
+        root.destroy()
+
+
 def test_parser_contract():
     basic = json.loads((ROOT / "tests/fixtures/profile_basic.json").read_text(encoding="utf-8"))
     detail = json.loads((ROOT / "tests/fixtures/profile_detail.json").read_text(encoding="utf-8"))
@@ -1907,10 +2023,17 @@ def test_multi_output_fetch_once_and_isolation():
             cookie_file.write_text("SUB=offline-fixture", encoding="utf-8")
             app_module.COOKIE_FILE = cookie_file
 
-            def run(selections, failing_suffix=None):
+            def run(
+                selections,
+                failing_suffix=None,
+                *,
+                permission_once=False,
+                fallback_dir=None,
+            ):
                 fetch_calls = []
                 saved_archives = []
                 rendered = []
+                permission_raised = False
 
                 class FakeClient:
                     def __init__(self, **_kwargs):
@@ -1929,8 +2052,12 @@ def test_multi_output_fetch_once_and_isolation():
                     before_commit=None,
                     selection_notice=None,
                 ):
+                    nonlocal permission_raised
                     if before_commit:
                         before_commit()
+                    if permission_once and not permission_raised:
+                        permission_raised = True
+                        raise PermissionError("fixture application directory is read-only")
                     if filename_suffix == failing_suffix:
                         raise OSError("fixture write failure")
                     rendered.append(
@@ -1961,6 +2088,7 @@ def test_multi_output_fetch_once_and_isolation():
                     FetchRange.trial(20),
                     folder,
                     selections,
+                    fallback_dir,
                 )
                 done = [event for event in worker.events if event[1] == "done"]
                 assert len(done) == 1
@@ -1998,6 +2126,18 @@ def test_multi_output_fetch_once_and_isolation():
             assert len(rendered) == 1
             assert [item["label"] for item in result["outputs"]] == ["完整归档"]
             assert [item["label"] for item in result["failures"]] == ["AI 分析版"]
+
+            fallback = folder / "Documents" / "WeiboTextArchiver" / "Archives"
+            fetch_calls, _, rendered, result = run(
+                two_outputs,
+                permission_once=True,
+                fallback_dir=fallback,
+            )
+            assert len(fetch_calls) == 1
+            assert len(rendered) == 2
+            assert result["output_dir"] == fallback
+            assert all(item["path"].parent == fallback for item in result["outputs"])
+            assert not result["failures"]
     finally:
         (
             app_module.COOKIE_FILE,
@@ -2892,6 +3032,8 @@ def main():
         ("startup import", test_startup_import),
         ("Alpha4 version and no-console GUI launcher", test_alpha4_version_and_gui_launcher),
         ("Windows preview packaging contract", test_windows_preview_packaging_contract),
+        ("portable Archives path and initial output defaults", test_portable_archives_path_and_initial_output_defaults),
+        ("activity indicator lifecycle", test_activity_indicator_lifecycle),
         ("raw parser contract", test_parser_contract),
         ("frozen model boundary", test_model_boundary),
         ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),

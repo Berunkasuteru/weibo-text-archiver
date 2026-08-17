@@ -29,7 +29,13 @@ from .export_options import (
 from .exporter import export_markdown
 from .models import ArchiveIntegrity, FetchRange, RangeMode, Termination
 from .network import Cancelled, NetworkError, RateLimited
-from .paths import APP_ICON_PNG, COOKIE_FILE, DEFAULT_OUTPUT_DIR
+from .paths import (
+    APP_ICON_PNG,
+    COOKIE_FILE,
+    default_output_dir,
+    fallback_output_dir,
+    prepare_output_dir,
+)
 from .security import redact_text, save_detailed_error
 from .storage import save_normalized_archive
 from .tasking import TaskManager, TaskState
@@ -142,6 +148,97 @@ def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
     ]
 
 
+class ActivityIndicator(tk.Canvas):
+    """Small indeterminate two-ball indicator driven only by Tk's event loop."""
+
+    _INTERVAL_MS = 45
+    _LAST_FRAME = 32
+
+    def __init__(self, master):
+        background = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
+        super().__init__(
+            master,
+            width=94,
+            height=14,
+            background=background,
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self._after_id: str | None = None
+        self._frame = 0
+        self._running = False
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def start(self) -> None:
+        if self._running:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        self._running = True
+        self._frame = 0
+        self._draw_frame()
+        self._schedule()
+
+    def stop(self) -> None:
+        self._running = False
+        after_id, self._after_id = self._after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        try:
+            self.delete("activity_ball")
+        except tk.TclError:
+            pass
+
+    def _schedule(self) -> None:
+        if self._running and self._after_id is None:
+            self._after_id = self.after(self._INTERVAL_MS, self._tick)
+
+    def _tick(self) -> None:
+        self._after_id = None
+        if not self._running:
+            return
+        try:
+            self._frame = (self._frame + 1) % self._LAST_FRAME
+            self._draw_frame()
+            self._schedule()
+        except tk.TclError:
+            self._running = False
+            self._after_id = None
+
+    def _draw_frame(self) -> None:
+        half_cycle = self._LAST_FRAME // 2
+        cycle_frame = self._frame % self._LAST_FRAME
+        progress = (
+            cycle_frame / half_cycle
+            if cycle_frame <= half_cycle
+            else (self._LAST_FRAME - cycle_frame) / half_cycle
+        )
+        left_x = 10 + round(34 * progress)
+        right_x = 84 - round(34 * progress)
+        radius = 3
+        self.delete("activity_ball")
+        for x, color in ((left_x, "#333333"), (right_x, "#777777")):
+            self.create_oval(
+                x - radius,
+                7 - radius,
+                x + radius,
+                7 + radius,
+                fill=color,
+                outline="",
+                tags="activity_ball",
+            )
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self:
+            self.stop()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -159,12 +256,14 @@ class App(tk.Tk):
         self.qr_status_var = tk.StringVar(value="正在获取二维码…")
 
         self.uid_var = tk.StringVar()
-        self.output_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
+        self.default_output_dir = default_output_dir()
+        self.fallback_output_dir = fallback_output_dir()
+        self.output_var = tk.StringVar(value=str(self.default_output_dir))
         self.range_mode_var = tk.StringVar(value=RangeMode.ALL.value)
         self.recent_count_var = tk.StringVar(value="1000")
         self.since_date_var = tk.StringVar(value="")
         self.full_output_var = tk.BooleanVar(value=True)
-        self.ai_output_var = tk.BooleanVar(value=False)
+        self.ai_output_var = tk.BooleanVar(value=True)
         self.custom_output_var = tk.BooleanVar(value=False)
         self.custom_options = ExportOptions()
         self.custom_filter = CustomFilterOptions()
@@ -175,6 +274,7 @@ class App(tk.Tk):
         self.range_hint_var = tk.StringVar(value="默认：抓取当前接口能访问到的全部微博。")
         self.logs_visible = False
         self._compact_geometry: tuple[int, int, int, int] | None = None
+        self._poll_after_id: str | None = None
 
         self._configure_style()
         self._build_ui()
@@ -187,7 +287,7 @@ class App(tk.Tk):
         self._refresh_login_status()
         self._update_range_controls()
         self._update_content_controls()
-        self.after(100, self._poll_events)
+        self._poll_after_id = self.after(100, self._poll_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -------------------- UI --------------------
@@ -412,8 +512,8 @@ class App(tk.Tk):
         )
         self.details_btn.pack(side="right")
 
-        self.progress = ttk.Progressbar(status_card, mode="indeterminate")
-        self.progress.pack(fill="x", pady=(9, 6))
+        self.activity = ActivityIndicator(status_card)
+        self.activity.pack(anchor="w", pady=(9, 6))
         ttk.Label(
             status_card,
             textvariable=self.progress_detail_var,
@@ -784,9 +884,9 @@ class App(tk.Tk):
 
         self.stop_btn.configure(state="normal" if running else "disabled")
         if running:
-            self.progress.start(12)
+            self.activity.start()
         else:
-            self.progress.stop()
+            self.activity.stop()
 
     # -------------------- Event channel --------------------
 
@@ -805,6 +905,7 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def _poll_events(self):
+        self._poll_after_id = None
         try:
             while True:
                 generation, kind, payload = self.events.get_nowait()
@@ -858,6 +959,8 @@ class App(tk.Tk):
                 elif kind == "done":
                     self.tasks.terminal(generation, TaskState.DONE)
                     self._set_running(False)
+                    if payload.get("output_dir"):
+                        self.output_var.set(str(payload["output_dir"]))
                     integrity = payload["integrity"]
                     if payload["failures"]:
                         self.status_var.set("Export complete · output warning")
@@ -906,7 +1009,10 @@ class App(tk.Tk):
         except queue.Empty:
             pass
 
-        self.after(100, self._poll_events)
+        try:
+            self._poll_after_id = self.after(100, self._poll_events)
+        except tk.TclError:
+            self._poll_after_id = None
 
     # -------------------- Login --------------------
 
@@ -1109,7 +1215,7 @@ class App(tk.Tk):
     def choose_output(self):
         folder = filedialog.askdirectory(
             title="选择 Markdown 保存位置",
-            initialdir=self.output_var.get() or str(DEFAULT_OUTPUT_DIR),
+            initialdir=self.output_var.get() or str(self.default_output_dir),
         )
         if folder:
             self.output_var.set(folder)
@@ -1140,12 +1246,22 @@ class App(tk.Tk):
             messagebox.showwarning("导出设置有误", str(exc))
             return
 
-        output_dir = Path(self.output_var.get().strip() or DEFAULT_OUTPUT_DIR).expanduser()
+        requested_output_dir = Path(
+            self.output_var.get().strip() or self.default_output_dir
+        ).expanduser()
+        is_default_output = requested_output_dir == self.default_output_dir
+        fallback_dir = self.fallback_output_dir if is_default_output else None
         try:
-            output_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
+            output_dir = prepare_output_dir(
+                requested_output_dir,
+                fallback=fallback_dir,
+            )
+        except OSError as exc:
             messagebox.showerror("保存位置不可用", str(exc))
             return
+        if output_dir != requested_output_dir:
+            self.output_var.set(str(output_dir))
+            fallback_dir = None
 
         try:
             generation, cancel = self.tasks.start(TaskState.FETCHING)
@@ -1171,6 +1287,7 @@ class App(tk.Tk):
                 fetch_range,
                 output_dir,
                 export_selections,
+                fallback_dir,
             ),
             daemon=True,
         )
@@ -1184,6 +1301,7 @@ class App(tk.Tk):
         fetch_range: FetchRange,
         output_dir: Path,
         export_selections: tuple[ExportSelection, ...],
+        fallback_dir: Path | None = None,
     ):
         terminal_sent = False
         try:
@@ -1231,14 +1349,32 @@ class App(tk.Tk):
                     selection_notice = filter_report_notice(filter_report)
 
                 try:
-                    output_path, stats = export_markdown(
-                        render_archive,
-                        output_dir,
-                        selection.options,
-                        selection.filename_suffix,
-                        before_commit=before_commit,
-                        selection_notice=selection_notice,
-                    )
+                    try:
+                        output_path, stats = export_markdown(
+                            render_archive,
+                            output_dir,
+                            selection.options,
+                            selection.filename_suffix,
+                            before_commit=before_commit,
+                            selection_notice=selection_notice,
+                        )
+                    except PermissionError:
+                        if fallback_dir is None:
+                            raise
+                        output_dir = prepare_output_dir(fallback_dir)
+                        fallback_dir = None
+                        self._worker_log(
+                            generation,
+                            f"应用目录不可写，改用备用保存位置：{output_dir}",
+                        )
+                        output_path, stats = export_markdown(
+                            render_archive,
+                            output_dir,
+                            selection.options,
+                            selection.filename_suffix,
+                            before_commit=before_commit,
+                            selection_notice=selection_notice,
+                        )
                 except Cancelled:
                     raise
                 except Exception as exc:
@@ -1254,6 +1390,8 @@ class App(tk.Tk):
                         f"{selection.label} 本地输出失败：{safe_error}",
                     )
                     continue
+
+                fallback_dir = None
 
                 outputs.append(
                     {
@@ -1281,6 +1419,7 @@ class App(tk.Tk):
                 "count": len(archive.posts),
                 "outputs": outputs,
                 "failures": failures,
+                "output_dir": output_dir,
             }
             self._emit(generation, "done", summary)
             terminal_sent = True
@@ -1480,6 +1619,17 @@ class App(tk.Tk):
                 return
             self.tasks.cancel()
         self.destroy()
+
+    def destroy(self):
+        if hasattr(self, "activity"):
+            self.activity.stop()
+        after_id, self._poll_after_id = self._poll_after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        super().destroy()
 
 
 def main():

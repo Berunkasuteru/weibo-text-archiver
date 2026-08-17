@@ -13,6 +13,42 @@ A local Windows tool for exporting Weibo posts into trustworthy Markdown archive
 - Processes archive data locally.
 - Uses no browser automation and downloads no runtime dependencies.
 
+## Quick start
+
+1. Extract the Windows ZIP and run `WeiboTextArchiver.exe`.
+2. Sign in to Weibo and enter the target account UID.
+3. If you are unsure, keep both **Full Archive** and **AI 分析版** selected.
+4. Choose a range, or use **Test Export** for a small first run, then start the export.
+5. Results are saved under `Archives` beside the application. If that portable location cannot be written, the tool falls back to `Documents\WeiboTextArchiver\Archives`.
+6. Open **Full Archive** for human reading and manual verification.
+7. Upload **AI 分析版** to an LLM when you want structured analysis.
+
+## Which output should I use?
+
+- **Full Archive** is the human-readable archival and reference copy. Use it for manual reading and verification.
+- **AI 分析版** preserves the same verified body facts while adding machine-oriented structure and explicit provenance, uncertainty, and attribution boundaries. It is intended for LLM analysis, not as a guaranteed smaller file.
+- **Custom** creates a deterministic local working set when you need only selected record types, keywords, dates, or metadata fields.
+
+## Try these with an AI
+
+- Summarize how my interests changed over several years, citing specific posts as evidence.
+- Identify games, works, people, or topics I repeatedly discussed.
+- Build a chronological timeline of notable events I explicitly mentioned.
+- Find older posts or recurring themes I may have forgotten.
+- Identify places I explicitly said I visited, separating them from places merely mentioned and from publication-location metadata.
+- Analyze changes in my writing style over time, with representative examples.
+- Identify recurring self-reposted older posts without confusing matching display names with verified identity.
+- Summarize my interests and attitudes while keeping my own top-level text distinct from nested repost-source text.
+
+Media markers such as `I`, `V`, and `A` show canonical detected media facts; the media itself is not exported. Ask the AI not to infer unseen image, video, or article contents from those markers alone.
+
+## Important limits
+
+- A visible timeline preview is not silently treated as verified full text.
+- AI analysis remains limited by the exported evidence and is not made hallucination-proof by formatting.
+- Weibo access, authentication, rate limits, and undocumented response changes can stop an export.
+- Keep the Full Archive when manual verification or long-term reference matters.
+
 ## Why archive integrity matters
 
 The application never treats a visible timeline preview as verified full text. If approved full-text paths independently prove that content is currently unavailable, the archive marks that record as incomplete and keeps any preview explicitly unverified. Unknown, mixed, authentication, network, schema, and rate-limit failures remain fail-closed.
@@ -79,7 +115,7 @@ python environment_check.py
 python tests/run_tests.py
 ```
 
-The current suite contains 50 offline regression checks.
+The current suite contains 56 offline regression checks.
 
 ## Build
 
