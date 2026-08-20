@@ -1,128 +1,121 @@
 # Weibo Text Archiver
 
-A local Windows tool for exporting Weibo posts into trustworthy Markdown archives.
+把个人微博历史整理成属于自己的本地 Markdown 归档，便于长期阅读、人工核验与 AI 分析。
 
-## What it does
+归档过程在本机完成。程序不内置 LLM，也不会把归档自动上传到云端；是否把导出文件交给 ChatGPT、Claude、Gemini、DeepSeek、Qwen、豆包或其他第三方服务，始终由用户自行决定。
 
-- Exports Weibo posts to Markdown.
-- Generates any combination of Full Archive, AI 分析版, and Custom outputs from one fetch.
-- Supports full snapshots, recent-post limits, date-based ranges, and a 20-post test export.
-- Retrieves long-text content through explicitly supported paths.
-- Marks narrowly proven unavailable content as incomplete instead of presenting a timeline preview as full text.
-- Reports archive integrity separately from pagination completion.
-- Processes archive data locally.
-- Uses no browser automation and downloads no runtime dependencies.
+## 它能做什么
 
-## Quick start
+- 一次读取可生成完整归档、AI 分析版和自定义导出中的任意组合。
+- 支持全量快照、最近 N 条、起始日期范围和最近 20 条的测试导出。
+- 通过明确支持的路径取得长微博正文。
+- 对当前无法验证的历史内容做显式标记，不把列表预览冒充完整正文。
+- 将归档完整性与分页是否结束分开报告。
+- 输出本地 Markdown，不使用浏览器自动化，也不在运行时下载依赖。
 
-1. Extract the Windows ZIP and run `WeiboTextArchiver.exe`.
-2. Sign in to Weibo and enter the target account UID.
-3. If you are unsure, keep both **Full Archive** and **AI 分析版** selected.
-4. Choose a range, or use **Test Export** for a small first run, then start the export.
-5. Results are saved under `Archives` beside the application. If that portable location cannot be written, the tool falls back to `Documents\WeiboTextArchiver\Archives`.
-6. Open **Full Archive** for human reading and manual verification.
-7. Upload **AI 分析版** to an LLM when you want structured analysis.
+## 快速开始
 
-## Which output should I use?
+1. 解压 Windows ZIP，运行 `WeiboTextArchiver.exe`。
+2. 扫码登录微博，输入目标账号的数字 UID。
+3. 如果不确定如何选择，保留默认勾选的“完整归档”和“AI 分析版”。
+4. 可以先用“测试导出”验证流程；它只读取最近 20 条，不代表完整归档。
+5. 正式导出后，文件默认保存在程序旁的 `Archives` 文件夹；若该位置不可写，则使用 `Documents\WeiboTextArchiver\Archives`。
+6. 用完整归档进行长期保存、人工阅读和未来核验。
+7. 需要模型分析时，再由你选择是否把 AI 分析版上传到第三方 AI 服务。
 
-- **Full Archive** is the human-readable archival and reference copy. Use it for manual reading and verification.
-- **AI 分析版** preserves the same verified body facts while adding machine-oriented structure and explicit provenance, uncertainty, and attribution boundaries. It is intended for LLM analysis, not as a guaranteed smaller file.
-- **Custom** creates a deterministic local working set when you need only selected record types, keywords, dates, or metadata fields.
+## 应该选择哪种输出？
 
-## Try these with an AI
+### 完整归档
 
-- Summarize how my interests changed over several years, citing specific posts as evidence.
-- Identify games, works, people, or topics I repeatedly discussed.
-- Build a chronological timeline of notable events I explicitly mentioned.
-- Find older posts or recurring themes I may have forgotten.
-- Identify places I explicitly said I visited, separating them from places merely mentioned and from publication-location metadata.
-- Analyze changes in my writing style over time, with representative examples.
-- Identify recurring self-reposted older posts without confusing matching display names with verified identity.
-- Summarize my interests and attitudes while keeping my own top-level text distinct from nested repost-source text.
+面向人工阅读和长期保存的归档版本，适合：
 
-Media markers such as `I`, `V`, and `A` show canonical detected media facts; the media itself is not exported. Ask the AI not to infer unseen image, video, or article contents from those markers alone.
+- 长期保留个人微博历史；
+- 按时间阅读和人工核验；
+- 为未来重新整理或迁移保留可靠参考。
 
-## Important limits
+它不是微博服务器数据的逐字节镜像，也不会把当前无法访问或无法验证的内容伪装成完整正文。
 
-- A visible timeline preview is not silently treated as verified full text.
-- AI analysis remains limited by the exported evidence and is not made hallucination-proof by formatting.
-- Weibo access, authentication, rate limits, and undocumented response changes can stop an export.
-- Keep the Full Archive when manual verification or long-term reference matters.
+### AI 分析版
 
-## Why archive integrity matters
+针对语言模型分析优化的确定性结构化表示：
 
-The application never treats a visible timeline preview as verified full text. If approved full-text paths independently prove that content is currently unavailable, the archive marks that record as incomplete and keeps any preview explicitly unverified. Unknown, mixed, authentication, network, schema, and rate-limit failures remain fail-closed.
+- 不会在导出过程中调用任何 LLM；
+- 不是 AI 自动生成的摘要；
+- 已验证且未重复的正文不会被有意摘要或删减；
+- 明确区分目标账号的顶层文字与嵌套转发原文；
+- 明确标注来源、归属、不确定性、缺失与预览边界；
+- 对重复转发正文使用显式引用，减少不必要的重复。
+
+不同模型可能给出不同分析结果。把文件上传到第三方服务意味着由用户主动向该服务披露文件内容，请根据自己的隐私需求决定是否使用。
+
+### 自定义导出
+
+在本机对本次已读取记录生成确定性工作集。可以选择部分元数据，并按原创/转发、关键词和可选日期范围筛选；不会为了筛选再次联网。
+
+关键词对 ASCII 不区分大小写并使用子串匹配。多个关键词使用 OR；类型、关键词和日期三类条件之间使用 AND。当前模型没有可靠的结构化话题字段，如需筛选话题，可直接把 `#话题#` 作为普通关键词。
+
+## 可以用 AI 分析版问什么？
+
+- 我的兴趣在这些年里发生了哪些变化？请引用具体微博作为证据。
+- 哪些游戏、作品、人物或主题被我反复提到，却可能已经忘记？
+- 我的表达方式或写作风格是否随时间发生变化？
+- 请按时间整理我明确提到的重要事件，不要补充归档中不存在的信息。
+- 我明确说去过哪些地方？请区分“去过”“只在正文中提到”和微博显示的发布位置。
+- 哪些观点随时间发生变化？请列出相互支持或矛盾的原文证据。
+- 哪些旧微博后来被我再次转发？请区分顶层评论与转发原文。
+- 哪些结论证据充分，哪些只是可能的解释？请分别说明依据和不确定性。
+
+`I`、`V`、`A` 等媒体标记只描述归档识别到的媒体事实，图片、视频或文章内容本身并未导出。不要要求模型凭这些标记猜测未看到的媒体内容。
+
+## 重要边界
+
+- 时间线中可见的预览不等于已经验证的完整正文。
+- 只有满足严格证据条件时，当前不可访问内容才会被明确标为不完整。
+- 登录、验证、限流、网络、未知结构或大范围访问异常会使任务停止，而不是产生看起来完整的归档。
+- AI 分析仍受导出证据限制，结构化格式不能保证模型不产生错误推断。
+- 微博可能调整未公开接口、返回结构或访问策略。
 
 ## Windows
 
-The Windows package targets Windows 10/11 x64 and does not require a Python installation.
+Windows 包面向 Windows 10/11 x64，不需要预先安装 Python。
 
-### Download from GitHub Releases
-
-Download `WeiboTextArchiver_Windows.zip` from the latest GitHub Release, extract it, and run:
+从最新 GitHub Release 下载 `WeiboTextArchiver_Windows.zip`，解压后运行：
 
 ```text
 WeiboTextArchiver.exe
 ```
 
-### Download from Command Prompt
-
-To save the latest regular release in the current Command Prompt directory:
+也可以在命令提示符中下载最新正式 Release：
 
 ```cmd
 curl.exe -fL -o WeiboTextArchiver_Windows.zip https://github.com/Berunkasuteru/weibo-text-archiver/releases/latest/download/WeiboTextArchiver_Windows.zip
 ```
 
-The downloaded ZIP is saved in the directory currently open in Command Prompt.
-
-### Run from source
-
-To run from source with Python 3:
+## 从源码运行
 
 ```text
 python -m weibo_archive.app
 ```
 
-## Export modes
+## 隐私与安全
 
-- **Full Archive** preserves the complete supported Markdown record.
-- **AI 分析版** preserves the same verified body facts as Full Archive while strengthening structure, deduplication, and semantic labels for AI analysis.
-- **Custom** lets users choose selected metadata fields and date precision, then locally filter the fetched records by original/repost type, keyword, and an optional inclusive date slice.
+- 登录凭据只保存在本机，并用于直接请求微博；项目不运营凭据上传服务。
+- 不使用浏览器自动化，不关闭 TLS 证书验证。
+- Markdown 与规范化归档缓存都保存在本机。
+- 诊断信息会经过脱敏，但仍不应向他人发送 `cookie.txt`。
+- “清除登录信息”只删除登录/会话材料，不会删除缓存或已经导出的 Markdown。
 
-Custom keywords are case-insensitive for ASCII and use substring matching. Multiple keywords use OR; type, keyword, and date categories combine with AND. Searchable text includes the target account's available text and available repost-source text. An incomplete preview may help select a record, but remains explicitly unverified and never becomes complete.
-
-The model has no reliable structured hashtag field, so this beta does not provide a separate hashtag filter. A literal `#topic#` can still be entered as a keyword. Records with unknown timestamps remain eligible when no Custom date filter is active; with a date filter they are excluded from the confirmed slice and reported separately.
-
-## Privacy and security
-
-- Login credentials remain in local application storage and are used for direct requests to Weibo; the project operates no credential-upload service.
-- The application does not use browser automation.
-- TLS certificate verification is not bypassed.
-- Markdown exports and normalized archive data are written locally.
-- Diagnostic output is redacted, but users should still never share their cookie file.
-
-## Limitations
-
-- Weibo may change undocumented endpoints, response structures, or access behavior.
-- Unavailable historical content may be explicitly marked incomplete when the narrow evidence requirements are met.
-- Login, challenge, rate-limit, widespread access, and unknown failures stop the task rather than producing a misleading complete archive.
-- Current packaging is focused on Windows 10/11 x64.
-
-## Development
+## 开发与构建
 
 ```text
 python environment_check.py
 python tests/run_tests.py
 ```
 
-The current suite contains 57 offline regression checks.
+当前测试套件包含 58 项离线回归检查。
 
-## Build
-
-Run `BUILD_WINDOWS.bat` on Windows. It uses the isolated `.venv-build` environment and creates a PyInstaller `onedir` / `windowed` ZIP plus `SHA256.txt` under `release/`.
+在 Windows 上运行 `BUILD_WINDOWS.bat` 可使用隔离的 `.venv-build` 环境生成 PyInstaller `onedir` / `windowed` ZIP，并在 `release/` 下写入 `SHA256.txt`。
 
 ## License
 
-Weibo Text Archiver is released under the MIT License.
-
-Third-party components remain subject to their respective licenses. See `THIRD_PARTY_NOTICES.txt` and `THIRD_PARTY_LICENSES/`.
+Weibo Text Archiver 使用 MIT License。第三方组件仍受各自许可证约束，详见 `THIRD_PARTY_NOTICES.txt` 与 `THIRD_PARTY_LICENSES/`。

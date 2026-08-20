@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import queue
 import threading
+import time
 from datetime import date, datetime
 from pathlib import Path
 import tkinter as tk
@@ -42,10 +43,23 @@ from .tasking import TaskManager, TaskState
 
 
 APP_TITLE = "Weibo Text Archiver"
-APP_SUBTITLE = "微博文字导出 / AI Archive"
+APP_SUBTITLE = "把微博历史整理成便于长期保存与 AI 分析的本地归档"
 TEST_EXPORT_LIMIT = 20
 DEFAULT_WINDOW_WIDTH = 860
 DEFAULT_COMPACT_HEIGHT = 760
+
+
+def format_elapsed_time(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    return f"{minutes:02}:{seconds:02}"
+
+
+def activity_status_text(read_count: int, elapsed_seconds: float) -> str:
+    return f"已读取 {max(0, int(read_count)):,} 条 · 用时 {format_elapsed_time(elapsed_seconds)}"
 
 
 def _compact_window_height(configured_height: int, requested_height: int) -> int:
@@ -308,12 +322,17 @@ class App(tk.Tk):
         self.custom_filter = CustomFilterOptions()
         self.content_summary_var = tk.StringVar()
         self.login_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="Ready")
+        self.status_var = tk.StringVar(value="就绪")
         self.progress_detail_var = tk.StringVar(value="等待任务")
+        self.activity_status_var = tk.StringVar(value="")
         self.range_hint_var = tk.StringVar(value="默认：抓取当前接口能访问到的全部微博。")
         self.logs_visible = False
         self._compact_geometry: tuple[int, int, int, int] | None = None
         self._poll_after_id: str | None = None
+        self._activity_after_id: str | None = None
+        self._activity_started_at: float | None = None
+        self._activity_read_count = 0
+        self._activity_timer_running = False
 
         self._configure_style()
         self._build_ui()
@@ -368,7 +387,7 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(0, 18))
 
         # Account
-        self._section_label("ACCOUNT")
+        self._section_label("登录账号")
         account = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         account.pack(fill="x", pady=(4, 14))
 
@@ -389,7 +408,7 @@ class App(tk.Tk):
         self.login_btn.pack(side="right", padx=(0, 8))
 
         # Target
-        self._section_label("TARGET")
+        self._section_label("目标账号")
         target = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         target.pack(fill="x", pady=(4, 14))
 
@@ -402,7 +421,7 @@ class App(tk.Tk):
         self.uid_entry.pack(fill="x", pady=(7, 0))
 
         # Range
-        self._section_label("RANGE")
+        self._section_label("导出范围")
         range_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         range_card.pack(fill="x", pady=(4, 14))
 
@@ -457,7 +476,7 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(7, 0))
 
         # Output selection
-        self._section_label("OUTPUT")
+        self._section_label("导出内容")
         content_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         content_card.pack(fill="x", pady=(4, 14))
 
@@ -494,7 +513,7 @@ class App(tk.Tk):
         self.custom_settings_btn.pack(side="right", padx=(8, 0))
 
         # Save location
-        self._section_label("SAVE TO")
+        self._section_label("保存位置")
         output_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
         output_card.pack(fill="x", pady=(4, 14))
         output_row = ttk.Frame(output_card)
@@ -519,6 +538,12 @@ class App(tk.Tk):
             command=lambda: self.start_export(trial=True),
         )
         self.trial_btn.pack(side="left")
+        self.trial_hint_label = ttk.Label(
+            actions,
+            text=f"快速验证 · 最近 {TEST_EXPORT_LIMIT} 条",
+            style="Muted.TLabel",
+        )
+        self.trial_hint_label.pack(side="left", padx=(10, 0))
 
         self.stop_btn = ttk.Button(
             actions,
@@ -551,8 +576,16 @@ class App(tk.Tk):
         )
         self.details_btn.pack(side="right")
 
-        self.activity = ActivityIndicator(status_card)
-        self.activity.pack(anchor="w", pady=(9, 6))
+        activity_row = ttk.Frame(status_card)
+        activity_row.pack(fill="x", pady=(9, 6))
+        self.activity = ActivityIndicator(activity_row)
+        self.activity.pack(side="left")
+        self.activity_status_label = ttk.Label(
+            activity_row,
+            textvariable=self.activity_status_var,
+            style="Muted.TLabel",
+        )
+        self.activity_status_label.pack(side="left", padx=(10, 0))
         ttk.Label(
             status_card,
             textvariable=self.progress_detail_var,
@@ -926,6 +959,60 @@ class App(tk.Tk):
             self.activity.start()
         else:
             self.activity.stop()
+            self._stop_activity_timer()
+
+    def _start_activity_timer(self) -> None:
+        if self._activity_timer_running:
+            return
+        self._activity_started_at = time.monotonic()
+        self._activity_read_count = 0
+        self._activity_timer_running = True
+        self._render_activity_status()
+        self._schedule_activity_timer()
+
+    def _schedule_activity_timer(self) -> None:
+        if self._activity_timer_running and self._activity_after_id is None:
+            self._activity_after_id = self.after(500, self._activity_timer_tick)
+
+    def _activity_timer_tick(self) -> None:
+        self._activity_after_id = None
+        if not self._activity_timer_running:
+            return
+        try:
+            self._render_activity_status()
+            self._schedule_activity_timer()
+        except tk.TclError:
+            self._activity_timer_running = False
+            self._activity_after_id = None
+
+    def _render_activity_status(self) -> None:
+        if self._activity_started_at is None:
+            return
+        elapsed = time.monotonic() - self._activity_started_at
+        self.activity_status_var.set(
+            activity_status_text(self._activity_read_count, elapsed)
+        )
+
+    def _set_activity_read_count(self, count: object) -> None:
+        if self._activity_started_at is None:
+            return
+        try:
+            value = max(0, int(count))
+        except (TypeError, ValueError):
+            return
+        self._activity_read_count = max(self._activity_read_count, value)
+        self._render_activity_status()
+
+    def _stop_activity_timer(self) -> None:
+        if self._activity_started_at is not None:
+            self._render_activity_status()
+        self._activity_timer_running = False
+        after_id, self._activity_after_id = self._activity_after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
 
     # -------------------- Event channel --------------------
 
@@ -963,6 +1050,7 @@ class App(tk.Tk):
                     message, data = payload
                     self.progress_detail_var.set(message)
                     if data and data.get("posts") is not None:
+                        self._set_activity_read_count(data["posts"])
                         count_label = data.get("count_label") or "条"
                         bits = [f"{data['posts']:,} {count_label}"]
                         if data.get("page"):
@@ -973,7 +1061,7 @@ class App(tk.Tk):
                                 bits.append(f"推进至 {d:%Y-%m-%d}")
                             except Exception:
                                 pass
-                        self.status_var.set("Fetching · " + " · ".join(bits))
+                        self.status_var.set("正在读取 · " + " · ".join(bits))
 
                 elif kind == "qr_matrix":
                     self._draw_qr(payload)
@@ -983,7 +1071,7 @@ class App(tk.Tk):
 
                 elif kind == "phase_export":
                     self.tasks.transition(TaskState.EXPORTING)
-                    self.status_var.set("Exporting")
+                    self.status_var.set("正在生成归档")
                     self.progress_detail_var.set("正在生成 Markdown 并验证输出…")
 
                 elif kind == "ready":
@@ -991,7 +1079,8 @@ class App(tk.Tk):
                     self._close_qr_window()
                     self._set_running(False)
                     self._refresh_login_status()
-                    self.status_var.set("Ready")
+                    self.status_var.set("就绪")
+                    self.activity_status_var.set("")
                     self.progress_detail_var.set("登录成功，可以开始导出。")
                     messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
 
@@ -1002,20 +1091,20 @@ class App(tk.Tk):
                         self.output_var.set(str(payload["output_dir"]))
                     integrity = payload["integrity"]
                     if payload["failures"]:
-                        self.status_var.set("Export complete · output warning")
+                        self.status_var.set("导出完成 · 输出提醒")
                         self.progress_detail_var.set(
                             f"已生成 {len(payload['outputs'])} 个文件；"
                             f"{len(payload['failures'])} 个本地输出失败。"
                         )
                     elif integrity.incomplete_records:
-                        self.status_var.set("Export complete · integrity warning")
+                        self.status_var.set("导出完成 · 完整性提醒")
                         self.progress_detail_var.set(
                             "导出已完成；"
                             f"其中 {integrity.incomplete_records:,} 条记录"
                             "含无法验证的历史内容。"
                         )
                     else:
-                        self.status_var.set("Export complete")
+                        self.status_var.set("导出完成")
                         self.progress_detail_var.set("本次导出已完成并写入 Markdown。")
                     self._show_completion(payload)
                     self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
@@ -1024,7 +1113,9 @@ class App(tk.Tk):
                     self.tasks.terminal(generation, TaskState.ERROR)
                     self._close_qr_window()
                     self._set_running(False)
-                    self.status_var.set("Error")
+                    self.status_var.set("失败")
+                    if self._activity_started_at is None:
+                        self.activity_status_var.set("")
                     self.progress_detail_var.set("任务失败；未把旧缓存伪装成成功结果。")
                     self.toggle_logs(True)
                     friendly, detail_path = payload
@@ -1041,7 +1132,9 @@ class App(tk.Tk):
                     self.tasks.terminal(generation, TaskState.CANCELLED)
                     self._close_qr_window()
                     self._set_running(False)
-                    self.status_var.set("Cancelled")
+                    self.status_var.set("已取消")
+                    if self._activity_started_at is None:
+                        self.activity_status_var.set("")
                     self.progress_detail_var.set("任务已取消；迟到的旧任务事件将被忽略。")
                     self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
 
@@ -1150,9 +1243,13 @@ class App(tk.Tk):
             return
 
         self._open_qr_window()
+        self._stop_activity_timer()
+        self._activity_started_at = None
+        self._activity_read_count = 0
+        self.activity_status_var.set("登录处理中")
         self._set_running(True)
-        self.status_var.set("Authenticating")
-        self.progress_detail_var.set("正在连接微博 Passport…")
+        self.status_var.set("正在登录")
+        self.progress_detail_var.set("正在连接微博登录服务…")
         self._append_log("\n=== WEIBO TEXT ARCHIVER QR AUTH ===\n")
 
         self.worker = threading.Thread(
@@ -1308,8 +1405,9 @@ class App(tk.Tk):
             return
 
         self.uid_var.set(uid)
+        self._start_activity_timer()
         self._set_running(True)
-        self.status_var.set("Fetching")
+        self.status_var.set("正在读取")
         self.progress_detail_var.set(
             f"{fetch_range.label()} · 正在启动独立抓取核心…"
         )
@@ -1519,7 +1617,7 @@ class App(tk.Tk):
         self.tasks.cancel()
         self._close_qr_window()
         self._set_running(False)
-        self.status_var.set("Cancelled")
+        self.status_var.set("已取消")
         self.progress_detail_var.set("已取消。正在退出的旧网络请求即使迟到也不会影响界面。")
         self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
 
@@ -1630,7 +1728,7 @@ class App(tk.Tk):
             ).grid(row=0, column=index, sticky="ew", padx=4)
         ttk.Button(
             actions,
-            text="打开导出文件夹",
+            text="打开归档文件夹",
             style="CompletionAction.TButton",
             command=lambda: launch(outputs[0]["path"].parent),
         ).grid(row=0, column=len(outputs), sticky="ew", padx=4)
@@ -1664,6 +1762,7 @@ class App(tk.Tk):
     def destroy(self):
         if hasattr(self, "activity"):
             self.activity.stop()
+        self._stop_activity_timer()
         after_id, self._poll_after_id = self._poll_after_id, None
         if after_id is not None:
             try:

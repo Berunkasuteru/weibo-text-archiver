@@ -296,6 +296,12 @@ def test_windows_preview_packaging_contract():
     assert {16, 24, 32, 48, 64, 128, 256} <= sizes
 
     generator = ROOT / "tools" / "generate_icon.py"
+    generator_source = generator.read_text(encoding="utf-8")
+    assert "def _render_balanced" in generator_source
+    assert "selected Round 3 Balanced archive mark" in generator_source
+    assert "document" not in generator_source.lower()
+    assert "arrow" not in generator_source.lower()
+    assert 'TEAL = "#4B9B96"' in generator_source
     result = subprocess.run(
         [sys.executable, str(generator), "--check"],
         cwd=str(ROOT),
@@ -367,12 +373,15 @@ def test_windows_preview_packaging_contract():
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# Weibo Text Archiver\n")
-    assert "AI 分析版" in readme
-    readme_without_mode_name = readme.replace("AI 分析版", "")
-    assert not any(
-        "\u4e00" <= character <= "\u9fff"
-        for character in readme_without_mode_name
-    )
+    for current_positioning in (
+        "本地 Markdown 归档",
+        "完整归档",
+        "AI 分析版",
+        "程序不内置 LLM",
+        "由用户主动向该服务披露文件内容",
+        "最近 20 条",
+    ):
+        assert current_positioning in readme
     assert not (ROOT / "README_先看.txt").exists()
     assert not (ROOT / "docs" / "ROADMAP.md").exists()
     assert not (ROOT / "启动微博文字导出器.bat").exists()
@@ -384,12 +393,30 @@ def test_windows_preview_packaging_contract():
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     for chinese_ui_text in (
         "扫码登录 / 更新",
+        "登录账号",
+        "目标账号",
+        "导出范围",
         "导出内容",
+        "保存位置",
         "测试导出",
+        "快速验证 · 最近",
         "开始导出 →",
         "清除登录信息",
+        "正在读取",
+        "正在生成归档",
     ):
         assert chinese_ui_text in app_source
+    for obsolete_english_ui in (
+        'self._section_label("ACCOUNT")',
+        'self._section_label("TARGET")',
+        'self._section_label("RANGE")',
+        'self._section_label("OUTPUT")',
+        'self._section_label("SAVE TO")',
+        'self.status_var.set("Fetching")',
+        'self.status_var.set("Exporting")',
+        'self.status_var.set("Ready")',
+    ):
+        assert obsolete_english_ui not in app_source
     for obsolete_action in ("试抓 50 条", "开始备份 →", 'text="清除登录"'):
         assert obsolete_action not in app_source
     client_source = (ROOT / "weibo_archive" / "client.py").read_text(encoding="utf-8")
@@ -511,6 +538,81 @@ def test_activity_indicator_lifecycle():
         assert indicator._running is False
     finally:
         root.destroy()
+
+
+def test_final_polish_activity_status_and_localized_ui():
+    import time
+
+    from weibo_archive import VERSION_DISPLAY
+    from weibo_archive.app import (
+        APP_SUBTITLE,
+        APP_TITLE,
+        TEST_EXPORT_LIMIT,
+        App,
+        activity_status_text,
+        format_elapsed_time,
+    )
+
+    expected_times = {
+        0: "00:00",
+        9: "00:09",
+        59: "00:59",
+        60: "01:00",
+        3599: "59:59",
+        3600: "1:00:00",
+        7322: "2:02:02",
+    }
+    for seconds, expected in expected_times.items():
+        assert format_elapsed_time(seconds) == expected
+    assert activity_status_text(0, 0) == "已读取 0 条 · 用时 00:00"
+    assert activity_status_text(1, 9) == "已读取 1 条 · 用时 00:09"
+    assert activity_status_text(347, 42) == "已读取 347 条 · 用时 00:42"
+    assert activity_status_text(1000, 3600) == "已读取 1,000 条 · 用时 1:00:00"
+
+    app = App()
+    app.withdraw()
+    app.update_idletasks()
+    try:
+        assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
+        assert VERSION_DISPLAY == "0.5.0-rc.2"
+        assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
+        assert app.full_output_var.get() is True
+        assert app.ai_output_var.get() is True
+        assert app.custom_output_var.get() is False
+        assert TEST_EXPORT_LIMIT == 20
+        assert app.trial_btn.cget("text") == "测试导出"
+        assert app.trial_hint_label.cget("text") == "快速验证 · 最近 20 条"
+
+        app._start_activity_timer()
+        first_after_id = app._activity_after_id
+        first_started_at = app._activity_started_at
+        assert first_after_id is not None
+        app._start_activity_timer()
+        assert app._activity_after_id == first_after_id
+        assert app._activity_started_at == first_started_at
+        assert app._activity_read_count == 0
+
+        app._set_activity_read_count(347)
+        assert app._activity_read_count == 347
+        before_animation = app._activity_read_count
+        app.activity.start()
+        app.activity._tick()
+        assert app._activity_read_count == before_animation
+
+        app._stop_activity_timer()
+        assert app._activity_after_id is None
+        assert app._activity_timer_running is False
+        stopped_count = app._activity_read_count
+        time.sleep(0.02)
+        app.update()
+        assert app._activity_read_count == stopped_count
+
+        app._start_activity_timer()
+        assert app._activity_read_count == 0
+        assert app._activity_after_id is not None
+        assert app._activity_started_at != first_started_at
+    finally:
+        app.destroy()
 
 
 def test_parser_contract():
@@ -3182,6 +3284,7 @@ def main():
         ("Windows preview packaging contract", test_windows_preview_packaging_contract),
         ("portable Archives path and initial output defaults", test_portable_archives_path_and_initial_output_defaults),
         ("activity indicator lifecycle", test_activity_indicator_lifecycle),
+        ("final polish activity status and localized UI", test_final_polish_activity_status_and_localized_ui),
         ("raw parser contract", test_parser_contract),
         ("frozen model boundary", test_model_boundary),
         ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),
