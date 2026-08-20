@@ -13,13 +13,13 @@ ICO_PATH = ASSET_DIR / "app_icon.ico"
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 
 
-CHARCOAL = "#252A2E"
-OFF_WHITE = "#F1EFE8"
-TEAL = "#4B9B96"
+BODY_CYAN = "#13B8B2"
+FACE_WHITE = "#F7F8F4"
+FEATURE_INK = "#18353B"
 
 
-def _render_balanced(size: int):
-    """Render the selected Round 3 Balanced archive mark at one target size."""
+def _render_mini_eater(size: int):
+    """Render the dark-mode-first Mini Eater mascot at one target size."""
     from PIL import Image, ImageDraw
 
     supersample = 8 if size <= 24 else 4
@@ -33,23 +33,29 @@ def _render_balanced(size: int):
     draw = ImageDraw.Draw(image)
     tiny = size <= 24
     draw.rounded_rectangle(
-        (q(8), q(12), q(248), q(248)),
-        radius=q(42 if not tiny else 34),
-        fill=CHARCOAL,
+        (q(8), q(8), q(248), q(248)),
+        radius=q(54 if not tiny else 42),
+        fill=BODY_CYAN,
     )
     draw.rounded_rectangle(
-        (q(48), q(60), q(208), q(202)),
-        radius=q(25 if not tiny else 19),
-        fill=OFF_WHITE,
+        (q(50), q(42 if tiny else 44), q(206), q(192 if tiny else 190)),
+        radius=q(38 if not tiny else 30),
+        fill=FACE_WHITE,
     )
-    draw.polygon(
-        ((q(86), q(52)), (q(128), q(136)), (q(170), q(52))),
-        fill=CHARCOAL,
-    )
+    eye_y1, eye_y2 = ((72, 116) if tiny else (76, 112))
+    left_eye = (68, eye_y1, 106, eye_y2) if tiny else (76, eye_y1, 104, eye_y2)
+    right_eye = (150, eye_y1, 188, eye_y2) if tiny else (152, eye_y1, 180, eye_y2)
+    for eye in (left_eye, right_eye):
+        draw.rounded_rectangle(
+            tuple(q(value) for value in eye),
+            radius=q(15 if tiny else 12),
+            fill=FEATURE_INK,
+        )
+    intake = (82, 126, 174, 180) if tiny else (88, 130, 168, 176)
     draw.rounded_rectangle(
-        (q(82), q(184), q(174), q(220)),
-        radius=q(14 if not tiny else 11),
-        fill=TEAL,
+        tuple(q(value) for value in intake),
+        radius=q(18 if tiny else 16),
+        fill=FEATURE_INK,
     )
     return image.resize((size, size), Image.Resampling.LANCZOS)
 
@@ -90,8 +96,8 @@ def _write_ico(images: dict[int, object]) -> None:
 
 def generate() -> None:
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
-    _render_balanced(512).save(PNG_PATH, format="PNG", optimize=True)
-    _write_ico({size: _render_balanced(size) for size in ICO_SIZES})
+    _render_mini_eater(512).save(PNG_PATH, format="PNG", optimize=True)
+    _write_ico({size: _render_mini_eater(size) for size in ICO_SIZES})
     validate()
 
 

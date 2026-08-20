@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Replaced the 0.5.0 application icon with a higher-contrast Mini Eater design for better recognition on Windows dark taskbars and small icon sizes.
+
 ## 0.5.0-rc.2
 
 - Correct the visible and packaged version label after rc.1 retained the beta.2 internal version string.

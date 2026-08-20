@@ -213,8 +213,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.0-rc.2"
-    assert VERSION_DISPLAY == "0.5.0-rc.2"
+    assert __version__ == "0.5.1"
+    assert VERSION_DISPLAY == "0.5.1"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -249,7 +249,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.0-rc.2"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.1"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -297,11 +297,35 @@ def test_windows_preview_packaging_contract():
 
     generator = ROOT / "tools" / "generate_icon.py"
     generator_source = generator.read_text(encoding="utf-8")
-    assert "def _render_balanced" in generator_source
-    assert "selected Round 3 Balanced archive mark" in generator_source
+    assert "def _render_mini_eater" in generator_source
+    assert "dark-mode-first Mini Eater mascot" in generator_source
+    assert "_render_balanced" not in generator_source
     assert "document" not in generator_source.lower()
     assert "arrow" not in generator_source.lower()
-    assert 'TEAL = "#4B9B96"' in generator_source
+    assert 'BODY_CYAN = "#13B8B2"' in generator_source
+    assert 'FACE_WHITE = "#F7F8F4"' in generator_source
+    assert 'FEATURE_INK = "#18353B"' in generator_source
+    assert "tiny = size <= 24" in generator_source
+    assert "fill=BODY_CYAN" in generator_source
+    assert "_write_ico({size: _render_mini_eater(size)" in generator_source
+
+    import tkinter as tk
+
+    icon_root = tk.Tk()
+    icon_root.withdraw()
+    try:
+        photo = tk.PhotoImage(master=icon_root, file=str(png_path))
+        assert photo.transparency_get(0, 0)
+        body = photo.get(256, 32)
+        face = photo.get(256, 130)
+        eye = photo.get(180, 188)
+        intake = photo.get(256, 300)
+        assert body[1] > 150 and body[2] > 140 and body[0] < 60
+        assert min(face) > 235
+        assert eye[0] < 40 and eye[1] < 80 and eye[2] < 90
+        assert intake[0] < 40 and intake[1] < 80 and intake[2] < 90
+    finally:
+        icon_root.destroy()
     result = subprocess.run(
         [sys.executable, str(generator), "--check"],
         cwd=str(ROOT),
@@ -435,7 +459,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.0_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.1_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -574,7 +598,7 @@ def test_final_polish_activity_status_and_localized_ui():
     app.update_idletasks()
     try:
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.0-rc.2"
+        assert VERSION_DISPLAY == "0.5.1"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
