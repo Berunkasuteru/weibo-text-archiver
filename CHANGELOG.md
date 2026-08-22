@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2
+
+- Preserve fetch-time visibility provenance as PUBLIC, FOLLOWERS, FRIENDS, PRIVATE, or explicit UNKNOWN without inferring historical audience settings.
+- Make AI 分析版 public-only by default, with explicit opt-ins for confirmed restricted visibility categories and local-only filtering from the same frozen Archive.
+- Add optional visibility filtering to Custom output while keeping Full Archive complete for all records returned to the authenticated session.
+- Keep nested repost visibility semantics uninterpreted in 0.5.2 while retaining structurally valid raw provenance in normalized cache schema version 3.
+
 ## 0.5.1
 
 - Replaced the 0.5.0 application icon with a higher-contrast Mini Eater design for better recognition on Windows dark taskbars and small icon sizes.

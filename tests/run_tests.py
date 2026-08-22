@@ -27,6 +27,7 @@ from weibo_archive.client import (
 from weibo_archive.export_options import (
     AI_COMPACT_OPTIONS,
     FULL_ARCHIVE_OPTIONS,
+    AIVisibilityOptions,
     CustomFilterOptions,
     DateFormat,
     ExportLayout,
@@ -35,9 +36,11 @@ from weibo_archive.export_options import (
     build_export_selections,
     filename_suffix_for_selection,
     filter_archive,
+    filter_archive_visibility,
     filter_report_notice,
     options_for_preset,
     parse_filter_terms,
+    visibility_scope_text,
 )
 from weibo_archive.exporter import (
     archive_to_legacy_data,
@@ -58,6 +61,8 @@ from weibo_archive.models import (
     TimestampProvenance,
     Termination,
     UserProfile,
+    VisibilityInfo,
+    VisibilityState,
     calculate_archive_integrity,
 )
 from weibo_archive.parser import (
@@ -108,6 +113,11 @@ def build_archive() -> Archive:
                 author="测试用户", author_id="1234567890",
                 engagement=Engagement(1, 1, 5),
                 media=MediaInfo(),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
                 retweet=Post(
                     id="9001", bid="rb1",
                     created_at=datetime(2026, 8, 10, 12, 0),
@@ -117,6 +127,11 @@ def build_archive() -> Archive:
                     author="原作者", author_id="987654321",
                     engagement=Engagement(12, 8, 99),
                     media=MediaInfo(images=1),
+                    visibility=VisibilityInfo(
+                        VisibilityState.UNKNOWN,
+                        raw_type=10,
+                        raw_list_id=42,
+                    ),
                 ),
             ),
             Post(
@@ -128,6 +143,11 @@ def build_archive() -> Archive:
                 author="测试用户", author_id="1234567890",
                 engagement=Engagement(3, 0, 21),
                 media=MediaInfo(images=3),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
             ),
             Post(
                 id="1001", bid="b1",
@@ -138,6 +158,11 @@ def build_archive() -> Archive:
                 author="测试用户", author_id="1234567890",
                 engagement=Engagement(None, 2, 10),
                 media=MediaInfo(),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
             ),
         ),
         fetch_range=_HistoricalTrialRange(RangeMode.TRIAL, limit=50),
@@ -213,8 +238,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.1"
-    assert VERSION_DISPLAY == "0.5.1"
+    assert __version__ == "0.5.2"
+    assert VERSION_DISPLAY == "0.5.2"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -249,7 +274,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.1"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.2"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -459,7 +484,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.1_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.2_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -509,8 +534,11 @@ def test_portable_archives_path_and_initial_output_defaults():
         assert Path(app.output_var.get()) == ROOT / "Archives"
         selections = app._selected_export_selections()
         assert tuple(selection.preset for selection in selections) == (
-            ExportPreset.FULL_ARCHIVE,
             ExportPreset.AI_COMPACT,
+            ExportPreset.FULL_ARCHIVE,
+        )
+        assert selections[0].visibility_states == frozenset(
+            {VisibilityState.PUBLIC}
         )
     finally:
         app.destroy()
@@ -566,6 +594,8 @@ def test_activity_indicator_lifecycle():
 
 def test_final_polish_activity_status_and_localized_ui():
     import time
+    import tkinter as tk
+    from tkinter import ttk
 
     from weibo_archive import VERSION_DISPLAY
     from weibo_archive.app import (
@@ -598,11 +628,33 @@ def test_final_polish_activity_status_and_localized_ui():
     app.update_idletasks()
     try:
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.1"
+        assert VERSION_DISPLAY == "0.5.2"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
         assert app.custom_output_var.get() is False
+        assert app.ai_followers_var.get() is False
+        assert app.ai_friends_var.get() is False
+        assert app.ai_private_var.get() is False
+        assert [button.cget("text") for button in app.output_buttons] == [
+            "AI 分析版",
+            "完整归档",
+            "自定义导出",
+        ]
+        assert [str(button.cget("state")) for button in app.ai_visibility_buttons] == [
+            "normal",
+            "normal",
+            "normal",
+        ]
+        app.ai_output_var.set(False)
+        app._update_content_controls()
+        assert [str(button.cget("state")) for button in app.ai_visibility_buttons] == [
+            "disabled",
+            "disabled",
+            "disabled",
+        ]
+        app.ai_output_var.set(True)
+        app._update_content_controls()
         assert TEST_EXPORT_LIMIT == 20
         assert app.trial_btn.cget("text") == "测试导出"
         assert app.trial_hint_label.cget("text") == "快速验证 · 最近 20 条"
@@ -635,6 +687,51 @@ def test_final_polish_activity_status_and_localized_ui():
         assert app._activity_read_count == 0
         assert app._activity_after_id is not None
         assert app._activity_started_at != first_started_at
+
+        app.tasks.start(TaskState.FETCHING)
+        app._set_running(True)
+        assert [
+            str(button.cget("state")) for button in app.ai_visibility_buttons
+        ] == ["disabled", "disabled", "disabled"]
+        app.tasks.cancel()
+        app.tasks.transition(TaskState.READY)
+        app._set_running(False)
+
+        app.custom_output_var.set(True)
+        app._update_content_controls()
+        app._open_custom_settings()
+        app.update_idletasks()
+        custom_windows = [
+            child for child in app.winfo_children() if isinstance(child, tk.Toplevel)
+        ]
+        assert custom_windows
+        custom_window = custom_windows[-1]
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        checkbuttons = [
+            widget
+            for widget in descendants(custom_window)
+            if isinstance(widget, ttk.Checkbutton)
+        ]
+        by_text = {widget.cget("text"): widget for widget in checkbuttons}
+        for label in (
+            "按可见范围筛选",
+            "公开",
+            "粉丝可见",
+            "好友圈",
+            "仅自己可见",
+            "未知",
+        ):
+            assert label in by_text
+        assert all(
+            str(by_text[label].cget("state")) == "disabled"
+            for label in ("公开", "粉丝可见", "好友圈", "仅自己可见", "未知")
+        )
+        custom_window.destroy()
     finally:
         app.destroy()
 
@@ -671,6 +768,73 @@ def test_parser_contract():
     # Core semantic invariant: API field missing != explicit zero.
     assert posts[2].engagement.reposts is None
     assert posts[1].engagement.comments == 0
+
+
+def test_visibility_parser_and_model_contract():
+    fixture = json.loads(
+        (ROOT / "tests/fixtures/visibility_posts.json").read_text(encoding="utf-8")
+    )
+    posts = [parse_post(raw) for raw in fixture["top_level"]]
+    assert [post.visibility.state for post in posts] == [
+        VisibilityState.PUBLIC,
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+        VisibilityState.PRIVATE,
+    ]
+    assert posts[2].visibility.raw_list_id == 777
+    assert posts[2].visibility.raw_list_idstr == "fixture-list"
+
+    def parsed_visible(value):
+        return parse_post(
+            {
+                "id": "visibility-case",
+                "text": "fixture",
+                "user": {"id": "100", "screen_name": "fixture-user"},
+                "visible": value,
+            }
+        ).visibility
+
+    for malformed in (
+        None,
+        [],
+        {},
+        {"list_id": 0},
+        {"type": True, "list_id": 0},
+        {"type": "0", "list_id": 0},
+        {"type": 0},
+        {"type": 0, "list_id": False},
+        {"type": 0, "list_id": "0"},
+    ):
+        assert parsed_visible(malformed).state is VisibilityState.UNKNOWN
+
+    unknown = parsed_visible({"type": 999, "list_id": 12})
+    assert unknown.state is VisibilityState.UNKNOWN
+    assert unknown.raw_type == 999 and unknown.raw_list_id == 12
+
+    malformed_optional = parsed_visible(
+        {"type": 0, "list_id": 51, "list_idstr": ["not", "a", "string"]}
+    )
+    assert malformed_optional.state is VisibilityState.PUBLIC
+    assert malformed_optional.raw_list_idstr is None
+
+    nested = parse_post(fixture["nested"])
+    assert nested.visibility.state is VisibilityState.PUBLIC
+    assert nested.retweet is not None
+    assert nested.retweet.visibility == VisibilityInfo(
+        state=VisibilityState.UNKNOWN,
+        raw_type=10,
+        raw_list_id=42,
+        raw_list_idstr="nested-list",
+    )
+
+    before = nested.visibility
+    try:
+        nested.visibility = VisibilityInfo(state=VisibilityState.PRIVATE)
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("Post visibility is not frozen")
+    assert nested.visibility is before
 
 
 def test_model_boundary():
@@ -1398,6 +1562,7 @@ def test_ai_compact_attribution_and_field_schema():
     )
 
     assert "FORMAT=WEIBO_AI_1" in text
+    assert "VISIBILITY: VIS on W" in text
     assert "STRUCTURE: W is a top-level rendered record;" in text
     assert "SELF requires exact non-empty UID equality" in text
     assert "//@ text is preserved but unparsed" in text
@@ -1416,6 +1581,7 @@ def test_ai_compact_attribution_and_field_schema():
     assert "must not be inherited from another" in text
     rule_order = [
         "ATTRIBUTION:",
+        "VISIBILITY:",
         "TEXT_CHAIN:",
         "MEDIA:",
         "CONTENT:",
@@ -1441,7 +1607,7 @@ def test_ai_compact_attribution_and_field_schema():
 
     lines = text.splitlines()
     rich_top = next(line for line in lines if "P=上海" in line)
-    assert rich_top == "[W｜2026-08-12 18:30｜S1｜P=上海｜I3 V2 A1｜R=3 C=0 L=21]"
+    assert rich_top == "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3 V2 A1｜R=3 C=0 L=21]"
     repost = next(line for line in lines if line.startswith(">[RT1"))
     assert repost == ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99]"
     assert all(line.startswith("[W｜") for line in lines if line.startswith("[W"))
@@ -1454,7 +1620,7 @@ def test_ai_compact_attribution_and_field_schema():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3｜R=3 C=0 L=21｜CONTENT=INCOMPLETE]" in incomplete_text
     assert ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99｜CONTENT=INCOMPLETE]" in incomplete_text
     assert incomplete_text.count("PREVIEW_ONLY") == 3  # one rule plus two records
 
@@ -1465,7 +1631,7 @@ def test_ai_compact_attribution_and_field_schema():
         archive.profile.id,
         AI_COMPACT_OPTIONS,
     )
-    assert "[W｜2026-08-12 18:30｜S1｜P=上海｜I3｜R=3 C=0 L=21｜TEXT=EMPTY]" in empty_text
+    assert "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3｜R=3 C=0 L=21｜TEXT=EMPTY]" in empty_text
     assert "仅媒体1条" in empty_text
     assert "[PREVIEW_ONLY｜" not in empty_text
     assert empty_stats["media_only_posts"] == 1
@@ -2074,7 +2240,7 @@ def test_invalid_author_uid_contract():
         finally:
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["posts"][0]["author_id"] is None
     assert payload["posts"][0]["retweet"]["author_id"] is None
 
@@ -2113,6 +2279,236 @@ def test_export_options_resolution_and_snapshot():
     later_gui_value = replace(custom, include_source=True)
     assert snapshot.include_source is False
     assert later_gui_value.include_source is True
+
+
+def test_visibility_scope_filter_and_schema3_contract():
+    from weibo_archive import storage
+
+    base = build_alpha3_archive().posts[0]
+    states = (
+        VisibilityState.PUBLIC,
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+        VisibilityState.PRIVATE,
+        VisibilityState.UNKNOWN,
+    )
+    archive = replace(
+        build_alpha3_archive(),
+        posts=tuple(
+            replace(
+                base,
+                id=f"visibility-{state.value}",
+                bid=f"visibility-{state.value}",
+                text=f"visibility body {state.value}",
+                retweet=None if state is VisibilityState.FRIENDS else base.retweet,
+                visibility=VisibilityInfo(
+                    state,
+                    raw_type={
+                        VisibilityState.PUBLIC: 0,
+                        VisibilityState.FOLLOWERS: 10,
+                        VisibilityState.FRIENDS: 6,
+                        VisibilityState.PRIVATE: 1,
+                    }.get(state, 999),
+                    raw_list_id=0,
+                ),
+            )
+            for state in states
+        ),
+    )
+
+    default_ai = AIVisibilityOptions()
+    assert default_ai.included_states == frozenset({VisibilityState.PUBLIC})
+    public_only, report = filter_archive_visibility(
+        archive,
+        default_ai.included_states,
+    )
+    assert [post.visibility.state for post in public_only.posts] == [
+        VisibilityState.PUBLIC
+    ]
+    assert report.fetched_count == 5
+    assert report.matched_count == 1
+    assert report.unknown_excluded_count == 1
+
+    mixed_scope = AIVisibilityOptions(
+        include_followers=True,
+        include_friends=True,
+        include_private=True,
+    ).included_states
+    assert visibility_scope_text(mixed_scope) == (
+        "PUBLIC,FOLLOWERS,FRIENDS,PRIVATE"
+    )
+    mixed, mixed_report = filter_archive_visibility(archive, mixed_scope)
+    assert [post.visibility.state for post in mixed.posts] == list(states[:-1])
+    assert mixed_report.unknown_excluded_count == 1
+
+    try:
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset(),
+        )
+    except ValueError as exc:
+        assert "至少选择一种" in str(exc)
+    else:
+        raise AssertionError("empty enabled visibility scope must be rejected")
+
+    custom, custom_report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset(
+                {VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+            ),
+        ),
+    )
+    assert [post.visibility.state for post in custom.posts] == [
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+    ]
+    assert custom_report.unknown_visibility_count == 1
+    assert "1 条记录可见范围未知" in filter_report_notice(custom_report)
+
+    composed, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            include_original=True,
+            include_reposts=False,
+            keywords=("friends",),
+            start_date=base.created_at.date(),
+            end_date=base.created_at.date(),
+            visibility_filter_enabled=True,
+            visibilities=frozenset(
+                {VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+            ),
+        ),
+    )
+    assert [post.visibility.state for post in composed.posts] == [
+        VisibilityState.FRIENDS
+    ]
+    with tempfile.TemporaryDirectory(prefix="weibo_custom_visibility_full_") as td:
+        custom_full_output, _ = export_markdown(
+            composed,
+            Path(td),
+            FULL_ARCHIVE_OPTIONS,
+            "自定义_完整",
+            visibility_scope="FOLLOWERS,FRIENDS",
+        )
+        custom_full_text = custom_full_output.read_text(encoding="utf-8")
+    assert "> 可见范围筛选：FOLLOWERS,FRIENDS" in custom_full_text
+    assert "> 可见范围：未筛选" not in custom_full_text
+
+    unknown_custom, unknown_custom_report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset({VisibilityState.UNKNOWN}),
+        ),
+    )
+    assert [post.visibility.state for post in unknown_custom.posts] == [
+        VisibilityState.UNKNOWN
+    ]
+    assert unknown_custom_report.unknown_visibility_count == 0
+
+    with tempfile.TemporaryDirectory(prefix="weibo_visibility_schema3_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    assert storage.SCHEMA_VERSION == 3
+    assert payload["schema_version"] == 3
+    assert payload["posts"][0]["visibility"] == {
+        "state": "public",
+        "raw_type": 0,
+        "raw_list_id": 0,
+        "raw_list_idstr": None,
+    }
+    assert payload["posts"][-1]["visibility"]["state"] == "unknown"
+    assert "visible" not in payload["posts"][0]
+    storage_source = (ROOT / "weibo_archive/storage.py").read_text(encoding="utf-8")
+    assert "read_text(" not in storage_source
+    assert "json.load" not in storage_source
+    assert not any(name.startswith("load_") for name in vars(storage))
+
+
+def test_visibility_full_and_ai_rendering_contract():
+    from weibo_archive import markdown_v5
+
+    base_archive = build_alpha3_archive()
+    first, second, third = base_archive.posts
+    archive = replace(
+        base_archive,
+        posts=(
+            replace(
+                first,
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC, raw_type=0, raw_list_id=0
+                ),
+            ),
+            replace(
+                second,
+                visibility=VisibilityInfo(
+                    VisibilityState.FOLLOWERS, raw_type=10, raw_list_id=0
+                ),
+            ),
+            replace(
+                third,
+                visibility=VisibilityInfo(
+                    VisibilityState.UNKNOWN, raw_type=999, raw_list_id=0
+                ),
+            ),
+        ),
+    )
+    data = archive_to_legacy_data(archive)
+
+    full, _, full_count = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    assert full_count == 3
+    assert "可见范围（抓取时）：公开" in full
+    assert "可见范围（抓取时）：粉丝可见" in full
+    assert "可见范围（抓取时）：未知" in full
+    assert "转发原文可见范围" not in full
+
+    ai, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert stats["count"] == 3
+    assert "FORMAT=WEIBO_AI_1" in ai
+    assert "VISIBILITY: VIS on W" in ai
+    assert "VIS=PUBLIC" in ai
+    assert "VIS=FOLLOWERS" in ai
+    assert "VIS=UNKNOWN" in ai
+    rt_lines = [line for line in ai.splitlines() if line.startswith(">[RT")]
+    assert rt_lines and all("VIS=" not in line for line in rt_lines)
+
+    public_archive, visibility_report = filter_archive_visibility(
+        archive,
+        frozenset({VisibilityState.PUBLIC}),
+    )
+    with tempfile.TemporaryDirectory(prefix="weibo_visibility_render_") as td:
+        output, output_stats = export_markdown(
+            public_archive,
+            Path(td),
+            AI_COMPACT_OPTIONS,
+            "AI分析版",
+            visibility_scope="PUBLIC",
+            unknown_visibility_excluded_count=(
+                visibility_report.unknown_excluded_count
+            ),
+        )
+        rendered = output.read_text(encoding="utf-8")
+    assert output_stats["count"] == 1
+    assert "VISIBILITY_SCOPE=PUBLIC" in rendered
+    assert "1 条记录的可见范围无法确认，未纳入 AI 分析版。" in rendered
+    assert "VISIBILITY_INPUT_W" not in rendered
+    assert "VISIBILITY_INCLUDED_W" not in rendered
 
 
 def test_custom_filter_contract():
@@ -2303,6 +2699,7 @@ def test_multi_output_fetch_once_and_isolation():
                 *,
                 permission_once=False,
                 fallback_dir=None,
+                source_archive=archive,
             ):
                 fetch_calls = []
                 saved_archives = []
@@ -2315,7 +2712,7 @@ def test_multi_output_fetch_once_and_isolation():
 
                     def fetch(self, uid, fetch_range):
                         fetch_calls.append((uid, fetch_range))
-                        return archive
+                        return source_archive
 
                 def fake_export(
                     render_archive,
@@ -2325,6 +2722,8 @@ def test_multi_output_fetch_once_and_isolation():
                     *,
                     before_commit=None,
                     selection_notice=None,
+                    visibility_scope=None,
+                    unknown_visibility_excluded_count=0,
                 ):
                     nonlocal permission_raised
                     if before_commit:
@@ -2340,6 +2739,8 @@ def test_multi_output_fetch_once_and_isolation():
                             render_archive,
                             tuple(post.id for post in render_archive.posts),
                             selection_notice,
+                            visibility_scope,
+                            unknown_visibility_excluded_count,
                         )
                     )
                     path = output_dir / f"{filename_suffix}.md"
@@ -2378,15 +2779,19 @@ def test_multi_output_fetch_once_and_isolation():
             assert len(fetch_calls) == 1
             assert saved == [archive]
             assert len(rendered) == 2
-            assert rendered[0][1] is archive and rendered[1][1] is archive
-            assert all(ids == ("1003", "1002", "1001") for _, _, ids, _ in rendered)
+            assert rendered[0][1] is not archive and rendered[1][1] is archive
+            assert all(
+                item[2] == ("1003", "1002", "1001") for item in rendered
+            )
+            assert rendered[0][4] == "PUBLIC"
+            assert rendered[1][4] == "UNFILTERED"
             assert len(result["outputs"]) == 2 and not result["failures"]
 
             fetch_calls, saved, rendered, result = run(three_outputs)
             assert len(fetch_calls) == 1
             assert saved == [archive]
             assert len(rendered) == 3
-            assert rendered[0][1] is archive and rendered[1][1] is archive
+            assert rendered[0][1] is not archive and rendered[1][1] is archive
             assert rendered[0][2] == rendered[1][2] == ("1003", "1002", "1001")
             assert rendered[2][2] == ("1001",)
             assert "匹配 1 / 本次抓取 3" in rendered[2][3]
@@ -2412,6 +2817,68 @@ def test_multi_output_fetch_once_and_isolation():
             assert result["output_dir"] == fallback
             assert all(item["path"].parent == fallback for item in result["outputs"])
             assert not result["failures"]
+
+            mixed_archive = replace(
+                archive,
+                posts=(
+                    replace(
+                        archive.posts[0],
+                        visibility=VisibilityInfo(
+                            VisibilityState.PUBLIC, raw_type=0, raw_list_id=0
+                        ),
+                    ),
+                    replace(
+                        archive.posts[1],
+                        visibility=VisibilityInfo(
+                            VisibilityState.FOLLOWERS, raw_type=10, raw_list_id=0
+                        ),
+                    ),
+                    replace(
+                        archive.posts[2],
+                        visibility=VisibilityInfo(
+                            VisibilityState.UNKNOWN, raw_type=999, raw_list_id=0
+                        ),
+                    ),
+                ),
+            )
+            public_ai = build_export_selections(
+                include_full=False,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=custom_filter,
+            )
+            fetch_calls, saved, rendered, result = run(
+                public_ai,
+                source_archive=mixed_archive,
+            )
+            assert len(fetch_calls) == 1
+            assert fetch_calls[0][1] == FetchRange.trial(20)
+            assert saved == [mixed_archive]
+            assert rendered[0][2] == ("1003",)
+            assert rendered[0][1].posts[0].retweet is mixed_archive.posts[0].retweet
+            assert rendered[0][4] == "PUBLIC"
+            assert rendered[0][5] == 1
+            visibility_report = result["outputs"][0]["visibility_report"]
+            assert visibility_report.fetched_count == 3
+            assert visibility_report.matched_count == 1
+            assert visibility_report.unknown_excluded_count == 1
+
+            followers_ai = build_export_selections(
+                include_full=False,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=custom_filter,
+                ai_visibility=AIVisibilityOptions(include_followers=True),
+            )
+            fetch_calls, _, rendered, _ = run(
+                followers_ai,
+                source_archive=mixed_archive,
+            )
+            assert len(fetch_calls) == 1
+            assert rendered[0][2] == ("1003", "1002")
+            assert rendered[0][4] == "PUBLIC,FOLLOWERS"
     finally:
         (
             app_module.COOKIE_FILE,
@@ -2468,7 +2935,7 @@ def test_alpha3_field_policy_applies_to_main_and_repost():
     ):
         assert hidden not in ai_text
     assert "所在地=北京" in ai_text
-    assert "[W｜2026-08-13]" in ai_text
+    assert "[W｜2026-08-13｜VIS=PUBLIC]" in ai_text
     assert "[RT1｜@原作者｜2026-08-10｜I1]" in ai_text
     assert "这是转发时写的评论。" in ai_text
     assert "这是被转发的原文。" in ai_text
@@ -2515,7 +2982,7 @@ def test_export_does_not_mutate_normalized_archive():
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["integrity"] == {
         "total_posts": 3,
         "complete_records": 3,
@@ -2552,7 +3019,7 @@ def test_alpha4_normalized_cache_contains_only_stable_semantics():
         raw = cache_path.read_text(encoding="utf-8")
         payload = json.loads(raw)
 
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["integrity"]["incomplete_records"] == 2
     assert payload["posts"][0]["retweet"]["content_state"] == "incomplete"
     assert payload["posts"][0]["retweet"]["text"] is None
@@ -2790,7 +3257,7 @@ def test_no_raw_api_escape_hatch():
     from dataclasses import fields
     from weibo_archive.models import UserProfile, MediaInfo, Engagement
 
-    for model in (Post, UserProfile, MediaInfo, Engagement):
+    for model in (Post, UserProfile, MediaInfo, Engagement, VisibilityInfo):
         names = {f.name for f in fields(model)}
         assert "raw" not in names
         assert "payload" not in names
@@ -3310,6 +3777,7 @@ def main():
         ("activity indicator lifecycle", test_activity_indicator_lifecycle),
         ("final polish activity status and localized UI", test_final_polish_activity_status_and_localized_ui),
         ("raw parser contract", test_parser_contract),
+        ("0.5.2 visibility parser and model contract", test_visibility_parser_and_model_contract),
         ("frozen model boundary", test_model_boundary),
         ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),
         ("Alpha4 parser explicit incomplete reasons", test_alpha4_parser_explicit_reasons_and_raw_immutability),
@@ -3337,6 +3805,8 @@ def main():
         ("0.5 lossless RT references and empty top-level W", test_ai_retweet_reference_is_lossless_per_occurrence),
         ("0.5 invalid author UID contract", test_invalid_author_uid_contract),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
+        ("0.5.2 visibility scope/filter and Schema 3", test_visibility_scope_filter_and_schema3_contract),
+        ("0.5.2 Full and AI visibility rendering", test_visibility_full_and_ai_rendering_contract),
         ("0.5 custom filter contract", test_custom_filter_contract),
         ("0.5 multi-output fetch-once contract", test_multi_output_fetch_once_and_isolation),
         ("Alpha3 document-wide field policy", test_alpha3_field_policy_applies_to_main_and_repost),

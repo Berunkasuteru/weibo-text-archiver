@@ -33,6 +33,7 @@ def _post_to_legacy(post: Post) -> dict:
         "created_at": when.replace(" ", "T") if when else "",
         "full_created_at": when,
         "created_at_provenance": post.created_at_provenance.value,
+        "visibility": post.visibility.state.value,
         "source": post.source,
         "location": post.location,
         "reposts_count": post.engagement.reposts,
@@ -107,6 +108,7 @@ def _inject_full_provenance(
     archive: Archive,
     options: ExportOptions | None = None,
     selection_notice: str | None = None,
+    visibility_scope: str | None = None,
 ) -> str:
     lines = text.splitlines()
     if not lines:
@@ -117,6 +119,13 @@ def _inject_full_provenance(
         f"> 抓取终止：{_termination_label(archive)}",
         "> 快照时间（导出机器本地）："
         + archive.fetched_at.isoformat(sep=" ", timespec="minutes"),
+        (
+            "> 可见范围：未筛选。"
+            if not visibility_scope or visibility_scope == "UNFILTERED"
+            else f"> 可见范围筛选：{visibility_scope}"
+        ),
+        "> 可见范围语义：表示归档抓取时来源响应中观察到的元数据；"
+        "不证明最初设置或此后未变化。嵌套转发的可见范围语义不作解释。",
     ]
     if options is not None:
         meta.append(f"> 输出配置：{options_provenance(options)}")
@@ -140,6 +149,8 @@ def _inject_ai_provenance(
     archive: Archive,
     options: ExportOptions | None = None,
     selection_notice: str | None = None,
+    visibility_scope: str = "UNFILTERED",
+    unknown_visibility_excluded_count: int = 0,
 ) -> str:
     lines = text.splitlines()
     if not lines:
@@ -149,11 +160,16 @@ def _inject_ai_provenance(
         "｜快照（导出机器本地）="
         + archive.fetched_at.isoformat(sep=" ", timespec="minutes")
     )
-    inserted = [meta]
+    inserted = [meta, f"VISIBILITY_SCOPE={visibility_scope}"]
     if options is not None:
         inserted.append("输出配置：" + options_provenance(options))
     if selection_notice:
         inserted.append("自定义筛选：" + selection_notice)
+    if unknown_visibility_excluded_count:
+        inserted.append(
+            f"{unknown_visibility_excluded_count} 条记录的可见范围无法确认，"
+            "未纳入 AI 分析版。"
+        )
     integrity = archive.integrity
     if integrity.incomplete_records:
         inserted.append(
@@ -219,6 +235,8 @@ def export_markdown(
     *,
     before_commit: Callable[[], None] | None = None,
     selection_notice: str | None = None,
+    visibility_scope: str | None = None,
+    unknown_visibility_excluded_count: int = 0,
 ) -> tuple[Path, dict]:
     if filename_suffix not in _ALLOWED_FILENAME_SUFFIXES:
         raise ValueError("未知 Markdown 文件名类型。")
@@ -243,9 +261,22 @@ def export_markdown(
         )
 
     if options.layout is ExportLayout.FULL:
-        text = _inject_full_provenance(text, archive, options, selection_notice)
+        text = _inject_full_provenance(
+            text,
+            archive,
+            options,
+            selection_notice,
+            visibility_scope,
+        )
     else:
-        text = _inject_ai_provenance(text, archive, options, selection_notice)
+        text = _inject_ai_provenance(
+            text,
+            archive,
+            options,
+            selection_notice,
+            visibility_scope=visibility_scope or "UNFILTERED",
+            unknown_visibility_excluded_count=unknown_visibility_excluded_count,
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_name = md.safe_filename(username)

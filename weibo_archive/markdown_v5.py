@@ -10,6 +10,25 @@ from .models import normalize_optional_uid
 # Frozen V5-compatible renderer.
 # V7 deliberately keeps this rendering surface stable while replacing the crawler beneath it.
 
+
+_VISIBILITY_LABELS = {
+    "public": "公开",
+    "followers": "粉丝可见",
+    "friends": "好友圈",
+    "private": "仅自己可见",
+    "unknown": "未知",
+}
+
+
+def visibility_token(item: dict) -> str:
+    value = str(item.get("visibility") or "unknown").strip().lower()
+    return value.upper() if value in _VISIBILITY_LABELS else "UNKNOWN"
+
+
+def visibility_label(item: dict) -> str:
+    value = str(item.get("visibility") or "unknown").strip().lower()
+    return _VISIBILITY_LABELS.get(value, "未知")
+
 def normalize_text(value) -> str:
     if value is None:
         return ""
@@ -522,6 +541,7 @@ def build_ai_markdown(
     out.append("摘要：" + "｜".join(summary_parts))
 
     format_parts = ["W=顶层记录", "RT*=转发原文编号"]
+    format_parts.append("VIS=抓取时可见范围")
     if options is None or options.include_source:
         format_parts.append("S*=发布来源")
     if options is None or options.include_location:
@@ -533,6 +553,11 @@ def build_ai_markdown(
     out.append(
         "ATTRIBUTION: RT is a nested repost-source record attributed to its recorded author "
         "metadata; SELF requires exact non-empty UID equality. W may contain preserved quoted text."
+    )
+    out.append(
+        "VISIBILITY: VIS on W is visibility metadata observed from the source response at "
+        "archive fetch time; it does not prove the original or unchanged audience. Nested "
+        "RT visibility semantics are not interpreted."
     )
     out.append(
         "TEXT_CHAIN: //@ text is preserved but unparsed and cannot verify identity or attribution."
@@ -624,7 +649,7 @@ def build_ai_markdown(
 
         require_incomplete_id(item)
         item_incomplete = is_incomplete(item)
-        meta = ["W", when]
+        meta = ["W", when, f"VIS={visibility_token(item)}"]
         if source_code and (options is None or options.include_source):
             meta.append(source_code)
         if location and (options is None or options.include_location):
@@ -769,6 +794,7 @@ def build_markdown(
         meta = post_meta_line(item, options)
         if meta:
             out.append(meta)
+        out.append(f"可见范围（抓取时）：{visibility_label(item)}")
         media = full_media_line(item)
         if media:
             out.append(f"媒体：{media}")

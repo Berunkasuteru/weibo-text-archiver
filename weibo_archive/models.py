@@ -36,6 +36,34 @@ class TimestampProvenance(str, Enum):
     UNKNOWN = "unknown"
 
 
+class VisibilityState(str, Enum):
+    PUBLIC = "public"
+    FOLLOWERS = "followers"
+    FRIENDS = "friends"
+    PRIVATE = "private"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class VisibilityInfo:
+    state: VisibilityState = VisibilityState.UNKNOWN
+    raw_type: Optional[int] = None
+    raw_list_id: Optional[int] = None
+    raw_list_idstr: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, VisibilityState):
+            raise TypeError("visibility state must be a VisibilityState")
+        for name in ("raw_type", "raw_list_id"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not int:
+                raise TypeError(f"{name} must be an int or None")
+        if self.raw_list_idstr is not None and not isinstance(
+            self.raw_list_idstr, str
+        ):
+            raise TypeError("raw_list_idstr must be a string or None")
+
+
 def normalize_optional_uid(value) -> Optional[str]:
     """Return a normalized non-zero identity, or None when identity is absent."""
     if value is None or isinstance(value, bool):
@@ -69,6 +97,7 @@ class Post:
     content_state: ContentState = ContentState.COMPLETE
     text_preview: Optional[str] = None
     incomplete_reason: Optional[IncompleteReason] = None
+    visibility: VisibilityInfo = field(default_factory=VisibilityInfo)
 
     def __post_init__(self) -> None:
         if self.author_id is not None and (
@@ -93,6 +122,8 @@ class Post:
 
         if not isinstance(self.content_state, ContentState):
             raise TypeError("content_state must be a ContentState")
+        if not isinstance(self.visibility, VisibilityInfo):
+            raise TypeError("visibility must be a VisibilityInfo")
 
         if self.content_state is ContentState.COMPLETE:
             if not isinstance(self.text, str):

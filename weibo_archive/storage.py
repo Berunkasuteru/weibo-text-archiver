@@ -10,6 +10,9 @@ from .models import Archive
 from .paths import CACHE_DIR
 
 
+SCHEMA_VERSION = 3
+
+
 def _json_default(value):
     if isinstance(value, (datetime, date)):
         return value.isoformat()
@@ -30,7 +33,7 @@ def save_normalized_archive(archive: Archive) -> Path:
     temp = folder / "last_success.json.tmp"
 
     payload = {
-        "schema_version": 2,
+        "schema_version": SCHEMA_VERSION,
         **asdict(archive),
         "integrity": asdict(archive.integrity),
     }

@@ -35,9 +35,11 @@ The cookie is currently stored as plaintext for compatibility with earlier local
 
 ## Local archive privacy
 
-`v7_cache/<uid>/last_success.json` is a normalized local archive. Version 2 stores source timestamp provenance, known UTC offsets, and optional author UIDs. Version 1 cannot recover the source offset or author UID and must not be silently interpreted with version 2 semantics. The application currently writes this cache but does not restore archives from it. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
+`v7_cache/<uid>/last_success.json` is a normalized local archive. Version 3 adds fetch-time visibility state and intentionally retained `type`/`list_id`/valid-string `list_idstr` provenance. Version 2 stores source timestamp provenance, known UTC offsets, and optional author UIDs but has no visibility fact, so it must not be interpreted as a visibility-aware archive. Version 1 cannot recover the source offset or author UID. The application currently writes this cache but does not restore archives from it. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
 
 It does contain post text and any explicitly marked timeline preview, so it remains personal archive data and should be protected like the exported Markdown files. Unversioned legacy cache files must not be silently treated as a trusted archive source.
+
+Visibility filtering operates only on records already returned to the current authenticated session. It does not enumerate inaccessible posts, infer hidden counts, or issue per-post visibility requests.
 
 ## Privileges
 

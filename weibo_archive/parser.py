@@ -13,8 +13,45 @@ from .models import (
     Post,
     TimestampProvenance,
     UserProfile,
+    VisibilityInfo,
+    VisibilityState,
     normalize_optional_uid,
 )
+
+
+_TOP_LEVEL_VISIBILITY_TYPES = {
+    0: VisibilityState.PUBLIC,
+    10: VisibilityState.FOLLOWERS,
+    6: VisibilityState.FRIENDS,
+    1: VisibilityState.PRIVATE,
+}
+
+
+def _parse_visibility(value: Any, *, interpret: bool) -> VisibilityInfo:
+    if not isinstance(value, dict):
+        return VisibilityInfo()
+
+    raw_type_value = value.get("type")
+    raw_list_id_value = value.get("list_id")
+    raw_type = raw_type_value if type(raw_type_value) is int else None
+    raw_list_id = raw_list_id_value if type(raw_list_id_value) is int else None
+    raw_list_idstr_value = value.get("list_idstr")
+    raw_list_idstr = (
+        raw_list_idstr_value if isinstance(raw_list_idstr_value, str) else None
+    )
+
+    structurally_valid = raw_type is not None and raw_list_id is not None
+    state = (
+        _TOP_LEVEL_VISIBILITY_TYPES.get(raw_type, VisibilityState.UNKNOWN)
+        if interpret and structurally_valid
+        else VisibilityState.UNKNOWN
+    )
+    return VisibilityInfo(
+        state=state,
+        raw_type=raw_type,
+        raw_list_id=raw_list_id,
+        raw_list_idstr=raw_list_idstr,
+    )
 
 
 def parse_count(value: Any) -> Optional[int]:
@@ -161,6 +198,7 @@ def parse_post(
     allow_retweet: bool = True,
     incomplete_reason: IncompleteReason | None = None,
     retweet_incomplete_reason: IncompleteReason | None = None,
+    interpret_visibility: bool = True,
 ) -> Post:
     if not isinstance(raw, dict):
         raise ValueError("post payload is not an object")
@@ -190,6 +228,7 @@ def parse_post(
             retweeted_status,
             allow_retweet=False,
             incomplete_reason=retweet_incomplete_reason,
+            interpret_visibility=False,
         )
 
     edit_count = parse_count(raw.get("edit_count")) or 0
@@ -221,6 +260,10 @@ def parse_post(
         ),
         text_preview=visible_text if incomplete_reason is not None else None,
         incomplete_reason=incomplete_reason,
+        visibility=_parse_visibility(
+            raw.get("visible"),
+            interpret=interpret_visibility,
+        ),
     )
 
 

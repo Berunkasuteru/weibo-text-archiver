@@ -5,7 +5,24 @@ from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
 
-from .models import Archive, Post, TimestampProvenance
+from .models import Archive, Post, TimestampProvenance, VisibilityState
+
+
+VISIBILITY_ORDER = (
+    VisibilityState.PUBLIC,
+    VisibilityState.FOLLOWERS,
+    VisibilityState.FRIENDS,
+    VisibilityState.PRIVATE,
+    VisibilityState.UNKNOWN,
+)
+
+VISIBILITY_LABELS = {
+    VisibilityState.PUBLIC: "公开",
+    VisibilityState.FOLLOWERS: "粉丝可见",
+    VisibilityState.FRIENDS: "好友圈",
+    VisibilityState.PRIVATE: "仅自己可见",
+    VisibilityState.UNKNOWN: "未知",
+}
 
 
 class ExportLayout(str, Enum):
@@ -43,12 +60,37 @@ class ExportOptions:
 
 
 @dataclass(frozen=True)
+class AIVisibilityOptions:
+    include_followers: bool = False
+    include_friends: bool = False
+    include_private: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("include_followers", "include_friends", "include_private"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a bool")
+
+    @property
+    def included_states(self) -> frozenset[VisibilityState]:
+        states = {VisibilityState.PUBLIC}
+        if self.include_followers:
+            states.add(VisibilityState.FOLLOWERS)
+        if self.include_friends:
+            states.add(VisibilityState.FRIENDS)
+        if self.include_private:
+            states.add(VisibilityState.PRIVATE)
+        return frozenset(states)
+
+
+@dataclass(frozen=True)
 class CustomFilterOptions:
     include_original: bool = True
     include_reposts: bool = True
     keywords: tuple[str, ...] = ()
     start_date: date | None = None
     end_date: date | None = None
+    visibility_filter_enabled: bool = False
+    visibilities: frozenset[VisibilityState] = frozenset(VISIBILITY_ORDER)
 
     def __post_init__(self) -> None:
         if not isinstance(self.include_original, bool):
@@ -67,6 +109,14 @@ class CustomFilterOptions:
             raise TypeError("end_date must be a date or None")
         if self.start_date and self.end_date and self.start_date > self.end_date:
             raise ValueError("自定义开始日期不能晚于结束日期。")
+        if not isinstance(self.visibility_filter_enabled, bool):
+            raise TypeError("visibility_filter_enabled must be a bool")
+        if not isinstance(self.visibilities, frozenset) or any(
+            not isinstance(state, VisibilityState) for state in self.visibilities
+        ):
+            raise TypeError("visibilities must be a frozenset of VisibilityState")
+        if self.visibility_filter_enabled and not self.visibilities:
+            raise ValueError("启用可见范围筛选时至少选择一种范围。")
 
     @property
     def time_filter_active(self) -> bool:
@@ -78,6 +128,14 @@ class CustomFilterReport:
     fetched_count: int
     matched_count: int
     unknown_timestamp_count: int
+    unknown_visibility_count: int = 0
+
+
+@dataclass(frozen=True)
+class VisibilityFilterReport:
+    fetched_count: int
+    matched_count: int
+    unknown_excluded_count: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +144,7 @@ class ExportSelection:
     options: ExportOptions
     filename_suffix: str
     custom_filter: CustomFilterOptions | None = None
+    visibility_states: frozenset[VisibilityState] | None = None
 
     @property
     def label(self) -> str:
@@ -141,12 +200,27 @@ def build_export_selections(
     include_custom: bool,
     custom_options: ExportOptions,
     custom_filter: CustomFilterOptions,
+    ai_visibility: AIVisibilityOptions = AIVisibilityOptions(),
 ) -> tuple[ExportSelection, ...]:
     selections = []
-    for enabled, preset, options, filter_options in (
-        (include_full, ExportPreset.FULL_ARCHIVE, FULL_ARCHIVE_OPTIONS, None),
-        (include_ai, ExportPreset.AI_COMPACT, AI_COMPACT_OPTIONS, None),
-        (include_custom, ExportPreset.CUSTOM, custom_options, custom_filter),
+    for enabled, preset, options, filter_options, visibility_states in (
+        (
+            include_ai,
+            ExportPreset.AI_COMPACT,
+            AI_COMPACT_OPTIONS,
+            None,
+            ai_visibility.included_states,
+        ),
+        (include_full, ExportPreset.FULL_ARCHIVE, FULL_ARCHIVE_OPTIONS, None, None),
+        (
+            include_custom,
+            ExportPreset.CUSTOM,
+            custom_options,
+            custom_filter,
+            custom_filter.visibilities
+            if custom_filter.visibility_filter_enabled
+            else None,
+        ),
     ):
         if enabled:
             selections.append(
@@ -155,6 +229,7 @@ def build_export_selections(
                     options=options,
                     filename_suffix=filename_suffix_for_selection(preset, options),
                     custom_filter=filter_options,
+                    visibility_states=visibility_states,
                 )
             )
     if not selections:
@@ -184,12 +259,41 @@ def _post_search_text(post: Post) -> str:
     return "\n".join(parts).casefold()
 
 
+def visibility_scope_text(states: frozenset[VisibilityState] | None) -> str:
+    if states is None:
+        return "UNFILTERED"
+    return ",".join(
+        state.name for state in VISIBILITY_ORDER if state in states
+    )
+
+
+def filter_archive_visibility(
+    archive: Archive,
+    states: frozenset[VisibilityState],
+) -> tuple[Archive, VisibilityFilterReport]:
+    matched = tuple(
+        post for post in archive.posts if post.visibility.state in states
+    )
+    unknown_excluded_count = sum(
+        1
+        for post in archive.posts
+        if post.visibility.state is VisibilityState.UNKNOWN
+        and VisibilityState.UNKNOWN not in states
+    )
+    return replace(archive, posts=matched), VisibilityFilterReport(
+        fetched_count=len(archive.posts),
+        matched_count=len(matched),
+        unknown_excluded_count=unknown_excluded_count,
+    )
+
+
 def filter_archive(
     archive: Archive,
     options: CustomFilterOptions,
 ) -> tuple[Archive, CustomFilterReport]:
     matched = []
     unknown_timestamp_count = 0
+    unknown_visibility_count = 0
     keyword_keys = tuple(keyword.casefold() for keyword in options.keywords)
 
     for post in archive.posts:
@@ -201,6 +305,14 @@ def filter_archive(
         if keyword_keys and not any(
             keyword in _post_search_text(post) for keyword in keyword_keys
         ):
+            continue
+
+        if (
+            options.visibility_filter_enabled
+            and post.visibility.state not in options.visibilities
+        ):
+            if post.visibility.state is VisibilityState.UNKNOWN:
+                unknown_visibility_count += 1
             continue
 
         if options.time_filter_active:
@@ -226,6 +338,7 @@ def filter_archive(
         fetched_count=len(archive.posts),
         matched_count=len(matched),
         unknown_timestamp_count=unknown_timestamp_count,
+        unknown_visibility_count=unknown_visibility_count,
     )
     return replace(archive, posts=tuple(matched)), report
 
@@ -244,6 +357,13 @@ def filter_summary(options: CustomFilterOptions) -> str:
         start = options.start_date.isoformat() if options.start_date else "不限"
         end = options.end_date.isoformat() if options.end_date else "不限"
         parts.append(f"日期：{start}～{end}")
+    if options.visibility_filter_enabled:
+        labels = [
+            VISIBILITY_LABELS[state]
+            for state in VISIBILITY_ORDER
+            if state in options.visibilities
+        ]
+        parts.append("可见范围：" + "、".join(labels))
     return " · ".join(parts)
 
 
@@ -253,6 +373,11 @@ def filter_report_notice(report: CustomFilterReport) -> str:
         notice += (
             f"；{report.unknown_timestamp_count} 条记录时间未知或依据未验证，"
             "无法用于时间筛选"
+        )
+    if report.unknown_visibility_count:
+        notice += (
+            f"；{report.unknown_visibility_count} 条记录可见范围未知，"
+            "未纳入筛选结果"
         )
     return notice
 

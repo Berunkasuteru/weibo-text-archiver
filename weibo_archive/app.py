@@ -13,6 +13,7 @@ from . import VERSION_DISPLAY
 from .auth import begin_qr_login, poll_qr_login, qr_matrix, save_cookies
 from .client import WeiboClient
 from .export_options import (
+    AIVisibilityOptions,
     CustomFilterOptions,
     CustomFilterReport,
     DateFormat,
@@ -22,13 +23,21 @@ from .export_options import (
     ExportSelection,
     build_export_selections,
     filter_archive,
+    filter_archive_visibility,
     filter_report_notice,
     filter_summary,
     options_summary,
     parse_filter_terms,
+    visibility_scope_text,
 )
 from .exporter import export_markdown
-from .models import ArchiveIntegrity, FetchRange, RangeMode, Termination
+from .models import (
+    ArchiveIntegrity,
+    FetchRange,
+    RangeMode,
+    Termination,
+    VisibilityState,
+)
 from .network import Cancelled, NetworkError, RateLimited
 from .paths import (
     APP_ICON_PNG,
@@ -320,6 +329,9 @@ class App(tk.Tk):
         self.custom_output_var = tk.BooleanVar(value=False)
         self.custom_options = ExportOptions()
         self.custom_filter = CustomFilterOptions()
+        self.ai_followers_var = tk.BooleanVar(value=False)
+        self.ai_friends_var = tk.BooleanVar(value=False)
+        self.ai_private_var = tk.BooleanVar(value=False)
         self.content_summary_var = tk.StringVar()
         self.login_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
@@ -484,8 +496,8 @@ class App(tk.Tk):
         preset_row.pack(fill="x")
         self.output_buttons = []
         for text, variable in (
-            ("完整归档（推荐）", self.full_output_var),
             ("AI 分析版", self.ai_output_var),
+            ("完整归档", self.full_output_var),
             ("自定义导出", self.custom_output_var),
         ):
             button = ttk.Checkbutton(
@@ -496,6 +508,36 @@ class App(tk.Tk):
             )
             button.pack(side="left", padx=(0, 18))
             self.output_buttons.append(button)
+
+        ai_scope_row = ttk.Frame(content_card)
+        ai_scope_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(ai_scope_row, text="AI 分析范围：公开（默认）").pack(side="left")
+        ttk.Label(ai_scope_row, text="另含：", style="Muted.TLabel").pack(
+            side="left", padx=(16, 4)
+        )
+        self.ai_visibility_buttons = []
+        for text, variable in (
+            ("粉丝可见", self.ai_followers_var),
+            ("好友圈", self.ai_friends_var),
+            ("仅自己可见", self.ai_private_var),
+        ):
+            button = ttk.Checkbutton(
+                ai_scope_row,
+                text=text,
+                variable=variable,
+                command=self._update_content_controls,
+            )
+            button.pack(side="left", padx=(0, 12))
+            self.ai_visibility_buttons.append(button)
+
+        ttk.Label(
+            content_card,
+            text=(
+                "限制可见内容可能属于不同受众语境。AI 分析版默认仅包含公开微博；"
+                "完整归档仍保存本次登录会话返回的全部记录。"
+            ),
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
 
         content_detail = ttk.Frame(content_card)
         content_detail.pack(fill="x", pady=(8, 0))
@@ -735,10 +777,20 @@ class App(tk.Tk):
 
     def _update_content_controls(self):
         selected = []
+        if self.ai_output_var.get():
+            extra_visibility = []
+            if self.ai_followers_var.get():
+                extra_visibility.append("粉丝可见")
+            if self.ai_friends_var.get():
+                extra_visibility.append("好友圈")
+            if self.ai_private_var.get():
+                extra_visibility.append("仅自己可见")
+            ai_scope = "公开"
+            if extra_visibility:
+                ai_scope += "+" + "+".join(extra_visibility)
+            selected.append(f"AI 分析版（{ai_scope}）")
         if self.full_output_var.get():
             selected.append("完整归档")
-        if self.ai_output_var.get():
-            selected.append("AI 分析版")
         if self.custom_output_var.get():
             selected.append(
                 "自定义："
@@ -757,6 +809,9 @@ class App(tk.Tk):
         )
         state = "normal" if self.custom_output_var.get() and not running else "disabled"
         self.custom_settings_btn.configure(state=state)
+        ai_state = "normal" if self.ai_output_var.get() and not running else "disabled"
+        for button in self.ai_visibility_buttons:
+            button.configure(state=ai_state)
 
     def _open_custom_settings(self):
         current = self.custom_options
@@ -777,6 +832,19 @@ class App(tk.Tk):
         date_var = tk.StringVar(value=current.date_format.value)
         original_var = tk.BooleanVar(value=current_filter.include_original)
         repost_var = tk.BooleanVar(value=current_filter.include_reposts)
+        visibility_enabled_var = tk.BooleanVar(
+            value=current_filter.visibility_filter_enabled
+        )
+        visibility_vars = {
+            state: tk.BooleanVar(value=state in current_filter.visibilities)
+            for state in (
+                VisibilityState.PUBLIC,
+                VisibilityState.FOLLOWERS,
+                VisibilityState.FRIENDS,
+                VisibilityState.PRIVATE,
+                VisibilityState.UNKNOWN,
+            )
+        }
         filter_start_var = tk.StringVar(
             value=current_filter.start_date.isoformat() if current_filter.start_date else ""
         )
@@ -809,6 +877,41 @@ class App(tk.Tk):
         ttk.Checkbutton(type_row, text="转发", variable=repost_var).pack(
             side="left", padx=(18, 0)
         )
+
+        ttk.Label(body, text="可见范围（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        visibility_enable = ttk.Checkbutton(
+            body,
+            text="按可见范围筛选",
+            variable=visibility_enabled_var,
+        )
+        visibility_enable.pack(anchor="w", pady=(4, 0))
+        visibility_row = ttk.Frame(body)
+        visibility_row.pack(fill="x", pady=(4, 0))
+        visibility_buttons = []
+        for state, text in (
+            (VisibilityState.PUBLIC, "公开"),
+            (VisibilityState.FOLLOWERS, "粉丝可见"),
+            (VisibilityState.FRIENDS, "好友圈"),
+            (VisibilityState.PRIVATE, "仅自己可见"),
+            (VisibilityState.UNKNOWN, "未知"),
+        ):
+            button = ttk.Checkbutton(
+                visibility_row,
+                text=text,
+                variable=visibility_vars[state],
+            )
+            button.pack(side="left", padx=(0, 12))
+            visibility_buttons.append(button)
+
+        def update_visibility_controls():
+            state = "normal" if visibility_enabled_var.get() else "disabled"
+            for button in visibility_buttons:
+                button.configure(state=state)
+
+        visibility_enable.configure(command=update_visibility_controls)
+        update_visibility_controls()
 
         ttk.Label(body, text="关键词（可选）", style="Section.TLabel").pack(
             anchor="w", pady=(12, 0)
@@ -901,6 +1004,12 @@ class App(tk.Tk):
                     keywords=parse_filter_terms(keyword_text.get("1.0", "end")),
                     start_date=optional_date(filter_start_var.get(), "开始日期"),
                     end_date=optional_date(filter_end_var.get(), "结束日期"),
+                    visibility_filter_enabled=visibility_enabled_var.get(),
+                    visibilities=frozenset(
+                        state
+                        for state, variable in visibility_vars.items()
+                        if variable.get()
+                    ),
                 )
             except (TypeError, ValueError) as exc:
                 messagebox.showwarning("自定义设置有误", str(exc), parent=win)
@@ -944,6 +1053,7 @@ class App(tk.Tk):
             self.login_btn,
             self.clear_login_btn,
             *self.output_buttons,
+            *self.ai_visibility_buttons,
         ):
             try:
                 widget.configure(state="disabled" if running else "normal")
@@ -1363,6 +1473,11 @@ class App(tk.Tk):
             include_custom=self.custom_output_var.get(),
             custom_options=self.custom_options,
             custom_filter=self.custom_filter,
+            ai_visibility=AIVisibilityOptions(
+                include_followers=self.ai_followers_var.get(),
+                include_friends=self.ai_friends_var.get(),
+                include_private=self.ai_private_var.get(),
+            ),
         )
 
     def start_export(self, *, trial: bool):
@@ -1477,8 +1592,14 @@ class App(tk.Tk):
 
                 render_archive = archive
                 filter_report: CustomFilterReport | None = None
+                visibility_report = None
                 selection_notice = None
-                if selection.preset is ExportPreset.CUSTOM:
+                if selection.preset is ExportPreset.AI_COMPACT:
+                    render_archive, visibility_report = filter_archive_visibility(
+                        archive,
+                        selection.visibility_states,
+                    )
+                elif selection.preset is ExportPreset.CUSTOM:
                     render_archive, filter_report = filter_archive(
                         archive,
                         selection.custom_filter,
@@ -1494,6 +1615,16 @@ class App(tk.Tk):
                             selection.filename_suffix,
                             before_commit=before_commit,
                             selection_notice=selection_notice,
+                            visibility_scope=visibility_scope_text(
+                                selection.visibility_states
+                            ),
+                            unknown_visibility_excluded_count=(
+                                visibility_report.unknown_excluded_count
+                                if visibility_report is not None
+                                else filter_report.unknown_visibility_count
+                                if filter_report is not None
+                                else 0
+                            ),
                         )
                     except PermissionError:
                         if fallback_dir is None:
@@ -1511,6 +1642,16 @@ class App(tk.Tk):
                             selection.filename_suffix,
                             before_commit=before_commit,
                             selection_notice=selection_notice,
+                            visibility_scope=visibility_scope_text(
+                                selection.visibility_states
+                            ),
+                            unknown_visibility_excluded_count=(
+                                visibility_report.unknown_excluded_count
+                                if visibility_report is not None
+                                else filter_report.unknown_visibility_count
+                                if filter_report is not None
+                                else 0
+                            ),
                         )
                 except Cancelled:
                     raise
@@ -1537,6 +1678,7 @@ class App(tk.Tk):
                         "options": selection.options,
                         "stats": stats,
                         "filter_report": filter_report,
+                        "visibility_report": visibility_report,
                     }
                 )
                 self._worker_log(
@@ -1668,9 +1810,19 @@ class App(tk.Tk):
                 f"{output['label']}：{stats['count']:,} 条 · "
                 f"{stats['output_bytes'] / 1024:.1f} KB"
             )
-            filter_report: CustomFilterReport | None = output["filter_report"]
+            filter_report: CustomFilterReport | None = output.get("filter_report")
             if filter_report is not None:
                 output_line += " · " + filter_report_notice(filter_report)
+            visibility_report = output.get("visibility_report")
+            if visibility_report is not None:
+                output_line += (
+                    f" · 可见范围匹配 {visibility_report.matched_count} / "
+                    f"本次抓取 {visibility_report.fetched_count}"
+                )
+                if visibility_report.unknown_excluded_count:
+                    output_line += (
+                        f"；{visibility_report.unknown_excluded_count} 条可见范围未知，未纳入"
+                    )
             lines.append(output_line)
             lines.append(f"  {output['path'].name}")
 

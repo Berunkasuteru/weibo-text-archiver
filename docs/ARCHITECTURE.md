@@ -27,7 +27,7 @@ exporter.py ◄──────── frozen ExportOptions snapshot ◄──�
     ▼
 markdown_v5.py           legacy baseline + explicit Alpha3 policy
     │
-    └──────────────► one selected primary Markdown
+    └──────────────► selected Full / AI Analysis / Custom Markdown outputs
 ```
 
 登录单独走：
@@ -100,11 +100,27 @@ content_state = INCOMPLETE
 顶层微博与转发原文分别拥有状态。其他网络、认证、schema、ID mismatch
 或混合失败仍然 fail closed，绝不能把列表页预览当完整正文。
 
-normalized cache 从 0.5.0 起写入 `schema_version: 2`，保存 source timestamp
-provenance、已知 UTC offset 和 optional author UID。版本 1 已经丢失 source
-offset 与 author UID，未来不得静默按版本 2 语义读取。当前应用只写 cache，
-不从 cache 恢复 Archive；本次不迁移或删除旧文件。无版本旧缓存仍属于
-legacy/unversioned，未来不得静默当作可信 mother archive 读取。
+normalized cache 在 0.5.2 写入 `schema_version: 3`，在版本 2 的 source
+timestamp provenance、已知 UTC offset 和 optional author UID 之外，增加抓取时
+visibility semantic state 与受控 raw provenance。版本 2 没有 visibility fact，
+不得静默当作 visibility-aware Archive。当前应用只写 cache，不从 cache 恢复
+Archive；本次不迁移或删除旧文件。无版本旧缓存仍属于 legacy/unversioned，
+未来不得静默当作可信 mother archive 读取。
+
+Visibility 的架构边界保持为：
+
+```text
+production list response
+→ parser normalization
+→ frozen Post.visibility
+→ one Archive
+→ local Full / AI Analysis / Custom policies
+```
+
+top-level W 使用当前受控证据映射；缺失、畸形或未来未知值保持 UNKNOWN。
+nested RT 只保留结构有效的独立 raw provenance，0.5.2 不解释其 semantic
+visibility，也不输出 per-RT semantic label。Full 不按 visibility 过滤；AI 与
+Custom 只按 top-level W 本地派生，不增加网络请求或不同快照。
 
 ## Runtime dependency policy
 
