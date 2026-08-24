@@ -113,13 +113,13 @@ python -m weibo_archive.app
 ## 开发与构建
 
 ```text
-python environment_check.py
+python tools/build/environment_check.py
 python tests/run_tests.py
 ```
 
 当前测试套件包含 61 项离线回归检查。
 
-在 Windows 上运行 `BUILD_WINDOWS.bat` 可使用隔离的 `.venv-build` 环境生成 PyInstaller `onedir` / `windowed` ZIP，并在 `release/` 下写入 `SHA256.txt`。
+在 Windows 上运行 `tools\windows\BUILD_WINDOWS.bat` 可使用隔离的 `.venv-build` 环境生成 PyInstaller `onedir` / `windowed` ZIP，并在 `release/` 下写入 `SHA256.txt`。
 
 ## License
 

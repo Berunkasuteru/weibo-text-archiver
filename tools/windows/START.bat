@@ -1,6 +1,7 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+for %%I in ("%~dp0..\..") do set "ROOT=%%~fI"
+cd /d "%ROOT%"
 set PYTHONUTF8=1
 title Weibo Text Archiver - Diagnostic Console
 

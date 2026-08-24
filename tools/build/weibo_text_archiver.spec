@@ -3,7 +3,7 @@
 from pathlib import Path
 
 
-ROOT = Path(SPECPATH)
+ROOT = Path(SPECPATH).resolve().parents[1]
 version_namespace = {}
 exec(
     (ROOT / "weibo_archive" / "__init__.py").read_text(encoding="utf-8"),

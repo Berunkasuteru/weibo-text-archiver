@@ -253,18 +253,33 @@ def test_alpha4_version_and_gui_launcher():
     assert callable(namespace["_show_startup_error"])
 
     user_visible_startup_files = (
-        ROOT / "START.bat",
-        ROOT / "CHECK_ENV.bat",
-        ROOT / "TEST.bat",
+        ROOT / "tools" / "windows" / "START.bat",
+        ROOT / "tools" / "windows" / "CHECK_ENV.bat",
+        ROOT / "tools" / "windows" / "TEST.bat",
         ROOT / "tests" / "RUN_TESTS.bat",
         ROOT / "README.md",
-        ROOT / "BUILD_WINDOWS.bat",
+        ROOT / "tools" / "windows" / "BUILD_WINDOWS.bat",
         launcher,
     )
     for path in user_visible_startup_files:
         source = path.read_text(encoding="utf-8-sig")
         assert "Weibo Archive V7.0 Alpha 1" not in source
         assert "Alpha1" not in source
+
+    windows_tools = ROOT / "tools" / "windows"
+    for name in ("BUILD_WINDOWS.bat", "CHECK_ENV.bat", "START.bat", "TEST.bat"):
+        source = (windows_tools / name).read_text(encoding="utf-8-sig")
+        assert 'for %%I in ("%~dp0..\\..") do set "ROOT=%%~fI"' in source
+        assert 'cd /d "%ROOT%"' in source
+    assert "python -m weibo_archive.app" in (
+        windows_tools / "START.bat"
+    ).read_text(encoding="utf-8-sig")
+    assert "%ROOT%\\tests\\run_tests.py" in (
+        windows_tools / "TEST.bat"
+    ).read_text(encoding="utf-8-sig")
+    assert "%ROOT%\\tools\\build\\environment_check.py" in (
+        windows_tools / "CHECK_ENV.bat"
+    ).read_text(encoding="utf-8-sig")
 
 
 def test_windows_preview_packaging_contract():
@@ -362,7 +377,9 @@ def test_windows_preview_packaging_contract():
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
-    spec = (ROOT / "weibo_text_archiver.spec").read_text(encoding="utf-8")
+    spec = (ROOT / "tools" / "build" / "weibo_text_archiver.spec").read_text(
+        encoding="utf-8"
+    )
     assert "console=False" in spec
     assert "exclude_binaries=True" in spec
     assert "COLLECT(" in spec
@@ -371,6 +388,20 @@ def test_windows_preview_packaging_contract():
     assert '"assets" / "app_icon.png"' in spec
     assert '"assets" / "app_icon.ico"' in spec
     assert '"PIL"' in spec
+    assert "Path(SPECPATH).resolve().parents[1]" in spec
+
+    build_script = (ROOT / "tools" / "windows" / "BUILD_WINDOWS.bat").read_text(
+        encoding="utf-8-sig"
+    )
+    assert 'set "ROOT=%%~fI"' in build_script
+    assert "tools/build/requirements-build.txt" in build_script
+    assert "tools\\build\\requirements-build.txt" in build_script
+    assert "tools\\build\\weibo_text_archiver.spec" in build_script
+
+    environment_check = (
+        ROOT / "tools" / "build" / "environment_check.py"
+    ).read_text(encoding="utf-8")
+    assert "Path(__file__).resolve().parents[2]" in environment_check
 
     package_source = (ROOT / "tools" / "package_windows_release.py").read_text(
         encoding="utf-8"
@@ -409,9 +440,21 @@ def test_windows_preview_packaging_contract():
     for ignored in (".venv-build/", "/build/", "/dist/", "/release/"):
         assert ignored in gitignore
 
-    requirements = (ROOT / "requirements-build.txt").read_text(encoding="utf-8")
+    requirements = (
+        ROOT / "tools" / "build" / "requirements-build.txt"
+    ).read_text(encoding="utf-8")
     assert "PyInstaller==" in requirements
     assert "Pillow==" in requirements
+    for old_root_helper in (
+        "BUILD_WINDOWS.bat",
+        "CHECK_ENV.bat",
+        "START.bat",
+        "TEST.bat",
+        "environment_check.py",
+        "requirements-build.txt",
+        "weibo_text_archiver.spec",
+    ):
+        assert not (ROOT / old_root_helper).exists()
 
     runtime_imports = "\n".join(
         path.read_text(encoding="utf-8")
