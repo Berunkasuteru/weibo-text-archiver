@@ -41,11 +41,11 @@ API_CONTAINER = "https://m.weibo.cn/api/container/getIndex"
 API_EXTEND = "https://m.weibo.cn/statuses/extend"
 DETAIL_URL = "https://m.weibo.cn/detail/{id}"
 
-PAGE_SIZE = 20
-PAGE_DELAY = (2.0, 5.0)
-LONGTEXT_DELAY = (1.0, 2.2)
-BATCH_POSTS = 60
-BATCH_DELAY = 8.0
+PAGE_SIZE = 100
+PAGE_DELAY = (0.2, 0.5)
+LONGTEXT_DELAY = (0.2, 0.4)
+BATCH_POSTS = 1000
+BATCH_DELAY = 3.0
 SESSION_POSTS = 2000
 SESSION_REST = 120.0
 

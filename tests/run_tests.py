@@ -17,9 +17,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from weibo_archive.client import (
+    BATCH_DELAY,
+    BATCH_POSTS,
     ContentUnavailable,
     HydrationOutcome,
     IncompleteContent,
+    LONGTEXT_DELAY,
+    PAGE_DELAY,
+    PAGE_SIZE,
+    SESSION_POSTS,
+    SESSION_REST,
     WeiboClient,
     _embedded_status_from_detail,
     _post_presentation_sort_key,
@@ -76,6 +83,7 @@ from weibo_archive.network import (
     HttpClient,
     InvalidResponse,
     NetworkError,
+    RateLimited,
     ResponseData,
     SafeRequestDiagnostic,
     classify_non_json_response,
@@ -238,8 +246,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.2"
-    assert VERSION_DISPLAY == "0.5.2"
+    assert __version__ == "0.5.3"
+    assert VERSION_DISPLAY == "0.5.3"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -289,7 +297,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.2"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.3"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -527,7 +535,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.2_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.3_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -671,7 +679,7 @@ def test_final_polish_activity_status_and_localized_ui():
     app.update_idletasks()
     try:
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.2"
+        assert VERSION_DISPLAY == "0.5.3"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -1055,6 +1063,157 @@ def test_network_non_json_diagnostic_has_no_body_or_query():
         assert exc.__context__ is None
     else:
         raise AssertionError("HTML permission page was accepted as JSON")
+
+
+def test_performance_constants_and_adaptive_network_backoff():
+    import urllib.error
+
+    assert PAGE_SIZE == 100
+    assert PAGE_DELAY == (0.2, 0.5)
+    assert LONGTEXT_DELAY == (0.2, 0.4)
+    assert BATCH_POSTS == 1000
+    assert BATCH_DELAY == 3.0
+    assert SESSION_POSTS == 2000
+    assert SESSION_REST == 120.0
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(
+            self,
+            url="https://m.weibo.cn/api/container/getIndex",
+            *,
+            body=b"{}",
+            content_type="application/json",
+        ):
+            self.url = url
+            self.body = body
+            self.headers = {"Content-Type": content_type}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+        def geturl(self):
+            return self.url
+
+    class SequenceOpener:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+
+        def open(self, _request, timeout=None):
+            self.calls += 1
+            if not self.outcomes:
+                raise AssertionError("unexpected extra request attempt")
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    def http_error(code):
+        return urllib.error.HTTPError(
+            "https://m.weibo.cn/api/container/getIndex?fixture=secret",
+            code,
+            "fixture error",
+            {"Content-Type": "application/json"},
+            None,
+        )
+
+    def configured_http(outcomes):
+        http = HttpClient()
+        opener = SequenceOpener(outcomes)
+        waits = []
+        http.opener = opener
+        http.wait = waits.append
+        return http, opener, waits
+
+    http, opener, waits = configured_http([http_error(403), FakeResponse()])
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 403
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+    else:
+        raise AssertionError("HTTP 403 was retried or accepted")
+    assert opener.calls == 1
+    assert waits == []
+
+    challenge = "<html>安全验证</html>".encode("utf-8")
+    http, opener, waits = configured_http(
+        [FakeResponse(body=challenge, content_type="text/html")]
+    )
+    try:
+        http.json_response("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except InvalidResponse as exc:
+        assert exc.diagnostic.classification == "challenge_html"
+    else:
+        raise AssertionError("challenge HTML was accepted")
+    assert opener.calls == 1
+    assert waits == []
+
+    http, opener, waits = configured_http([http_error(429), FakeResponse()])
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 2
+    assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
+
+    http, opener, waits = configured_http(
+        [http_error(429), http_error(429), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 429
+    else:
+        raise AssertionError("repeated HTTP 429 was accepted")
+    assert opener.calls == 2
+    assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
+
+    http, opener, waits = configured_http([http_error(432), FakeResponse()])
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 2
+    assert waits == [120.0]
+
+    http, opener, waits = configured_http(
+        [http_error(432), http_error(432), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 432
+    else:
+        raise AssertionError("repeated HTTP 432 was accepted")
+    assert opener.calls == 2
+    assert waits == [120.0]
+
+    transient = lambda: urllib.error.URLError(TimeoutError("fixture timeout"))
+    http, opener, waits = configured_http(
+        [transient(), transient(), FakeResponse()]
+    )
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 3
+    assert waits == [1.0, 3.0]
+
+    http, opener, waits = configured_http(
+        [transient(), transient(), transient(), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except NetworkError as exc:
+        assert exc.diagnostic.classification == "timeout"
+    else:
+        raise AssertionError("ordinary transient failures exceeded the retry cap")
+    assert opener.calls == 3
+    assert waits == [1.0, 3.0]
 
 
 def test_non_json_classifier_prioritizes_challenge_and_login():
@@ -3826,6 +3985,7 @@ def main():
         ("Alpha4 parser explicit incomplete reasons", test_alpha4_parser_explicit_reasons_and_raw_immutability),
         ("long-text detail decoder", test_longtext_detail_decoder),
         ("non-JSON diagnostics contain no body/query", test_network_non_json_diagnostic_has_no_body_or_query),
+        ("0.5.3 adaptive network backoff", test_performance_constants_and_adaptive_network_backoff),
         ("non-JSON classifier safety priority", test_non_json_classifier_prioritizes_challenge_and_login),
         ("long-text permission failure diagnostics", test_longtext_permission_failure_preserves_two_safe_attempts),
         ("long-text mixed outcomes remain fatal", test_longtext_mixed_or_challenge_outcomes_remain_fatal),

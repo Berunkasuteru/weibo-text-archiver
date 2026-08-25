@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.cookiejar
 import json
+import random
 import ssl
 import threading
 import urllib.error
@@ -16,6 +17,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/145.0.0.0 Safari/537.36"
 )
+
+_TRANSIENT_BACKOFF = (1.0, 3.0)
+_RATE_LIMIT_COOLDOWN = {
+    429: (60.0, 120.0),
+    432: (120.0, 120.0),
+}
 
 
 class Cancelled(RuntimeError):
@@ -165,11 +172,15 @@ class HttpClient:
             base_headers.update(headers)
 
         last_error: Exception | None = None
+        max_attempts = max(1, min(int(retries), 3))
+        restriction_retry_used = False
 
-        for attempt in range(retries):
+        for attempt in range(max_attempts):
             self._check_cancelled()
             req = urllib.request.Request(url, headers=base_headers, method="GET")
             self.request_count += 1
+            retry_delay = None
+            stop_retrying = False
             try:
                 with self.opener.open(req, timeout=timeout) as resp:
                     body = resp.read()
@@ -197,10 +208,21 @@ class HttpClient:
                         f"微博限制了当前请求（HTTP {exc.code}）。请稍后再试。",
                         diagnostic=diagnostic,
                     )
+                    if exc.code in (403, 414):
+                        stop_retrying = True
+                    elif restriction_retry_used or attempt + 1 >= max_attempts:
+                        stop_retrying = True
+                    else:
+                        restriction_retry_used = True
+                        low, high = _RATE_LIMIT_COOLDOWN[exc.code]
+                        retry_delay = random.uniform(low, high)
                 else:
                     last_error = NetworkError(
                         f"微博请求失败（HTTP {exc.code}）。",
                         diagnostic=diagnostic,
+                    )
+                    stop_retrying = (
+                        restriction_retry_used or attempt + 1 >= max_attempts
                     )
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 host, path = _safe_endpoint(url)
@@ -216,9 +238,17 @@ class HttpClient:
                         path=path,
                     ),
                 )
+                stop_retrying = (
+                    restriction_retry_used or attempt + 1 >= max_attempts
+                )
 
-            if attempt + 1 < retries:
-                self.wait(2 ** attempt)
+            if stop_retrying:
+                break
+            if retry_delay is None:
+                retry_delay = _TRANSIENT_BACKOFF[
+                    min(attempt, len(_TRANSIENT_BACKOFF) - 1)
+                ]
+            self.wait(retry_delay)
 
         assert last_error is not None
         raise last_error

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3
+
+- Speed up sequential timeline retrieval with larger validated page requests and substantially lower healthy-response delays.
+- Reduce unnecessary long-text and frequent batch waiting while keeping hydration and pagination sequential.
+- Apply meaningful bounded cooldowns only after actual HTTP 429/432 restriction signals; HTTP 403 fails without rapid retry.
+- Preserve archive completeness, long-text verification, and all existing fail-closed behavior.
+
 ## 0.5.2
 
 - Preserve fetch-time visibility provenance as PUBLIC, FOLLOWERS, FRIENDS, PRIVATE, or explicit UNKNOWN without inferring historical audience settings.
