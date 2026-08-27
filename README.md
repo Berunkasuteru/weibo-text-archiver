@@ -103,10 +103,10 @@ python -m weibo_archive.app
 
 ## 隐私与安全
 
-- 登录凭据只保存在本机，并用于直接请求微博；项目不运营凭据上传服务。
+- 登录凭据只保存在本机，并用于直接请求微博；项目不运营凭据上传服务。Windows 会使用当前用户的 DPAPI 保护已保存凭据；非 Windows 源码模式保留本地明文兼容方式。
 - 不使用浏览器自动化，不关闭 TLS 证书验证。
 - Markdown 与规范化归档缓存都保存在本机。
-- 诊断信息会经过脱敏，但仍不应向他人发送 `cookie.txt`。
+- DPAPI 提供静态存储保护，但不能防御已在同一 Windows 用户身份下运行的恶意软件。诊断信息会经过脱敏，仍不应向他人发送 `credential.dat` 或旧版 `cookie.txt`。
 - “清除登录信息”只删除登录/会话材料，不会删除缓存或已经导出的 Markdown。
 - 工具只归档当前登录会话实际返回的记录，不推断或枚举当前会话无法访问的微博；可见范围筛选只在本地 Archive 上执行。
 
@@ -117,7 +117,7 @@ python tools/build/environment_check.py
 python tests/run_tests.py
 ```
 
-当前测试套件包含 62 项离线回归检查。
+运行 `python tests/run_tests.py` 可执行完整离线回归测试套件。
 
 在 Windows 上运行 `tools\windows\BUILD_WINDOWS.bat` 可使用隔离的 `.venv-build` 环境生成 PyInstaller `onedir` / `windowed` ZIP，并在 `release/` 下写入 `SHA256.txt`。
 

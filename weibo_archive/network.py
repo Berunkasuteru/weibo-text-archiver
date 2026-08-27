@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 
 USER_AGENT = (
@@ -23,6 +23,8 @@ _RATE_LIMIT_COOLDOWN = {
     429: (60.0, 120.0),
     432: (120.0, 120.0),
 }
+
+RetryNotice = Callable[[int, float], None]
 
 
 class Cancelled(RuntimeError):
@@ -107,9 +109,15 @@ def classify_non_json_response(raw: str, content_type: str = "") -> str:
 class HttpClient:
     """Small HTTPS client with cancellation, retries and Windows system trust."""
 
-    def __init__(self, cookie_header: str = "", cancel_event: threading.Event | None = None):
+    def __init__(
+        self,
+        cookie_header: str = "",
+        cancel_event: threading.Event | None = None,
+        retry_notice: RetryNotice | None = None,
+    ):
         self.cookie_header = cookie_header.strip()
         self.cancel_event = cancel_event or threading.Event()
+        self.retry_notice = retry_notice
         self.jar = http.cookiejar.CookieJar()
         context = ssl.create_default_context()
         self.opener = urllib.request.build_opener(
@@ -180,6 +188,7 @@ class HttpClient:
             req = urllib.request.Request(url, headers=base_headers, method="GET")
             self.request_count += 1
             retry_delay = None
+            retry_notice_status = None
             stop_retrying = False
             try:
                 with self.opener.open(req, timeout=timeout) as resp:
@@ -216,6 +225,7 @@ class HttpClient:
                         restriction_retry_used = True
                         low, high = _RATE_LIMIT_COOLDOWN[exc.code]
                         retry_delay = random.uniform(low, high)
+                        retry_notice_status = exc.code
                 else:
                     last_error = NetworkError(
                         f"微博请求失败（HTTP {exc.code}）。",
@@ -248,6 +258,8 @@ class HttpClient:
                 retry_delay = _TRANSIENT_BACKOFF[
                     min(attempt, len(_TRANSIENT_BACKOFF) - 1)
                 ]
+            if retry_notice_status is not None and self.retry_notice is not None:
+                self.retry_notice(retry_notice_status, retry_delay)
             self.wait(retry_delay)
 
         assert last_error is not None

@@ -10,8 +10,14 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import VERSION_DISPLAY
-from .auth import begin_qr_login, poll_qr_login, qr_matrix, save_cookies
+from .auth import begin_qr_login, poll_qr_login, qr_matrix
 from .client import WeiboClient
+from .credentials import (
+    clear_saved_login,
+    has_saved_login,
+    load_cookie_header,
+    save_cookies,
+)
 from .export_options import (
     AIVisibilityOptions,
     CustomFilterOptions,
@@ -41,7 +47,6 @@ from .models import (
 from .network import Cancelled, NetworkError, RateLimited
 from .paths import (
     APP_ICON_PNG,
-    COOKIE_FILE,
     default_output_dir,
     fallback_output_dir,
     prepare_output_dir,
@@ -1217,7 +1222,7 @@ class App(tk.Tk):
                         self.status_var.set("导出完成")
                         self.progress_detail_var.set("本次导出已完成并写入 Markdown。")
                     self._show_completion(payload)
-                    self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
                 elif kind == "error":
                     self.tasks.terminal(generation, TaskState.ERROR)
@@ -1234,9 +1239,9 @@ class App(tk.Tk):
                         friendly
                         + "\n\n详细错误日志：\n"
                         + detail_path
-                        + "\n\n请不要发送 cookie.txt。",
+                        + "\n\n请不要发送本机保存的登录凭据文件。",
                     )
-                    self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
                 elif kind == "cancelled":
                     self.tasks.terminal(generation, TaskState.CANCELLED)
@@ -1246,7 +1251,7 @@ class App(tk.Tk):
                     if self._activity_started_at is None:
                         self.activity_status_var.set("")
                     self.progress_detail_var.set("任务已取消；迟到的旧任务事件将被忽略。")
-                    self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
         except queue.Empty:
             pass
@@ -1259,7 +1264,7 @@ class App(tk.Tk):
     # -------------------- Login --------------------
 
     def _refresh_login_status(self):
-        if COOKIE_FILE.exists() and COOKIE_FILE.stat().st_size > 20:
+        if has_saved_login():
             self.login_var.set("● 已保存登录状态")
             if self.tasks.state is TaskState.IDLE:
                 self.tasks.transition(TaskState.READY)
@@ -1391,7 +1396,7 @@ class App(tk.Tk):
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
 
-            save_cookies(COOKIE_FILE, cookies)
+            save_cookies(cookies)
             self._worker_log(generation, "扫码登录成功；凭据已保存。")
             self._emit(generation, "ready", None)
             terminal_sent = True
@@ -1419,7 +1424,7 @@ class App(tk.Tk):
         ):
             return
         try:
-            COOKIE_FILE.unlink(missing_ok=True)
+            clear_saved_login()
             if self.tasks.state is TaskState.READY:
                 self.tasks.transition(TaskState.IDLE)
             self._refresh_login_status()
@@ -1486,7 +1491,7 @@ class App(tk.Tk):
             messagebox.showwarning("请输入 UID", "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。")
             return
 
-        if not COOKIE_FILE.exists():
+        if not has_saved_login():
             messagebox.showwarning("需要登录", "本工具不再匿名尝试抓取。请先扫码登录。")
             return
 
@@ -1557,9 +1562,7 @@ class App(tk.Tk):
     ):
         terminal_sent = False
         try:
-            cookie = COOKIE_FILE.read_text(encoding="utf-8").strip()
-            if "SUB=" not in cookie:
-                raise RuntimeError("本机登录凭据缺少 SUB，请重新扫码登录。")
+            cookie = load_cookie_header()
 
             def progress(message: str, data=None):
                 self._worker_log(generation, message)
@@ -1761,7 +1764,7 @@ class App(tk.Tk):
         self._set_running(False)
         self.status_var.set("已取消")
         self.progress_detail_var.set("已取消。正在退出的旧网络请求即使迟到也不会影响界面。")
-        self.tasks.transition(TaskState.READY if COOKIE_FILE.exists() else TaskState.IDLE)
+        self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
     # -------------------- Completion / exit --------------------
 

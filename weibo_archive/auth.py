@@ -7,7 +7,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 import qrcode
 
@@ -234,13 +233,3 @@ def poll_qr_login(
             raise Cancelled("用户取消了扫码登录。")
 
     raise TimeoutError("二维码等待超时，请重新获取。")
-
-
-def save_cookies(cookie_file: Path, cookies: dict[str, str]):
-    if not cookies.get("SUB"):
-        raise RuntimeError("拒绝保存缺少 SUB 的登录 Cookie。")
-    cookie_file.parent.mkdir(parents=True, exist_ok=True)
-    cookie_file.write_text(
-        "; ".join(f"{k}={v}" for k, v in cookies.items()),
-        encoding="utf-8",
-    )

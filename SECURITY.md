@@ -23,13 +23,15 @@ Diagnostic logs and `last_error.txt` redact known credential fields, including:
 - CSRF headers and tokens
 - alternate or token-like query values
 
-The application stores the Weibo login cookie locally at:
+On Windows, the application protects the saved Weibo login state with Windows DPAPI scoped to the current Windows user and stores the protected binary at:
 
 ```text
-%LOCALAPPDATA%\WeiboTextExporter\cookie.txt
+%LOCALAPPDATA%\WeiboTextExporter\credential.dat
 ```
 
-The cookie is currently stored as plaintext for compatibility with earlier local versions. Users should never share this file. A future credential-storage change must fail safely and require a new login if stored credentials cannot be read.
+Existing plaintext `cookie.txt` credentials are migrated only after the protected credential has been atomically written, decrypted again, and validated. Failed migration leaves the legacy credential intact. Source execution on non-Windows systems retains the local plaintext file as a compatibility fallback without adding keyring dependencies.
+
+DPAPI protects against casual plaintext disclosure and access from other Windows user contexts. It does not protect credentials from malicious software already running as the same Windows user. Users should never share either protected or legacy credential files.
 
 "Clear login information" removes saved login/session material only. It does not erase normalized archive caches or previously exported Markdown files.
 

@@ -72,6 +72,10 @@ from weibo_archive.models import (
     VisibilityState,
     calculate_archive_integrity,
 )
+from weibo_archive.credentials import (
+    CredentialError,
+    CredentialStore,
+)
 from weibo_archive.parser import (
     extract_mblogs,
     parse_created_at_fact,
@@ -246,12 +250,17 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.3"
-    assert VERSION_DISPLAY == "0.5.3"
+    assert __version__ == "0.5.4"
+    assert VERSION_DISPLAY == "0.5.4"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
     assert "__version__" not in app_source
+    assert "COOKIE_FILE" not in app_source
+    assert "load_cookie_header()" in app_source
+    assert "has_saved_login()" in app_source
+    assert "save_cookies(cookies)" in app_source
+    assert "clear_saved_login()" in app_source
     assert "Alpha 1" not in app_source
     assert "Alpha1" not in app_source
 
@@ -297,7 +306,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.3"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.4"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -525,6 +534,7 @@ def test_windows_preview_packaging_contract():
 
 
 def test_portable_archives_path_and_initial_output_defaults():
+    import weibo_archive.app as app_module
     from weibo_archive.app import App
     from weibo_archive.paths import (
         application_dir,
@@ -535,7 +545,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.3_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.4_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -576,8 +586,11 @@ def test_portable_archives_path_and_initial_output_defaults():
     for migration_operation in ("shutil", ".rename(", ".replace(", ".unlink("):
         assert migration_operation not in paths_source
 
-    app = App()
+    original_has_saved_login = app_module.has_saved_login
+    app_module.has_saved_login = lambda: False
+    app = None
     try:
+        app = App()
         app.withdraw()
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -592,7 +605,9 @@ def test_portable_archives_path_and_initial_output_defaults():
             {VisibilityState.PUBLIC}
         )
     finally:
-        app.destroy()
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_has_saved_login
 
 
 def test_activity_indicator_lifecycle():
@@ -648,6 +663,7 @@ def test_final_polish_activity_status_and_localized_ui():
     import tkinter as tk
     from tkinter import ttk
 
+    import weibo_archive.app as app_module
     from weibo_archive import VERSION_DISPLAY
     from weibo_archive.app import (
         APP_SUBTITLE,
@@ -674,12 +690,15 @@ def test_final_polish_activity_status_and_localized_ui():
     assert activity_status_text(347, 42) == "已读取 347 条 · 用时 00:42"
     assert activity_status_text(1000, 3600) == "已读取 1,000 条 · 用时 1:00:00"
 
-    app = App()
-    app.withdraw()
-    app.update_idletasks()
+    original_has_saved_login = app_module.has_saved_login
+    app_module.has_saved_login = lambda: False
+    app = None
     try:
+        app = App()
+        app.withdraw()
+        app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.3"
+        assert VERSION_DISPLAY == "0.5.4"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -784,7 +803,9 @@ def test_final_polish_activity_status_and_localized_ui():
         )
         custom_window.destroy()
     finally:
-        app.destroy()
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_has_saved_login
 
 
 def test_parser_contract():
@@ -1066,6 +1087,7 @@ def test_network_non_json_diagnostic_has_no_body_or_query():
 
 
 def test_performance_constants_and_adaptive_network_backoff():
+    import threading
     import urllib.error
 
     assert PAGE_SIZE == 100
@@ -1125,15 +1147,29 @@ def test_performance_constants_and_adaptive_network_backoff():
             None,
         )
 
-    def configured_http(outcomes):
-        http = HttpClient()
+    def configured_http(
+        outcomes,
+        *,
+        retry_notice=None,
+        cancel_event=None,
+        mock_wait=True,
+    ):
+        http = HttpClient(
+            cancel_event=cancel_event,
+            retry_notice=retry_notice,
+        )
         opener = SequenceOpener(outcomes)
         waits = []
         http.opener = opener
-        http.wait = waits.append
+        if mock_wait:
+            http.wait = waits.append
         return http, opener, waits
 
-    http, opener, waits = configured_http([http_error(403), FakeResponse()])
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(403), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
     try:
         http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
     except RateLimited as exc:
@@ -1144,6 +1180,7 @@ def test_performance_constants_and_adaptive_network_backoff():
         raise AssertionError("HTTP 403 was retried or accepted")
     assert opener.calls == 1
     assert waits == []
+    assert notices == []
 
     challenge = "<html>安全验证</html>".encode("utf-8")
     http, opener, waits = configured_http(
@@ -1158,11 +1195,16 @@ def test_performance_constants_and_adaptive_network_backoff():
     assert opener.calls == 1
     assert waits == []
 
-    http, opener, waits = configured_http([http_error(429), FakeResponse()])
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(429), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
     response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
     assert response.status == 200
     assert opener.calls == 2
     assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
+    assert notices == [(429, waits[0])]
 
     http, opener, waits = configured_http(
         [http_error(429), http_error(429), FakeResponse()]
@@ -1176,11 +1218,16 @@ def test_performance_constants_and_adaptive_network_backoff():
     assert opener.calls == 2
     assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
 
-    http, opener, waits = configured_http([http_error(432), FakeResponse()])
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(432), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
     response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
     assert response.status == 200
     assert opener.calls == 2
     assert waits == [120.0]
+    assert notices == [(432, 120.0)]
 
     http, opener, waits = configured_http(
         [http_error(432), http_error(432), FakeResponse()]
@@ -1202,6 +1249,42 @@ def test_performance_constants_and_adaptive_network_backoff():
     assert response.status == 200
     assert opener.calls == 3
     assert waits == [1.0, 3.0]
+
+    progress = []
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda message, data=None: progress.append((message, data)),
+    )
+    client.http.retry_notice(429, 87.4)
+    assert progress == [
+        (
+            "微博暂时限制访问（HTTP 429），正在休息约 87 秒后重试…",
+            {"cooldown_status": 429, "cooldown_seconds": 87},
+        )
+    ]
+
+    cancel_event = threading.Event()
+    cancel_notices = []
+
+    def cancel_on_notice(status, seconds):
+        cancel_notices.append((status, seconds))
+        cancel_event.set()
+
+    http, opener, waits = configured_http(
+        [http_error(432), FakeResponse()],
+        retry_notice=cancel_on_notice,
+        cancel_event=cancel_event,
+        mock_wait=False,
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except Cancelled:
+        pass
+    else:
+        raise AssertionError("cancellation during cooldown was ignored")
+    assert opener.calls == 1
+    assert cancel_notices == [(432, 120.0)]
 
     http, opener, waits = configured_http(
         [transient(), transient(), transient(), FakeResponse()]
@@ -2883,17 +2966,18 @@ def test_multi_output_fetch_once_and_isolation():
             self.logs.append((generation, text))
 
     original_values = (
-        app_module.COOKIE_FILE,
+        app_module.load_cookie_header,
         app_module.WeiboClient,
         app_module.save_normalized_archive,
         app_module.export_markdown,
     )
+    credential_loads = []
     try:
         with tempfile.TemporaryDirectory(prefix="weibo_multi_export_") as td:
             folder = Path(td)
-            cookie_file = folder / "cookie.txt"
-            cookie_file.write_text("SUB=offline-fixture", encoding="utf-8")
-            app_module.COOKIE_FILE = cookie_file
+            app_module.load_cookie_header = lambda: (
+                credential_loads.append(True) or "SUB=offline-fixture"
+            )
 
             def run(
                 selections,
@@ -3081,9 +3165,10 @@ def test_multi_output_fetch_once_and_isolation():
             assert len(fetch_calls) == 1
             assert rendered[0][2] == ("1003", "1002")
             assert rendered[0][4] == "PUBLIC,FOLLOWERS"
+            assert len(credential_loads) == 7
     finally:
         (
-            app_module.COOKIE_FILE,
+            app_module.load_cookie_header,
             app_module.WeiboClient,
             app_module.save_normalized_archive,
             app_module.export_markdown,
@@ -3353,6 +3438,147 @@ def test_generation_guard():
     assert gen2 != gen1
     assert manager.accepts(gen2)
     assert not manager.accepts(gen1)
+
+
+def test_dpapi_credential_store_and_legacy_migration():
+    synthetic_sub = "synthetic-test-secret"
+    synthetic_xsrf = "synthetic-xsrf"
+    cookies = {
+        "SUB": synthetic_sub,
+        "XSRF-TOKEN": synthetic_xsrf,
+    }
+    expected_header = (
+        f"SUB={synthetic_sub}; XSRF-TOKEN={synthetic_xsrf}"
+    )
+
+    def protect(data):
+        return bytes(value ^ 0xA5 for value in data)
+
+    def unprotect(data):
+        return bytes(value ^ 0xA5 for value in data)
+
+    def store_for(root, **overrides):
+        options = {
+            "protected_file": Path(root) / "credential.dat",
+            "legacy_file": Path(root) / "cookie.txt",
+            "use_dpapi": True,
+            "protect": protect,
+            "unprotect": unprotect,
+        }
+        options.update(overrides)
+        return CredentialStore(**options)
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_store_") as td:
+        root = Path(td)
+        store = store_for(root)
+        store.save_cookies(cookies)
+        protected = root / "credential.dat"
+        legacy = root / "cookie.txt"
+        payload = protected.read_bytes()
+        assert synthetic_sub.encode("utf-8") not in payload
+        assert synthetic_xsrf.encode("utf-8") not in payload
+        assert not legacy.exists()
+        assert store.has_saved_login()
+        assert store.load_cookie_header() == expected_header
+
+        try:
+            store.save_cookies({"XSRF-TOKEN": synthetic_xsrf})
+        except CredentialError as exc:
+            assert synthetic_xsrf not in str(exc)
+        else:
+            raise AssertionError("credential without SUB was saved")
+
+        old_payload = protected.read_bytes()
+
+        def failing_write(_path, _data):
+            raise OSError("synthetic write failure")
+
+        failing_store = store_for(root, atomic_write=failing_write)
+        try:
+            failing_store.save_cookies({"SUB": "replacement-secret"})
+        except CredentialError as exc:
+            assert "replacement-secret" not in str(exc)
+        else:
+            raise AssertionError("failed atomic replacement was accepted")
+        assert protected.read_bytes() == old_payload
+        assert store.load_cookie_header() == expected_header
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_migration_") as td:
+        root = Path(td)
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+        store = store_for(root)
+        assert store.load_cookie_header() == expected_header
+        assert (root / "credential.dat").is_file()
+        assert not legacy.exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_failed_migration_") as td:
+        root = Path(td)
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+
+        def failed_unprotect(_data):
+            raise RuntimeError(f"backend failure {synthetic_sub}")
+
+        store = store_for(root, unprotect=failed_unprotect)
+        try:
+            store.load_cookie_header()
+        except CredentialError as exc:
+            rendered = str(exc) + repr(exc)
+            assert synthetic_sub not in rendered
+            assert synthetic_xsrf not in rendered
+        else:
+            raise AssertionError("failed migration was accepted")
+        assert legacy.read_text(encoding="utf-8") == expected_header
+        assert not (root / "credential.dat").exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_prefer_protected_") as td:
+        root = Path(td)
+        store = store_for(root)
+        store.save_cookies(cookies)
+        legacy = root / "cookie.txt"
+        legacy.write_text("SUB=legacy-fallback", encoding="utf-8")
+        assert store.load_cookie_header() == expected_header
+        assert not legacy.exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_corrupt_") as td:
+        root = Path(td)
+        protected = root / "credential.dat"
+        protected.write_bytes(b"corrupt-protected-fixture")
+        store = store_for(root)
+        assert not store.has_saved_login()
+        try:
+            store.load_cookie_header()
+        except CredentialError as exc:
+            assert "corrupt-protected-fixture" not in str(exc)
+        else:
+            raise AssertionError("corrupt protected credential was accepted")
+
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+        assert store.load_cookie_header() == expected_header
+        assert not legacy.exists()
+        assert store.has_saved_login()
+
+        legacy.write_text("SUB=legacy-to-clear", encoding="utf-8")
+        store.clear_saved_login()
+        assert not protected.exists()
+        assert not legacy.exists()
+        assert not store.has_saved_login()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_plaintext_compat_") as td:
+        root = Path(td)
+        store = CredentialStore(
+            protected_file=root / "credential.dat",
+            legacy_file=root / "cookie.txt",
+            use_dpapi=False,
+            protect=protect,
+            unprotect=unprotect,
+        )
+        store.save_cookies(cookies)
+        assert not (root / "credential.dat").exists()
+        assert (root / "cookie.txt").read_text(encoding="utf-8") == expected_header
+        assert store.load_cookie_header() == expected_header
 
 
 def test_redaction():
@@ -4032,6 +4258,7 @@ def main():
         ("unknown ok=0 fails closed", test_unknown_ok0_is_not_natural_end),
         ("since-date unknown timestamp guard", test_since_unknown_date_cannot_trigger_early_stop),
         ("relative timestamp boundary guard", test_relative_timestamp_cannot_prove_since_or_frontier),
+        ("Windows DPAPI credential storage", test_dpapi_credential_store_and_legacy_migration),
         ("security redaction", test_redaction),
         ("zero-runtime-dependency audit", test_dependency_audit),
     ]

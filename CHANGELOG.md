@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4
+
+- Protect saved Weibo login credentials on Windows with current-user Windows DPAPI instead of leaving the normal saved session as plaintext on disk.
+- Safely migrate legacy plaintext login state only after protected round-trip verification, preserving the old credential if migration fails.
+- Show an explicit progress message during existing HTTP 429/432 cooldown waits so long rate-limit recovery is not mistaken for a frozen application.
+- Keep archive schema, AI format, pagination, export semantics and the accepted 0.5.3 performance profile unchanged.
+
 ## 0.5.3
 
 - Speed up sequential timeline retrieval with larger validated page requests and substantially lower healthy-response delays.

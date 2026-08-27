@@ -259,9 +259,13 @@ class WeiboClient:
         cancel_event: threading.Event,
         progress: Progress = _noop_progress,
     ):
-        self.http = HttpClient(cookie_header=cookie_header, cancel_event=cancel_event)
         self.cancel_event = cancel_event
         self.progress = progress
+        self.http = HttpClient(
+            cookie_header=cookie_header,
+            cancel_event=cancel_event,
+            retry_notice=self._emit_retry_cooldown,
+        )
         self.posts_since_batch_rest = 0
         self.posts_since_session_rest = 0
         self.long_text_cache: dict[str, str] = {}
@@ -274,6 +278,15 @@ class WeiboClient:
         self.consecutive_unique_unavailable = 0
         self._long_text_attempted_ids: set[str] = set()
         self._content_unavailable_ids: set[str] = set()
+
+    def _emit_retry_cooldown(self, status: int, seconds: float) -> None:
+        rounded_seconds = max(1, int(round(seconds)))
+        self._emit(
+            f"微博暂时限制访问（HTTP {status}），"
+            f"正在休息约 {rounded_seconds} 秒后重试…",
+            cooldown_status=status,
+            cooldown_seconds=rounded_seconds,
+        )
 
     def _emit(self, message: str, **data):
         self.progress(message, data or None)
