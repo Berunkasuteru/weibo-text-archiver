@@ -21,7 +21,9 @@ from .models import (
     Termination,
 )
 from .network import (
+    AuthenticationExpired,
     Cancelled,
+    ChallengeRequired,
     HttpClient,
     InvalidResponse,
     NetworkError,
@@ -54,8 +56,8 @@ class InvalidUser(RuntimeError):
     pass
 
 
-class NeedLogin(RuntimeError):
-    pass
+class NeedLogin(AuthenticationExpired):
+    """Backward-compatible name for explicit authentication expiry."""
 
 
 @dataclass(frozen=True)
@@ -311,10 +313,16 @@ class WeiboClient:
         data = basic.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("userInfo"), dict):
             msg = str(basic.get("msg") or "")
+            url = str(basic.get("url") or "")
+            combined = f"{msg}\n{url}".lower()
             if "这里还没有内容" in msg:
                 raise InvalidUser("没有找到该账号，可能 UID 不正确或账号已注销。")
-            if basic.get("url") or "登录" in msg or "验证" in msg:
-                raise NeedLogin("微博没有返回用户资料，请重新扫码登录后再试。")
+            if any(marker in msg for marker in ("验证", "验证码", "安全验证")):
+                raise ChallengeRequired(
+                    "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。"
+                )
+            if "登录" in msg or "login" in combined or "passport" in combined:
+                raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
             raise InvalidResponse("用户资料响应缺少 userInfo。")
 
         detail = None
@@ -326,6 +334,8 @@ class WeiboClient:
                 timeout=15,
                 retries=2,
             )
+        except (AuthenticationExpired, ChallengeRequired):
+            raise
         except NetworkError:
             # Extended profile is useful metadata, not required to preserve post text.
             self._emit("扩展资料暂时不可用，将继续备份正文。")
@@ -465,6 +475,8 @@ class WeiboClient:
                     content_chars=len(content) if isinstance(content, str) else None,
                 )
             )
+        except (AuthenticationExpired, ChallengeRequired):
+            raise
         except NetworkError as exc:
             attempts.append(
                 _attempt_from_network_error(
@@ -530,6 +542,16 @@ class WeiboClient:
                 classification = classify_non_json_response(
                     html, response.content_type
                 )
+                if classification == "login_html":
+                    raise AuthenticationExpired(
+                        "微博登录已过期，需要重新扫码。",
+                        diagnostic=response.safe_diagnostic(classification),
+                    )
+                if classification == "challenge_html":
+                    raise ChallengeRequired(
+                        "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。",
+                        diagnostic=response.safe_diagnostic(classification),
+                    )
                 attempts.append(
                     LongTextAttemptDiagnostic(
                         fallback="detail",
@@ -546,6 +568,8 @@ class WeiboClient:
                         embedded_status_present=False,
                     )
                 )
+        except (AuthenticationExpired, ChallengeRequired):
+            raise
         except NetworkError as exc:
             attempts.append(
                 _attempt_from_network_error(
@@ -648,8 +672,17 @@ class WeiboClient:
 
             # Fail closed: an unknown ok=0 response is never treated as the end
             # of the timeline. Anti-bot JSON often has no challenge URL.
-            limit_markers = ("验证", "访问频次", "频繁", "异常", "限制", "登录")
-            if js.get("url") or any(marker in msg for marker in limit_markers):
+            url = str(js.get("url") or "")
+            combined = f"{msg}\n{url}".lower()
+            challenge_markers = ("验证", "验证码", "安全验证")
+            if any(marker in msg for marker in challenge_markers):
+                raise RateLimited(
+                    "微博要求额外验证或限制了访问。请稍后再试；本次不会生成伪完整备份。"
+                )
+            if "登录" in msg or "login" in combined or "passport" in combined:
+                raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
+            limit_markers = ("访问频次", "频繁", "异常", "限制")
+            if any(marker in msg for marker in limit_markers):
                 raise RateLimited(
                     "微博要求额外验证或限制了访问。请稍后再试；本次不会生成伪完整备份。"
                 )

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.5
+
+- Recover from confirmed expired login by requesting a fresh QR scan and restarting the exact frozen export once, from the beginning.
+- Keep explicit login expiry separate from security challenges, rate limits, ambiguous responses, and ordinary network failures.
+- Preserve existing Markdown snapshots with collision-safe `_2`, `_3`, and subsequent output filenames.
+- Reject obvious single-post `/detail/` and `/status/` links when an account UID or homepage is required.
+- Check the public GitHub latest-release endpoint once per launch in the background and show a silent, non-modal update notice when a newer stable version exists.
+- Add concise Windows first-use guidance to fully extract the ZIP before running the executable and to try a Test Export first.
+- Replace developer-oriented normal UI status wording with concise user-facing explanations.
+
 ## 0.5.4
 
 - Protect saved Weibo login credentials on Windows with current-user Windows DPAPI instead of leaving the normal saved session as plaintext on disk.

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 import time
+import urllib.parse
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 import tkinter as tk
@@ -44,7 +47,7 @@ from .models import (
     Termination,
     VisibilityState,
 )
-from .network import Cancelled, NetworkError, RateLimited
+from .network import AuthenticationExpired, Cancelled, NetworkError, RateLimited
 from .paths import (
     APP_ICON_PNG,
     default_output_dir,
@@ -54,6 +57,7 @@ from .paths import (
 from .security import redact_text, save_detailed_error
 from .storage import save_normalized_archive
 from .tasking import TaskManager, TaskState
+from .update_check import find_newer_github_version, launch_official_release_page
 
 
 APP_TITLE = "Weibo Text Archiver"
@@ -61,6 +65,16 @@ APP_SUBTITLE = "把微博历史整理成便于长期保存与 AI 分析的本地
 TEST_EXPORT_LIMIT = 20
 DEFAULT_WINDOW_WIDTH = 860
 DEFAULT_COMPACT_HEIGHT = 760
+
+
+@dataclass(frozen=True)
+class ExportRequest:
+    uid: str
+    fetch_range: FetchRange
+    output_dir: Path
+    export_selections: tuple[ExportSelection, ...]
+    fallback_dir: Path | None = None
+    auth_retry_count: int = 0
 
 
 def format_elapsed_time(seconds: float) -> str:
@@ -137,9 +151,35 @@ def _load_app_icon(window, icon_path: Path = APP_ICON_PNG):
 
 
 def extract_uid(value: str) -> str:
-    import re
     m = re.search(r"(?<!\d)(\d{5,})(?!\d)", (value or "").strip())
     return m.group(1) if m else ""
+
+
+def is_obvious_single_post_url(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    candidate = raw
+    if "://" not in candidate and re.match(
+        r"^(?:[A-Za-z0-9-]+\.)*weibo\.(?:com|cn)(?:/|$)",
+        candidate,
+        re.IGNORECASE,
+    ):
+        candidate = "https://" + candidate
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host != "weibo.com" and not host.endswith(".weibo.com"):
+        if host != "weibo.cn" and not host.endswith(".weibo.cn"):
+            return False
+    segments = {
+        urllib.parse.unquote(segment).casefold()
+        for segment in parsed.path.split("/")
+        if segment
+    }
+    return bool(segments & {"detail", "status"})
 
 
 def launch_with_system(
@@ -346,10 +386,13 @@ class App(tk.Tk):
         self.logs_visible = False
         self._compact_geometry: tuple[int, int, int, int] | None = None
         self._poll_after_id: str | None = None
+        self._update_after_id: str | None = None
         self._activity_after_id: str | None = None
         self._activity_started_at: float | None = None
         self._activity_read_count = 0
         self._activity_timer_running = False
+        self._pending_export_request: ExportRequest | None = None
+        self._update_check_started = False
 
         self._configure_style()
         self._build_ui()
@@ -363,6 +406,7 @@ class App(tk.Tk):
         self._update_range_controls()
         self._update_content_controls()
         self._poll_after_id = self.after(100, self._poll_events)
+        self._update_after_id = self.after(500, self._start_update_check)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -------------------- UI --------------------
@@ -392,11 +436,23 @@ class App(tk.Tk):
         hero = ttk.Frame(self.root_frame)
         hero.pack(fill="x")
         ttk.Label(hero, text=APP_TITLE, style="Hero.TLabel").pack(side="left")
+        version_panel = ttk.Frame(hero)
+        version_panel.pack(side="right", anchor="n")
         ttk.Label(
-            hero,
+            version_panel,
             text=VERSION_DISPLAY,
             style="Muted.TLabel",
-        ).pack(side="right", anchor="n", pady=(8, 0))
+        ).pack(anchor="e", pady=(8, 0))
+        self.update_notice_label = ttk.Label(
+            version_panel,
+            text="",
+            style="Muted.TLabel",
+            cursor="hand2",
+        )
+        self.update_notice_label.bind(
+            "<Button-1>",
+            lambda _event: launch_official_release_page(),
+        )
         ttk.Label(
             self.root_frame,
             text=APP_SUBTITLE,
@@ -1131,6 +1187,21 @@ class App(tk.Tk):
 
     # -------------------- Event channel --------------------
 
+    def _start_update_check(self) -> None:
+        self._update_after_id = None
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        threading.Thread(
+            target=self._update_check_worker,
+            daemon=True,
+        ).start()
+
+    def _update_check_worker(self) -> None:
+        latest = find_newer_github_version(VERSION_DISPLAY)
+        if latest is not None:
+            self.events.put((None, "update_available", latest))
+
     def _emit(self, generation: int, kind: str, payload=None):
         self.events.put((generation, kind, payload))
 
@@ -1150,6 +1221,11 @@ class App(tk.Tk):
         try:
             while True:
                 generation, kind, payload = self.events.get_nowait()
+
+                if kind == "update_available":
+                    self.update_notice_label.configure(text=f"发现新版本 {payload}")
+                    self.update_notice_label.pack(anchor="e", pady=(2, 0))
+                    continue
 
                 # The central invariant: stale worker generations cannot mutate UI.
                 if not self.tasks.accepts(generation):
@@ -1194,10 +1270,56 @@ class App(tk.Tk):
                     self._close_qr_window()
                     self._set_running(False)
                     self._refresh_login_status()
-                    self.status_var.set("就绪")
                     self.activity_status_var.set("")
-                    self.progress_detail_var.set("登录成功，可以开始导出。")
-                    messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
+                    recovery = bool(payload and payload.get("recovery"))
+                    pending = self._pending_export_request if recovery else None
+                    if pending is not None:
+                        self._pending_export_request = None
+                        resumed = replace(
+                            pending,
+                            auth_retry_count=pending.auth_retry_count + 1,
+                        )
+                        self.status_var.set("正在重新开始")
+                        self.progress_detail_var.set(
+                            "登录已更新，正在重新开始刚才的导出…"
+                        )
+                        self._launch_export_request(resumed)
+                    else:
+                        self.status_var.set("就绪")
+                        self.progress_detail_var.set("登录成功，可以开始导出。")
+                        messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
+
+                elif kind == "auth_expired":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._stop_activity_timer()
+                    self._set_running(False)
+                    self._pending_export_request = payload
+                    self.login_var.set("○ 登录已过期，请重新扫码")
+                    self.status_var.set("登录已过期")
+                    self.progress_detail_var.set("需要重新扫码；完成后将从头重新导出。")
+                    messagebox.showinfo(
+                        "登录已过期",
+                        "微博登录已过期，需要重新扫码。\n\n"
+                        "完成登录后，将自动重新开始刚才的导出。\n"
+                        "已读取但尚未完成的内容不会被当作成功结果。",
+                    )
+                    self.tasks.transition(TaskState.READY)
+                    self.start_login(recovery=True)
+
+                elif kind == "auth_retry_failed":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._pending_export_request = None
+                    self._set_running(False)
+                    self.status_var.set("登录更新失败")
+                    self.progress_detail_var.set("重新登录后会话仍未被接受；本次导出已停止。")
+                    messagebox.showerror(
+                        "导出已停止",
+                        "重新登录后微博仍未接受当前会话，本次导出已停止。\n"
+                        "请稍后再试。",
+                    )
+                    self.tasks.transition(
+                        TaskState.READY if has_saved_login() else TaskState.IDLE
+                    )
 
                 elif kind == "done":
                     self.tasks.terminal(generation, TaskState.DONE)
@@ -1226,12 +1348,15 @@ class App(tk.Tk):
 
                 elif kind == "error":
                     self.tasks.terminal(generation, TaskState.ERROR)
+                    self._pending_export_request = None
                     self._close_qr_window()
                     self._set_running(False)
                     self.status_var.set("失败")
                     if self._activity_started_at is None:
                         self.activity_status_var.set("")
-                    self.progress_detail_var.set("任务失败；未把旧缓存伪装成成功结果。")
+                    self.progress_detail_var.set(
+                        "本次导出未完成，没有生成不完整的成功结果。"
+                    )
                     self.toggle_logs(True)
                     friendly, detail_path = payload
                     messagebox.showerror(
@@ -1245,12 +1370,15 @@ class App(tk.Tk):
 
                 elif kind == "cancelled":
                     self.tasks.terminal(generation, TaskState.CANCELLED)
+                    self._pending_export_request = None
                     self._close_qr_window()
                     self._set_running(False)
                     self.status_var.set("已取消")
                     if self._activity_started_at is None:
                         self.activity_status_var.set("")
-                    self.progress_detail_var.set("任务已取消；迟到的旧任务事件将被忽略。")
+                    self.progress_detail_var.set(
+                        "任务已取消；未完成内容不会保存为成功归档。"
+                    )
                     self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
         except queue.Empty:
@@ -1265,7 +1393,7 @@ class App(tk.Tk):
 
     def _refresh_login_status(self):
         if has_saved_login():
-            self.login_var.set("● 已保存登录状态")
+            self.login_var.set("● 已保存登录信息")
             if self.tasks.state is TaskState.IDLE:
                 self.tasks.transition(TaskState.READY)
         else:
@@ -1351,7 +1479,9 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def start_login(self):
+    def start_login(self, *, recovery: bool = False):
+        if not recovery:
+            self._pending_export_request = None
         try:
             generation, cancel = self.tasks.start(TaskState.AUTHENTICATING)
         except RuntimeError:
@@ -1369,12 +1499,17 @@ class App(tk.Tk):
 
         self.worker = threading.Thread(
             target=self._login_worker,
-            args=(generation, cancel),
+            args=(generation, cancel, recovery),
             daemon=True,
         )
         self.worker.start()
 
-    def _login_worker(self, generation: int, cancel: threading.Event):
+    def _login_worker(
+        self,
+        generation: int,
+        cancel: threading.Event,
+        recovery: bool = False,
+    ):
         terminal_sent = False
         try:
             self._worker_log(generation, "开始微博二维码登录。")
@@ -1398,7 +1533,7 @@ class App(tk.Tk):
 
             save_cookies(cookies)
             self._worker_log(generation, "扫码登录成功；凭据已保存。")
-            self._emit(generation, "ready", None)
+            self._emit(generation, "ready", {"recovery": recovery})
             terminal_sent = True
 
         except Cancelled:
@@ -1486,7 +1621,15 @@ class App(tk.Tk):
         )
 
     def start_export(self, *, trial: bool):
-        uid = extract_uid(self.uid_var.get())
+        target_value = self.uid_var.get()
+        if is_obvious_single_post_url(target_value):
+            messagebox.showwarning(
+                "需要账号主页",
+                "这里需要微博账号的数字 UID 或账号主页链接，\n"
+                "不是单条微博链接。",
+            )
+            return
+        uid = extract_uid(target_value)
         if not uid:
             messagebox.showwarning("请输入 UID", "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。")
             return
@@ -1519,33 +1662,40 @@ class App(tk.Tk):
             self.output_var.set(str(output_dir))
             fallback_dir = None
 
+        request = ExportRequest(
+            uid=uid,
+            fetch_range=fetch_range,
+            output_dir=output_dir,
+            export_selections=export_selections,
+            fallback_dir=fallback_dir,
+        )
+        self._launch_export_request(request)
+
+    def _launch_export_request(self, request: ExportRequest) -> None:
         try:
             generation, cancel = self.tasks.start(TaskState.FETCHING)
         except RuntimeError:
             return
 
-        self.uid_var.set(uid)
+        self.uid_var.set(request.uid)
         self._start_activity_timer()
         self._set_running(True)
-        self.status_var.set("正在读取")
-        self.progress_detail_var.set(
-            f"{fetch_range.label()} · 正在启动独立抓取核心…"
-        )
+        if request.auth_retry_count:
+            self.status_var.set("正在重新开始")
+            self.progress_detail_var.set("登录已更新，正在重新开始刚才的导出…")
+        else:
+            self.status_var.set("正在读取")
+            self.progress_detail_var.set(
+                f"{request.fetch_range.label()} · 正在开始读取微博…"
+            )
         self._append_log(
-            f"\n=== WEIBO TEXT ARCHIVER · UID {uid} · {fetch_range.label()} ===\n"
+            f"\n=== WEIBO TEXT ARCHIVER · UID {request.uid} · "
+            f"{request.fetch_range.label()} ===\n"
         )
 
         self.worker = threading.Thread(
             target=self._export_worker,
-            args=(
-                generation,
-                cancel,
-                uid,
-                fetch_range,
-                output_dir,
-                export_selections,
-                fallback_dir,
-            ),
+            args=(generation, cancel, request),
             daemon=True,
         )
         self.worker.start()
@@ -1554,13 +1704,11 @@ class App(tk.Tk):
         self,
         generation: int,
         cancel: threading.Event,
-        uid: str,
-        fetch_range: FetchRange,
-        output_dir: Path,
-        export_selections: tuple[ExportSelection, ...],
-        fallback_dir: Path | None = None,
+        request: ExportRequest,
     ):
         terminal_sent = False
+        output_dir = request.output_dir
+        fallback_dir = request.fallback_dir
         try:
             cookie = load_cookie_header()
 
@@ -1573,7 +1721,7 @@ class App(tk.Tk):
                 cancel_event=cancel,
                 progress=progress,
             )
-            archive = client.fetch(uid, fetch_range)
+            archive = client.fetch(request.uid, request.fetch_range)
 
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
@@ -1589,7 +1737,7 @@ class App(tk.Tk):
 
             outputs = []
             failures = []
-            for selection in export_selections:
+            for selection in request.export_selections:
                 if cancel.is_set():
                     raise Cancelled("任务已取消。")
 
@@ -1706,6 +1854,13 @@ class App(tk.Tk):
             self._emit(generation, "done", summary)
             terminal_sent = True
 
+        except AuthenticationExpired:
+            if request.auth_retry_count == 0:
+                self._emit(generation, "auth_expired", request)
+            else:
+                self._emit(generation, "auth_retry_failed", None)
+            terminal_sent = True
+
         except Cancelled:
             self._emit(generation, "cancelled", None)
             terminal_sent = True
@@ -1760,10 +1915,13 @@ class App(tk.Tk):
         # Invalidate the current generation immediately. Any later HTTP/worker
         # event is structurally incapable of touching the new UI state.
         self.tasks.cancel()
+        self._pending_export_request = None
         self._close_qr_window()
         self._set_running(False)
         self.status_var.set("已取消")
-        self.progress_detail_var.set("已取消。正在退出的旧网络请求即使迟到也不会影响界面。")
+        self.progress_detail_var.set(
+            "任务已取消；正在结束当前操作，未完成内容不会保存。"
+        )
         self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
 
     # -------------------- Completion / exit --------------------
@@ -1922,6 +2080,12 @@ class App(tk.Tk):
         if after_id is not None:
             try:
                 self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        update_after_id, self._update_after_id = self._update_after_id, None
+        if update_after_id is not None:
+            try:
+                self.after_cancel(update_after_id)
             except tk.TclError:
                 pass
         super().destroy()

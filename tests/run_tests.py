@@ -83,7 +83,9 @@ from weibo_archive.parser import (
     parse_profile,
 )
 from weibo_archive.network import (
+    AuthenticationExpired,
     Cancelled,
+    ChallengeRequired,
     HttpClient,
     InvalidResponse,
     NetworkError,
@@ -250,8 +252,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.4"
-    assert VERSION_DISPLAY == "0.5.4"
+    assert __version__ == "0.5.5"
+    assert VERSION_DISPLAY == "0.5.5"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -306,7 +308,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.4"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.5"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -426,7 +428,17 @@ def test_windows_preview_packaging_contract():
     assert 'BUNDLE_NAME = f"WeiboTextArchiver_{__version__}_Windows"' in package_source
     assert 'ZIP_NAME = "WeiboTextArchiver_Windows.zip"' in package_source
     assert 'f"{digest}  {ZIP_NAME}\\n"' in package_source
+    assert 'FIRST_USE_NAME = "【先解压整个文件夹】使用说明.txt"' in package_source
+    assert "ROOT / FIRST_USE_NAME" in package_source
+    assert "BUNDLE_DIR / FIRST_USE_NAME" in package_source
     assert '"archives"' in package_source
+
+    first_use = ROOT / "【先解压整个文件夹】使用说明.txt"
+    first_use_lines = first_use.read_text(encoding="utf-8").splitlines()
+    assert 1 <= len(first_use_lines) <= 5
+    assert "完整解压 ZIP" in first_use_lines[0]
+    assert "不要直接在压缩包里运行 EXE" in first_use_lines[0]
+    assert any("测试导出" in line for line in first_use_lines)
 
     package_namespace = runpy.run_path(
         str(ROOT / "tools" / "package_windows_release.py"),
@@ -545,7 +557,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.4_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.5_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -698,7 +710,7 @@ def test_final_polish_activity_status_and_localized_ui():
         app.withdraw()
         app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.4"
+        assert VERSION_DISPLAY == "0.5.5"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -1188,7 +1200,7 @@ def test_performance_constants_and_adaptive_network_backoff():
     )
     try:
         http.json_response("https://m.weibo.cn/api/container/getIndex", retries=4)
-    except InvalidResponse as exc:
+    except ChallengeRequired as exc:
         assert exc.diagnostic.classification == "challenge_html"
     else:
         raise AssertionError("challenge HTML was accepted")
@@ -1314,6 +1326,143 @@ def test_non_json_classifier_prioritizes_challenge_and_login():
     ) == "no_view_permission_html"
 
 
+def test_authentication_expiry_classification_and_propagation():
+    import threading
+
+    login_html = "<html>请登录 passport login</html>".encode("utf-8")
+    challenge_html = "<html>安全验证 验证码</html>".encode("utf-8")
+
+    for body, expected in (
+        (login_html, AuthenticationExpired),
+        (challenge_html, ChallengeRequired),
+    ):
+        http = HttpClient()
+        http.request = lambda *_args, body=body, **_kwargs: ResponseData(
+            body=body,
+            url="https://m.weibo.cn/api/container/getIndex?fixture=secret",
+            status=200,
+            content_type="text/html",
+        )
+        try:
+            http.json_response("https://m.weibo.cn/api/container/getIndex")
+        except expected as exc:
+            assert exc.diagnostic.path == "/api/container/getIndex"
+            assert "fixture=secret" not in repr(exc.diagnostic)
+        else:
+            raise AssertionError("explicit login/challenge HTML lost its classification")
+
+    def profile_client(payload):
+        client = WeiboClient(
+            cookie_header="",
+            cancel_event=threading.Event(),
+            progress=lambda *_args, **_kwargs: None,
+        )
+        client.http.json = lambda *_args, **_kwargs: payload
+        return client
+
+    for payload in (
+        {"ok": 0, "msg": "请先登录"},
+        {"ok": 0, "url": "https://passport.weibo.cn/signin/login"},
+    ):
+        try:
+            profile_client(payload).fetch_profile("123")
+        except AuthenticationExpired:
+            pass
+        else:
+            raise AssertionError("explicit profile login evidence was not propagated")
+
+    try:
+        profile_client({"ok": 0, "msg": "请完成安全验证"}).fetch_profile("123")
+    except ChallengeRequired:
+        pass
+    else:
+        raise AssertionError("profile challenge incorrectly became login expiry")
+
+    try:
+        profile_client({"ok": 0, "url": "/ambiguous/next-step"}).fetch_profile("123")
+    except InvalidResponse:
+        pass
+    else:
+        raise AssertionError("ambiguous profile URL triggered automatic reauthentication")
+
+    for payload, expected in (
+        ({"ok": 0, "msg": "请重新登录"}, AuthenticationExpired),
+        ({"ok": 0, "url": "https://passport.weibo.cn/signin/login"}, AuthenticationExpired),
+        ({"ok": 0, "msg": "请完成安全验证"}, RateLimited),
+        ({"ok": 0, "url": "/ambiguous/next-step"}, InvalidResponse),
+    ):
+        timeline = WeiboClient(
+            cookie_header="",
+            cancel_event=threading.Event(),
+            progress=lambda *_args, **_kwargs: None,
+        )
+        timeline._wait_random = lambda *_args: None
+        timeline.http.json = lambda *_args, payload=payload, **_kwargs: payload
+        try:
+            timeline._timeline_page("123", 1)
+        except expected:
+            pass
+        else:
+            raise AssertionError("timeline authentication classification was ambiguous")
+
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    responses = iter(
+        [
+            {"data": {"userInfo": {"id": "123", "screen_name": "fixture"}}},
+            AuthenticationExpired("expired during optional profile detail"),
+        ]
+    )
+
+    def profile_sequence(*_args, **_kwargs):
+        outcome = next(responses)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    client.http.json = profile_sequence
+    client._wait_random = lambda *_args: None
+    try:
+        client.fetch_profile("123")
+    except AuthenticationExpired:
+        pass
+    else:
+        raise AssertionError("optional profile-detail catch swallowed login expiry")
+
+    extend_login = _longtext_client(
+        lambda url, **_kwargs: ResponseData(login_html, url, 200, "text/html")
+    )
+    try:
+        extend_login._fetch_full_text_html({"id": "42"})
+    except AuthenticationExpired:
+        assert not extend_login.unavailable_cache
+        assert not extend_login.long_text_diagnostics
+    else:
+        raise AssertionError("extend login expiry became long-text incompleteness")
+
+    def login_on_detail(url, **_kwargs):
+        if url.endswith("/statuses/extend"):
+            return ResponseData(
+                b'{"ok":1,"data":{}}',
+                url,
+                200,
+                "application/json",
+            )
+        return ResponseData(login_html, url, 200, "text/html")
+
+    detail_login = _longtext_client(login_on_detail)
+    try:
+        detail_login._fetch_full_text_html({"id": "42"})
+    except AuthenticationExpired:
+        assert not detail_login.unavailable_cache
+        assert "42" not in detail_login.long_text_diagnostics
+    else:
+        raise AssertionError("detail login expiry became long-text incompleteness")
+
+
 def test_longtext_permission_failure_preserves_two_safe_attempts():
     body = _fixture_bytes("longtext_no_permission.html")
     calls = []
@@ -1405,16 +1554,16 @@ def test_longtext_mixed_or_challenge_outcomes_remain_fatal():
     def challenge_with_permission_marker(url, **kwargs):
         return ResponseData(challenge, url, 200, "text/html")
 
-    cases.append((challenge_with_permission_marker, ["challenge_html", "challenge_html"]))
+    cases.append((challenge_with_permission_marker, ChallengeRequired))
 
     login = "<html>请登录 passport login 暂无查看权限</html>".encode("utf-8")
 
     def login_with_permission_marker(url, **kwargs):
         return ResponseData(login, url, 200, "text/html")
 
-    cases.append((login_with_permission_marker, ["login_html", "login_html"]))
+    cases.append((login_with_permission_marker, AuthenticationExpired))
 
-    for fake_request, expected in cases:
+    for fake_request, expected in cases[:2]:
         client = _longtext_client(fake_request)
         try:
             client._fetch_full_text_html({"id": "42"})
@@ -1425,6 +1574,16 @@ def test_longtext_mixed_or_challenge_outcomes_remain_fatal():
             assert "42" not in client.unavailable_cache
         else:
             raise AssertionError("mixed/challenge response was accepted")
+
+    for fake_request, expected_exception in cases[2:]:
+        client = _longtext_client(fake_request)
+        try:
+            client._fetch_full_text_html({"id": "42"})
+        except expected_exception:
+            assert "42" not in client.unavailable_cache
+            assert "42" not in client.long_text_diagnostics
+        else:
+            raise AssertionError("session-wide login/challenge response was swallowed")
 
 
 def test_longtext_cancelled_is_not_converted_to_incomplete():
@@ -3041,15 +3200,18 @@ def test_multi_output_fetch_once_and_isolation():
                 app_module.save_normalized_archive = saved_archives.append
                 app_module.export_markdown = fake_export
                 worker = FakeWorker()
+                request = app_module.ExportRequest(
+                    uid=archive.profile.id,
+                    fetch_range=FetchRange.trial(20),
+                    output_dir=folder,
+                    export_selections=selections,
+                    fallback_dir=fallback_dir,
+                )
                 app_module.App._export_worker(
                     worker,
                     1,
                     threading.Event(),
-                    archive.profile.id,
-                    FetchRange.trial(20),
-                    folder,
-                    selections,
-                    fallback_dir,
+                    request,
                 )
                 done = [event for event in worker.events if event[1] == "done"]
                 assert len(done) == 1
@@ -3379,6 +3541,7 @@ def test_atomic_export_preserves_existing_final_on_cancel_or_failure():
 
         assert final.read_text(encoding="utf-8") == "existing user archive"
         assert not list(output_dir.glob("*.tmp"))
+        assert not (output_dir / "测试用户_1234567890_测试导出20条_完整_2.md").exists()
 
         def fail_before_commit():
             raise OSError("simulated write failure")
@@ -3398,6 +3561,233 @@ def test_atomic_export_preserves_existing_final_on_cancel_or_failure():
 
         assert final.read_text(encoding="utf-8") == "existing user archive"
         assert not list(output_dir.glob("*.tmp"))
+
+
+def test_collision_safe_export_preserves_every_snapshot():
+    archive = replace(build_alpha3_archive(), fetch_range=FetchRange.trial(20))
+    expected_name = "测试用户_1234567890_测试导出20条_完整.md"
+
+    with tempfile.TemporaryDirectory(prefix="weibo_collision_safe_") as td:
+        output_dir = Path(td)
+        first_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert first_path == output_dir / expected_name
+        first_bytes = first_path.read_bytes()
+
+        second_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert second_path == output_dir / expected_name.replace(".md", "_2.md")
+        assert first_path.read_bytes() == first_bytes
+        second_bytes = second_path.read_bytes()
+
+        third_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert third_path == output_dir / expected_name.replace(".md", "_3.md")
+        assert first_path.read_bytes() == first_bytes
+        assert second_path.read_bytes() == second_bytes
+        assert third_path.read_bytes() == first_bytes
+        assert not list(output_dir.glob("*.tmp"))
+
+
+def test_day0_uid_guard_and_user_facing_wording():
+    import weibo_archive.app as app_module
+
+    for accepted, expected in (
+        ("123456789", "123456789"),
+        ("https://weibo.com/u/123456789", "123456789"),
+        ("https://m.weibo.cn/u/123456789", "123456789"),
+        ("ambiguous text 123456789", "123456789"),
+    ):
+        assert not app_module.is_obvious_single_post_url(accepted)
+        assert app_module.extract_uid(accepted) == expected
+
+    for rejected in (
+        "https://m.weibo.cn/detail/1234567890123456",
+        "m.weibo.cn/detail/1234567890123456",
+        "https://weibo.com/status/1234567890123456",
+        "https://www.weibo.cn/status/1234567890123456",
+    ):
+        assert app_module.is_obvious_single_post_url(rejected)
+
+    assert not app_module.is_obvious_single_post_url(
+        "https://example.com/detail/1234567890123456"
+    )
+    assert not app_module.is_obvious_single_post_url("not a URL /detail/ 123456")
+
+    class Value:
+        def get(self):
+            return "https://m.weibo.cn/detail/1234567890123456"
+
+    warnings = []
+    original_warning = app_module.messagebox.showwarning
+    app_module.messagebox.showwarning = lambda title, text: warnings.append(
+        (title, text)
+    )
+    try:
+        app_module.App.start_export(type("GuardHarness", (), {"uid_var": Value()})(), trial=False)
+    finally:
+        app_module.messagebox.showwarning = original_warning
+    assert len(warnings) == 1
+    assert warnings[0][0] == "需要账号主页"
+    assert "不是单条微博链接" in warnings[0][1]
+
+    app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    for removed in (
+        "任务失败；未把旧缓存伪装成成功结果。",
+        "任务已取消；迟到的旧任务事件将被忽略。",
+        "正在退出的旧网络请求即使迟到也不会影响界面。",
+        "正在启动独立抓取核心",
+    ):
+        assert removed not in app_source
+    for replacement in (
+        "本次导出未完成，没有生成不完整的成功结果。",
+        "任务已取消；未完成内容不会保存为成功归档。",
+        "正在开始读取微博",
+    ):
+        assert replacement in app_source
+
+
+def test_bounded_github_update_check():
+    import urllib.error
+
+    import weibo_archive.app as app_module
+    import weibo_archive.update_check as update_module
+
+    class FakeResponse:
+        def __init__(self, body, status=200):
+            self.body = body
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit):
+            assert limit == 65537
+            return self.body
+
+    observed_requests = []
+
+    def opener_for(body, status=200):
+        def open_fixture(request, timeout):
+            assert timeout == 3.0
+            assert request.full_url == update_module.GITHUB_LATEST_RELEASE_API
+            header_names = {name.casefold() for name in request.headers}
+            assert "cookie" not in header_names
+            assert "authorization" not in header_names
+            observed_requests.append(request.full_url)
+            return FakeResponse(body, status)
+
+        return open_fixture
+
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=opener_for(b'{"tag_name":"v0.5.6"}'),
+    ) == "0.5.6"
+    for tag in ("v0.5.5", "0.5.4", "v0.5.6-rc.1", "latest", "v1.2"):
+        assert update_module.find_newer_github_version(
+            "0.5.5",
+            opener=opener_for(json.dumps({"tag_name": tag}).encode("utf-8")),
+        ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=opener_for(b"not json"),
+    ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=opener_for(b'{"wrong_field":"v9.9.9"}'),
+    ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=opener_for(b'{"tag_name":"v9.9.9"}', status=503),
+    ) is None
+
+    def timeout_opener(_request, timeout):
+        assert timeout == 3.0
+        raise TimeoutError("offline fixture timeout")
+
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=timeout_opener,
+    ) is None
+
+    def http_error_opener(_request, timeout):
+        assert timeout == 3.0
+        raise urllib.error.HTTPError(
+            update_module.GITHUB_LATEST_RELEASE_API,
+            500,
+            "fixture",
+            {},
+            None,
+        )
+
+    assert update_module.find_newer_github_version(
+        "0.5.5",
+        opener=http_error_opener,
+    ) is None
+    assert observed_requests
+
+    launched = []
+    assert update_module.launch_official_release_page(launched.append)
+    assert launched == [update_module.GITHUB_LATEST_RELEASE_PAGE]
+
+    starts = []
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            assert daemon is True
+            self.target = target
+
+        def start(self):
+            starts.append(self.target)
+
+    class UpdateHarness:
+        _update_check_started = False
+
+        def _update_check_worker(self):
+            raise AssertionError("fake thread must not execute the network worker")
+
+    original_thread = app_module.threading.Thread
+    app_module.threading.Thread = FakeThread
+    try:
+        harness = UpdateHarness()
+        app_module.App._start_update_check(harness)
+        app_module.App._start_update_check(harness)
+    finally:
+        app_module.threading.Thread = original_thread
+    assert len(starts) == 1
+
+    original_login = app_module.has_saved_login
+    app = None
+    try:
+        app_module.has_saved_login = lambda: False
+        app = app_module.App()
+        app.withdraw()
+        app.tasks.transition(TaskState.READY)
+        generation, _ = app.tasks.start(TaskState.FETCHING)
+        app.events.put((None, "update_available", "0.5.6"))
+        app._poll_events()
+        assert app.tasks.state is TaskState.FETCHING
+        assert app.tasks.accepts(generation)
+        assert app.update_notice_label.cget("text") == "发现新版本 0.5.6"
+    finally:
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_login
 
 
 def test_safe_system_launcher():
@@ -3439,6 +3829,269 @@ def test_generation_guard():
     assert manager.accepts(gen2)
     assert not manager.accepts(gen1)
 
+
+def test_expired_login_worker_retry_limit_and_frozen_request():
+    import threading
+
+    import weibo_archive.app as app_module
+
+    archive = build_archive()
+    selections = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=True,
+        custom_options=ExportOptions(include_source=False),
+        custom_filter=CustomFilterOptions(
+            keywords=("frozen",),
+            visibility_filter_enabled=True,
+            visibilities=frozenset({VisibilityState.PRIVATE}),
+        ),
+        ai_visibility=AIVisibilityOptions(
+            include_followers=True,
+            include_friends=True,
+        ),
+    )
+    request = app_module.ExportRequest(
+        uid=archive.profile.id,
+        fetch_range=FetchRange.recent(37),
+        output_dir=Path("C:/fixture/output"),
+        export_selections=selections,
+        fallback_dir=Path("C:/fixture/fallback"),
+    )
+    try:
+        request.auth_retry_count = 9
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("ExportRequest is mutable")
+
+    class FakeWorker:
+        def __init__(self):
+            self.events = []
+            self.logs = []
+
+        def _emit(self, generation, kind, payload=None):
+            self.events.append((generation, kind, payload))
+
+        def _worker_log(self, generation, text):
+            self.logs.append((generation, text))
+
+    class ExpiredClient:
+        instances = 0
+
+        def __init__(self, **_kwargs):
+            type(self).instances += 1
+
+        def fetch(self, uid, fetch_range):
+            assert uid == request.uid
+            assert fetch_range == request.fetch_range
+            raise AuthenticationExpired("fixture expired")
+
+    originals = (
+        app_module.load_cookie_header,
+        app_module.WeiboClient,
+        app_module.save_normalized_archive,
+        app_module.export_markdown,
+    )
+    try:
+        app_module.load_cookie_header = lambda: "SUB=offline-fixture"
+        app_module.WeiboClient = ExpiredClient
+        app_module.save_normalized_archive = lambda _archive: (_ for _ in ()).throw(
+            AssertionError("expired fetch wrote normalized archive")
+        )
+        app_module.export_markdown = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("expired fetch wrote Markdown")
+        )
+
+        first = FakeWorker()
+        app_module.App._export_worker(first, 1, threading.Event(), request)
+        assert [(kind, payload) for _, kind, payload in first.events] == [
+            ("auth_expired", request)
+        ]
+
+        retried = replace(request, auth_retry_count=1)
+        second = FakeWorker()
+        app_module.App._export_worker(second, 2, threading.Event(), retried)
+        assert [(kind, payload) for _, kind, payload in second.events] == [
+            ("auth_retry_failed", None)
+        ]
+        assert ExpiredClient.instances == 2
+
+        class SuccessfulClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def fetch(self, uid, fetch_range):
+                assert uid == request.uid
+                assert fetch_range == request.fetch_range
+                return archive
+
+        saved = []
+        app_module.WeiboClient = SuccessfulClient
+        app_module.save_normalized_archive = saved.append
+        with tempfile.TemporaryDirectory(prefix="weibo_auth_resume_") as td:
+            output_dir = Path(td)
+            successful_request = replace(
+                request,
+                output_dir=output_dir,
+                export_selections=(
+                    next(
+                        selection
+                        for selection in selections
+                        if selection.preset is ExportPreset.FULL_ARCHIVE
+                    ),
+                ),
+                fallback_dir=None,
+                auth_retry_count=1,
+            )
+
+            def successful_export(
+                _archive,
+                requested_dir,
+                _options,
+                filename_suffix,
+                **_kwargs,
+            ):
+                assert requested_dir == output_dir
+                return requested_dir / f"{filename_suffix}.md", {
+                    "count": len(archive.posts),
+                    "output_bytes": 1,
+                    "output_chars": 1,
+                    "layout": "full",
+                }
+
+            app_module.export_markdown = successful_export
+            third = FakeWorker()
+            app_module.App._export_worker(
+                third,
+                3,
+                threading.Event(),
+                successful_request,
+            )
+            done = [event for event in third.events if event[1] == "done"]
+            assert len(done) == 1
+            assert len(done[0][2]["outputs"]) == 1
+            assert done[0][2]["outputs"][0]["path"].parent == output_dir
+            assert saved == [archive]
+    finally:
+        (
+            app_module.load_cookie_header,
+            app_module.WeiboClient,
+            app_module.save_normalized_archive,
+            app_module.export_markdown,
+        ) = originals
+
+    assert request.export_selections == selections
+    assert request.export_selections[0].visibility_states == frozenset(
+        {VisibilityState.PUBLIC, VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+    )
+    assert request.export_selections[2].custom_filter.keywords == ("frozen",)
+    assert request.export_selections[2].custom_filter.visibilities == frozenset(
+        {VisibilityState.PRIVATE}
+    )
+
+
+def test_expired_login_ui_generation_resume_and_cancellation():
+    import weibo_archive.app as app_module
+
+    originals = (
+        app_module.has_saved_login,
+        app_module.messagebox.showinfo,
+        app_module.messagebox.showerror,
+    )
+    app = None
+    notices = []
+    try:
+        app_module.has_saved_login = lambda: True
+        app_module.messagebox.showinfo = lambda title, text: notices.append(
+            ("info", title, text)
+        )
+        app_module.messagebox.showerror = lambda title, text: notices.append(
+            ("error", title, text)
+        )
+        app = app_module.App()
+        app.withdraw()
+        request = app_module.ExportRequest(
+            uid="123456",
+            fetch_range=FetchRange.since_date(date(2024, 1, 2)),
+            output_dir=Path("C:/frozen/output"),
+            export_selections=build_export_selections(
+                include_full=True,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=CustomFilterOptions(),
+                ai_visibility=AIVisibilityOptions(include_private=True),
+            ),
+            fallback_dir=Path("C:/frozen/fallback"),
+        )
+
+        auth_generations = []
+
+        def fake_start_login(*, recovery=False):
+            assert recovery is True
+            generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+            auth_generations.append(generation)
+
+        resumed = []
+        fetch_generations = []
+
+        def fake_launch(resumed_request):
+            resumed.append(resumed_request)
+            generation, _ = app.tasks.start(TaskState.FETCHING)
+            fetch_generations.append(generation)
+
+        app.start_login = fake_start_login
+        app._launch_export_request = fake_launch
+
+        old_generation, _ = app.tasks.start(TaskState.FETCHING)
+        app.events.put((old_generation, "auth_expired", request))
+        app.events.put((old_generation, "status", "stale old worker event"))
+        app._poll_events()
+        assert len(auth_generations) == 1
+        assert auth_generations[0] != old_generation
+        assert app.tasks.state is TaskState.AUTHENTICATING
+        assert app._pending_export_request is request
+        assert app.status_var.get() != "stale old worker event"
+
+        app.uid_var.set("999999")
+        app.range_mode_var.set(RangeMode.ALL.value)
+        app.ai_private_var.set(False)
+        app.events.put((auth_generations[0], "ready", {"recovery": True}))
+        app._poll_events()
+        assert len(resumed) == 1
+        assert resumed[0].uid == "123456"
+        assert resumed[0].fetch_range == FetchRange.since_date(date(2024, 1, 2))
+        assert resumed[0].output_dir == Path("C:/frozen/output")
+        assert resumed[0].fallback_dir == Path("C:/frozen/fallback")
+        assert resumed[0].export_selections == request.export_selections
+        assert resumed[0].auth_retry_count == 1
+        assert fetch_generations[0] not in (old_generation, auth_generations[0])
+        assert app._pending_export_request is None
+
+        app.tasks.cancel()
+        app.tasks.transition(TaskState.READY)
+        app._pending_export_request = request
+        cancelled_auth_generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+        app.stop_current()
+        assert app._pending_export_request is None
+        assert not app.tasks.accepts(cancelled_auth_generation)
+        resumed_before = len(resumed)
+
+        app.tasks.transition(TaskState.READY)
+        manual_generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+        app.events.put((manual_generation, "ready", {"recovery": False}))
+        app._poll_events()
+        assert len(resumed) == resumed_before
+        assert app._pending_export_request is None
+    finally:
+        if app is not None:
+            app.destroy()
+        (
+            app_module.has_saved_login,
+            app_module.messagebox.showinfo,
+            app_module.messagebox.showerror,
+        ) = originals
 
 def test_dpapi_credential_store_and_legacy_migration():
     synthetic_sub = "synthetic-test-secret"
@@ -4213,6 +4866,7 @@ def main():
         ("non-JSON diagnostics contain no body/query", test_network_non_json_diagnostic_has_no_body_or_query),
         ("0.5.3 adaptive network backoff", test_performance_constants_and_adaptive_network_backoff),
         ("non-JSON classifier safety priority", test_non_json_classifier_prioritizes_challenge_and_login),
+        ("0.5.5 authentication-expiry classification", test_authentication_expiry_classification_and_propagation),
         ("long-text permission failure diagnostics", test_longtext_permission_failure_preserves_two_safe_attempts),
         ("long-text mixed outcomes remain fatal", test_longtext_mixed_or_challenge_outcomes_remain_fatal),
         ("long-text cancellation remains cancellation", test_longtext_cancelled_is_not_converted_to_incomplete),
@@ -4243,8 +4897,13 @@ def main():
         ("Alpha4 normalized cache semantics", test_alpha4_normalized_cache_contains_only_stable_semantics),
         ("Alpha4 completion integrity warning", test_completion_integrity_warning_text),
         ("Alpha3 atomic cancellation safety", test_atomic_export_preserves_existing_final_on_cancel_or_failure),
+        ("Day-0 collision-safe Markdown output", test_collision_safe_export_preserves_every_snapshot),
+        ("Day-0 UID guard and user wording", test_day0_uid_guard_and_user_facing_wording),
+        ("bounded GitHub update check", test_bounded_github_update_check),
         ("Alpha3 Windows launcher helper", test_safe_system_launcher),
         ("generation guard", test_generation_guard),
+        ("0.5.5 frozen request and retry limit", test_expired_login_worker_retry_limit_and_frozen_request),
+        ("0.5.5 recovery generation and cancellation", test_expired_login_ui_generation_resume_and_cancellation),
         ("range semantics", test_range_semantics),
         ("no raw API escape hatch", test_no_raw_api_escape_hatch),
         ("Alpha4 recovery layer guards", test_alpha4_recovery_and_diagnostic_layer_guards),

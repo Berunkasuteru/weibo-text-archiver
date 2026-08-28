@@ -54,6 +54,14 @@ class NetworkError(RuntimeError):
         self.diagnostic = diagnostic
 
 
+class AuthenticationExpired(NetworkError):
+    """The server explicitly requires a new authenticated login."""
+
+
+class ChallengeRequired(NetworkError):
+    """The server explicitly requires verification, not reauthentication."""
+
+
 class RateLimited(NetworkError):
     pass
 
@@ -280,6 +288,16 @@ class HttpClient:
             )
 
         if parse_diagnostic is not None:
+            if parse_diagnostic.classification == "login_html":
+                raise AuthenticationExpired(
+                    "微博登录已过期，需要重新扫码。",
+                    diagnostic=parse_diagnostic,
+                )
+            if parse_diagnostic.classification == "challenge_html":
+                raise ChallengeRequired(
+                    "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。",
+                    diagnostic=parse_diagnostic,
+                )
             raise InvalidResponse(
                 "微博返回的不是可用 JSON。可能遇到登录失效、风控或临时网页错误。",
                 diagnostic=parse_diagnostic,

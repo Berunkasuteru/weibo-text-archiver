@@ -209,8 +209,8 @@ def _atomic_write_text(
     final_path: Path,
     text: str,
     before_commit: Callable[[], None] | None = None,
-) -> None:
-    """Replace final_path only after a unique task-owned temp is complete."""
+) -> Path:
+    """Atomically commit to the first available collision-safe final path."""
     fd, temp_name = tempfile.mkstemp(
         prefix=".weibo-export-",
         suffix=".tmp",
@@ -222,7 +222,21 @@ def _atomic_write_text(
         temp_path.write_text(text, encoding="utf-8")
         if before_commit is not None:
             before_commit()
-        temp_path.replace(final_path)
+        candidate = final_path
+        index = 2
+        while True:
+            try:
+                if os.name == "nt":
+                    temp_path.rename(candidate)
+                else:
+                    os.link(temp_path, candidate)
+                    temp_path.unlink()
+                return candidate
+            except FileExistsError:
+                candidate = final_path.with_name(
+                    f"{final_path.stem}_{index}{final_path.suffix}"
+                )
+                index += 1
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -282,8 +296,8 @@ def export_markdown(
     safe_name = md.safe_filename(username)
     range_label = _range_filename_label(archive)
 
-    output_path = output_dir / f"{safe_name}_{uid}_{range_label}_{filename_suffix}.md"
-    _atomic_write_text(output_path, text, before_commit)
+    desired_path = output_dir / f"{safe_name}_{uid}_{range_label}_{filename_suffix}.md"
+    output_path = _atomic_write_text(desired_path, text, before_commit)
 
     stats = dict(renderer_stats)
     stats.update(
