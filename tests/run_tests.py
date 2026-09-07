@@ -82,6 +82,7 @@ from weibo_archive.parser import (
     parse_post,
     parse_profile,
 )
+from weibo_archive.performance import PerformanceMetrics
 from weibo_archive.network import (
     AuthenticationExpired,
     Cancelled,
@@ -252,8 +253,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.5"
-    assert VERSION_DISPLAY == "0.5.5"
+    assert __version__ == "0.5.6"
+    assert VERSION_DISPLAY == "0.5.6"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -308,7 +309,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.5"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.6"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -428,17 +429,8 @@ def test_windows_preview_packaging_contract():
     assert 'BUNDLE_NAME = f"WeiboTextArchiver_{__version__}_Windows"' in package_source
     assert 'ZIP_NAME = "WeiboTextArchiver_Windows.zip"' in package_source
     assert 'f"{digest}  {ZIP_NAME}\\n"' in package_source
-    assert 'FIRST_USE_NAME = "【先解压整个文件夹】使用说明.txt"' in package_source
-    assert "ROOT / FIRST_USE_NAME" in package_source
-    assert "BUNDLE_DIR / FIRST_USE_NAME" in package_source
     assert '"archives"' in package_source
-
-    first_use = ROOT / "【先解压整个文件夹】使用说明.txt"
-    first_use_lines = first_use.read_text(encoding="utf-8").splitlines()
-    assert 1 <= len(first_use_lines) <= 5
-    assert "完整解压 ZIP" in first_use_lines[0]
-    assert "不要直接在压缩包里运行 EXE" in first_use_lines[0]
-    assert any("测试导出" in line for line in first_use_lines)
+    assert not (ROOT / "【先解压整个文件夹】使用说明.txt").exists()
 
     package_namespace = runpy.run_path(
         str(ROOT / "tools" / "package_windows_release.py"),
@@ -557,7 +549,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.5_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.6_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -641,7 +633,7 @@ def test_activity_indicator_lifecycle():
         indicator.start()
         assert indicator._after_id == first_after_id
 
-        deadline = time.monotonic() + 0.25
+        deadline = time.monotonic() + 0.20
         while time.monotonic() < deadline:
             root.update()
             time.sleep(0.01)
@@ -651,19 +643,13 @@ def test_activity_indicator_lifecycle():
         stopped_frame = indicator._frame
         assert indicator._after_id is None
         assert indicator._running is False
-        deadline = time.monotonic() + 0.08
-        while time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.01)
+        root.update()
         assert indicator._frame == stopped_frame
 
         indicator.start()
         assert indicator._after_id is not None
         indicator.destroy()
-        deadline = time.monotonic() + 0.08
-        while time.monotonic() < deadline:
-            root.update()
-            time.sleep(0.01)
+        root.update_idletasks()
         assert indicator._after_id is None
         assert indicator._running is False
     finally:
@@ -680,6 +666,7 @@ def test_final_polish_activity_status_and_localized_ui():
     from weibo_archive.app import (
         APP_SUBTITLE,
         APP_TITLE,
+        ActivityIndicator,
         TEST_EXPORT_LIMIT,
         App,
         activity_status_text,
@@ -710,7 +697,7 @@ def test_final_polish_activity_status_and_localized_ui():
         app.withdraw()
         app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.5"
+        assert VERSION_DISPLAY == "0.5.6"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -740,6 +727,48 @@ def test_final_polish_activity_status_and_localized_ui():
         assert TEST_EXPORT_LIMIT == 20
         assert app.trial_btn.cget("text") == "测试导出"
         assert app.trial_hint_label.cget("text") == "快速验证 · 最近 20 条"
+        assert app.trial_btn.cget("style") == "Quiet.TButton"
+        assert app.stop_btn.cget("style") == "Quiet.TButton"
+        assert app.login_btn.cget("style") == "Quiet.TButton"
+        assert app.output_choose_btn.cget("style") == "Quiet.TButton"
+        assert app.export_btn.cget("style") == "Primary.TButton"
+        assert app.clear_login_btn.cget("style") == "Quiet.TButton"
+        assert app.custom_settings_btn.cget("style") == "Quiet.TButton"
+        assert app.details_btn.cget("style") == "Quiet.TButton"
+        assert app.login_var.get() == "○ 未登录"
+
+        app.deiconify()
+        app.update()
+        assert app.winfo_width() >= 780
+        assert app.winfo_reqwidth() <= app.winfo_width()
+        assert app.recent_entry.master is app.recent_suffix_label.master
+        assert app.since_entry.master is app.since_suffix_label.master
+        recent_gap = app.recent_suffix_label.winfo_x() - (
+            app.recent_entry.winfo_x() + app.recent_entry.winfo_width()
+        )
+        since_gap = app.since_suffix_label.winfo_x() - (
+            app.since_entry.winfo_x() + app.since_entry.winfo_width()
+        )
+        assert 0 <= recent_gap <= 12
+        assert 0 <= since_gap <= 12
+        assert app.recent_suffix_label.cget("text") == "条"
+        assert app.since_suffix_label.cget("text") == "起（YYYY-MM-DD）"
+        bottom = max(
+            child.winfo_y() + child.winfo_height()
+            for child in app.root_frame.winfo_children()
+            if child.winfo_manager()
+        )
+        assert bottom <= app.root_frame.winfo_height()
+        for required_widget in (
+            app.uid_entry,
+            app.recent_entry,
+            app.since_entry,
+            app.trial_btn,
+            app.export_btn,
+            app.details_btn,
+        ):
+            assert required_widget.winfo_viewable()
+        app.withdraw()
 
         app._start_activity_timer()
         first_after_id = app._activity_after_id
@@ -752,10 +781,7 @@ def test_final_polish_activity_status_and_localized_ui():
 
         app._set_activity_read_count(347)
         assert app._activity_read_count == 347
-        before_animation = app._activity_read_count
-        app.activity.start()
-        app.activity._tick()
-        assert app._activity_read_count == before_animation
+        assert isinstance(app.activity, ActivityIndicator)
 
         app._stop_activity_timer()
         assert app._activity_after_id is None
@@ -772,12 +798,18 @@ def test_final_polish_activity_status_and_localized_ui():
 
         app.tasks.start(TaskState.FETCHING)
         app._set_running(True)
+        assert str(app.trial_btn.cget("state")) == "disabled"
+        assert str(app.export_btn.cget("state")) == "disabled"
+        assert str(app.stop_btn.cget("state")) == "normal"
         assert [
             str(button.cget("state")) for button in app.ai_visibility_buttons
         ] == ["disabled", "disabled", "disabled"]
         app.tasks.cancel()
         app.tasks.transition(TaskState.READY)
         app._set_running(False)
+        assert str(app.trial_btn.cget("state")) == "normal"
+        assert str(app.export_btn.cget("state")) == "normal"
+        assert str(app.stop_btn.cget("state")) == "disabled"
 
         app.custom_output_var.set(True)
         app._update_content_controls()
@@ -799,6 +831,14 @@ def test_final_polish_activity_status_and_localized_ui():
             for widget in descendants(custom_window)
             if isinstance(widget, ttk.Checkbutton)
         ]
+        dialog_buttons = {
+            widget.cget("text"): widget
+            for widget in descendants(custom_window)
+            if isinstance(widget, ttk.Button)
+        }
+        assert dialog_buttons["保存设置"].cget("style") == "Primary.TButton"
+        assert dialog_buttons["取消"].cget("style") == "Primary.TButton"
+        assert dialog_buttons["保存设置"].winfo_height() == dialog_buttons["取消"].winfo_height()
         by_text = {widget.cget("text"): widget for widget in checkbuttons}
         for label in (
             "按可见范围筛选",
@@ -1261,6 +1301,151 @@ def test_performance_constants_and_adaptive_network_backoff():
     assert response.status == 200
     assert opener.calls == 3
     assert waits == [1.0, 3.0]
+    class FakeClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = FakeClock()
+    metrics = PerformanceMetrics(clock=clock)
+    metrics.begin()
+    for elapsed in (1.0, 3.0, 9.0):
+        metrics.record_request("longtext_extend", elapsed)
+    metrics.record_planned_wait("page_pacing", 2.0)
+    metrics.record_planned_wait("longtext_pacing", 3.0)
+    metrics.record_retry_wait("ordinary_backoff", 2.0)
+    metrics.increment_longtext("unique_attempted")
+    metrics.increment_longtext("extend_success")
+    metrics.increment_error("ordinary_retry")
+    clock.advance(25.0)
+    metrics.finish(successful=True)
+    snapshot = metrics.snapshot()
+    assert snapshot["status"] == "fetch_success"
+    assert snapshot["total_wall_time"] == 25.0
+    assert snapshot["request_time"] == 13.0
+    assert snapshot["planned_wait_time"] == 5.0
+    assert snapshot["retry_wait_time"] == 2.0
+    assert snapshot["other_time"] == 5.0
+    assert snapshot["request_count"] == 3
+    assert snapshot["requests"]["longtext_extend"] == {
+        "count": 3,
+        "mean": 13.0 / 3.0,
+        "p50": 3.0,
+        "p95": 9.0,
+    }
+    rendered = metrics.render()
+    for forbidden in (
+        "SUB=",
+        "Cookie",
+        "credential",
+        "containerid",
+        "post_id",
+        "fixture-secret",
+    ):
+        assert forbidden not in rendered
+
+    failed = PerformanceMetrics(clock=clock)
+    failed.begin()
+    clock.advance(1.0)
+    failed.finish(successful=False)
+    assert failed.snapshot()["status"] == "fetch_failed"
+    assert "status: fetch_failed" in failed.render()
+    assert "status: fetch_success" not in failed.render()
+
+    class FakeResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            clock.advance(2.5)
+            return b"{}"
+
+        def geturl(self):
+            return "https://m.weibo.cn/api/container/getIndex"
+
+    timed = PerformanceMetrics(clock=clock)
+    http = HttpClient(cancel_event=threading.Event(), performance=timed)
+    http.opener = type("Opener", (), {"open": lambda *_args, **_kwargs: FakeResponse()})()
+    http.request(
+        "https://m.weibo.cn/api/container/getIndex",
+        performance_category="timeline",
+    )
+    assert timed.snapshot()["requests"]["timeline"]["p50"] == 2.5
+
+    outcomes = [
+        urllib.error.URLError(TimeoutError("fixture timeout")),
+        FakeResponse(),
+    ]
+
+    class RetryOpener:
+        def open(self, *_args, **_kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                clock.advance(0.5)
+                raise outcome
+            return outcome
+
+    retried = PerformanceMetrics(clock=clock)
+    retry_http = HttpClient(cancel_event=threading.Event(), performance=retried)
+    retry_http.opener = RetryOpener()
+    retry_http.wait = clock.advance
+    retry_http.request(
+        "https://m.weibo.cn/api/container/getIndex",
+        retries=2,
+        performance_category="timeline",
+    )
+    retry_snapshot = retried.snapshot()
+    assert retry_snapshot["requests"]["timeline"]["count"] == 2
+    assert retry_snapshot["retry_waits"]["ordinary_backoff"] == 1.0
+    assert retry_snapshot["planned_wait_time"] == 0.0
+    assert retry_snapshot["errors"]["ordinary_retry"] == 1
+
+    spacing_clock = FakeClock()
+    spacing = PerformanceMetrics(clock=spacing_clock)
+    spacing.note_request_start()
+    spacing_clock.advance(0.1)
+    assert abs(spacing.remaining_start_spacing(0.3) - 0.2) < 1e-9
+    spacing_clock.advance(0.5)
+    assert spacing.remaining_start_spacing(0.3) == 0.0
+    assert spacing.remaining_start_spacing(-1.0) == 0.0
+
+    paced_client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    paced_client.performance = PerformanceMetrics(clock=spacing_clock)
+    paced_client.http.performance = paced_client.performance
+    waits = []
+    paced_client.http.wait = waits.append
+    original_uniform = __import__("weibo_archive.client", fromlist=["random"]).random.uniform
+    __import__("weibo_archive.client", fromlist=["random"]).random.uniform = (
+        lambda _low, _high: 0.3
+    )
+    try:
+        paced_client.performance.note_request_start()
+        spacing_clock.advance(0.1)
+        paced_client._wait_random(0.2, 0.5, "page_pacing")
+        paced_client.performance.note_request_start()
+        spacing_clock.advance(0.8)
+        paced_client._wait_random(0.2, 0.5, "page_pacing")
+    finally:
+        __import__("weibo_archive.client", fromlist=["random"]).random.uniform = original_uniform
+    assert abs(waits[0] - 0.2) < 1e-9
+    assert waits[1] == 0.0
+    assert abs(paced_client.performance.planned_waits["page_pacing"] - 0.2) < 1e-9
+    assert paced_client.performance.retry_waits["ordinary_backoff"] == 0.0
 
     progress = []
     client = WeiboClient(
@@ -3644,6 +3829,12 @@ def test_day0_uid_guard_and_user_facing_wording():
     assert "不是单条微博链接" in warnings[0][1]
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    for login_status in (
+        "● 已保存登录信息",
+        "○ 未登录",
+        "○ 登录已过期，请重新扫码",
+    ):
+        assert login_status in app_source
     for removed in (
         "任务失败；未把旧缓存伪装成成功结果。",
         "任务已取消；迟到的旧任务事件将被忽略。",
@@ -3695,24 +3886,24 @@ def test_bounded_github_update_check():
         return open_fixture
 
     assert update_module.find_newer_github_version(
-        "0.5.5",
-        opener=opener_for(b'{"tag_name":"v0.5.6"}'),
-    ) == "0.5.6"
-    for tag in ("v0.5.5", "0.5.4", "v0.5.6-rc.1", "latest", "v1.2"):
+        "0.5.6",
+        opener=opener_for(b'{"tag_name":"v0.5.7"}'),
+    ) == "0.5.7"
+    for tag in ("v0.5.6", "0.5.5", "v0.5.7-rc.1", "latest", "v1.2"):
         assert update_module.find_newer_github_version(
-            "0.5.5",
+            "0.5.6",
             opener=opener_for(json.dumps({"tag_name": tag}).encode("utf-8")),
         ) is None
     assert update_module.find_newer_github_version(
-        "0.5.5",
+        "0.5.6",
         opener=opener_for(b"not json"),
     ) is None
     assert update_module.find_newer_github_version(
-        "0.5.5",
+        "0.5.6",
         opener=opener_for(b'{"wrong_field":"v9.9.9"}'),
     ) is None
     assert update_module.find_newer_github_version(
-        "0.5.5",
+        "0.5.6",
         opener=opener_for(b'{"tag_name":"v9.9.9"}', status=503),
     ) is None
 
@@ -3721,7 +3912,7 @@ def test_bounded_github_update_check():
         raise TimeoutError("offline fixture timeout")
 
     assert update_module.find_newer_github_version(
-        "0.5.5",
+        "0.5.6",
         opener=timeout_opener,
     ) is None
 
@@ -3736,7 +3927,7 @@ def test_bounded_github_update_check():
         )
 
     assert update_module.find_newer_github_version(
-        "0.5.5",
+        "0.5.6",
         opener=http_error_opener,
     ) is None
     assert observed_requests

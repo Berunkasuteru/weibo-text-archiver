@@ -37,6 +37,7 @@ from .parser import (
     parse_post,
     parse_profile,
 )
+from .performance import PerformanceMetrics
 
 
 API_CONTAINER = "https://m.weibo.cn/api/container/getIndex"
@@ -263,10 +264,12 @@ class WeiboClient:
     ):
         self.cancel_event = cancel_event
         self.progress = progress
+        self.performance = PerformanceMetrics()
         self.http = HttpClient(
             cookie_header=cookie_header,
             cancel_event=cancel_event,
             retry_notice=self._emit_retry_cooldown,
+            performance=self.performance,
         )
         self.posts_since_batch_rest = 0
         self.posts_since_session_rest = 0
@@ -293,13 +296,21 @@ class WeiboClient:
     def _emit(self, message: str, **data):
         self.progress(message, data or None)
 
-    def _wait_random(self, low: float, high: float):
-        self.http.wait(random.uniform(low, high))
+    def _wait_random(self, low: float, high: float, category: str = "other"):
+        interval = random.uniform(low, high)
+        remaining = self.performance.remaining_start_spacing(interval)
+        self.performance.record_planned_wait(category, remaining)
+        self.http.wait(remaining)
 
     def preheat(self):
         self._emit("正在建立微博会话…")
         # Preheating lets the mobile site issue any current fingerprint/session cookies.
-        self.http.request("https://m.weibo.cn/", timeout=12, retries=2)
+        self.http.request(
+            "https://m.weibo.cn/",
+            timeout=12,
+            retries=2,
+            performance_category="preheat",
+        )
 
     def fetch_profile(self, uid: str):
         self._emit("正在读取账号资料…")
@@ -308,6 +319,7 @@ class WeiboClient:
             params={"containerid": "100505" + uid},
             timeout=15,
             retries=4,
+            performance_category="profile_basic",
         )
 
         data = basic.get("data")
@@ -318,21 +330,24 @@ class WeiboClient:
             if "这里还没有内容" in msg:
                 raise InvalidUser("没有找到该账号，可能 UID 不正确或账号已注销。")
             if any(marker in msg for marker in ("验证", "验证码", "安全验证")):
+                self.performance.increment_error("challenge")
                 raise ChallengeRequired(
                     "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。"
                 )
             if "登录" in msg or "login" in combined or "passport" in combined:
+                self.performance.increment_error("auth_expired")
                 raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
             raise InvalidResponse("用户资料响应缺少 userInfo。")
 
         detail = None
         try:
-            self._wait_random(0.4, 1.0)
+            self._wait_random(0.4, 1.0, "profile_pacing")
             detail = self.http.json(
                 API_CONTAINER,
                 params={"containerid": f"230283{uid}_-_INFO"},
                 timeout=15,
                 retries=2,
+                performance_category="profile_detail",
             )
         except (AuthenticationExpired, ChallengeRequired):
             raise
@@ -346,6 +361,7 @@ class WeiboClient:
         if post_id not in self._long_text_attempted_ids:
             self._long_text_attempted_ids.add(post_id)
             self.unique_long_text_attempted += 1
+            self.performance.increment_longtext("unique_attempted")
 
     def _enforce_long_text_safety_fuse(
         self,
@@ -384,6 +400,7 @@ class WeiboClient:
             return
         self._content_unavailable_ids.add(post_id)
         self.unique_content_unavailable += 1
+        self.performance.increment_longtext("content_unavailable")
         self.consecutive_unique_unavailable += 1
 
         self._enforce_long_text_safety_fuse(attempts)
@@ -408,7 +425,7 @@ class WeiboClient:
         self._begin_long_text_acquisition(post_id)
 
         self._emit(f"正在读取长微博全文 {post_id}…")
-        self._wait_random(*LONGTEXT_DELAY)
+        self._wait_random(*LONGTEXT_DELAY, "longtext_pacing")
         attempts: list[LongTextAttemptDiagnostic] = []
 
         # Fast path: statuses/extend is a small JSON response.
@@ -419,6 +436,7 @@ class WeiboClient:
                 headers={"Referer": f"https://m.weibo.cn/detail/{post_id}"},
                 timeout=15,
                 retries=3,
+                performance_category="longtext_extend",
             )
             response_meta = response.safe_diagnostic("response")
             data = js.get("data")
@@ -453,6 +471,7 @@ class WeiboClient:
                     self.long_text_diagnostics[post_id] = tuple(attempts)
                     self.long_text_cache[post_id] = content
                     self._record_long_text_success(tuple(attempts))
+                    self.performance.increment_longtext("extend_success")
                     return content
             outcome = (
                 "json_ok_0"
@@ -486,13 +505,15 @@ class WeiboClient:
 
         # Compatibility fallback: current weibo-crawler reads the embedded status
         # object from the mobile detail page. We do the same, but keep TLS verification on.
-        self._wait_random(0.5, 1.2)
+        self._wait_random(0.5, 1.2, "longtext_pacing")
+        self.performance.increment_longtext("detail_attempted")
         try:
             html, response = self.http.text_response(
                 DETAIL_URL.format(id=post_id),
                 headers={"Referer": "https://m.weibo.cn/"},
                 timeout=18,
                 retries=3,
+                performance_category="longtext_detail",
             )
             response_meta = response.safe_diagnostic("response")
             status = _embedded_status_from_detail(html)
@@ -519,6 +540,7 @@ class WeiboClient:
                     self.long_text_diagnostics[post_id] = tuple(attempts)
                     self.long_text_cache[post_id] = content
                     self._record_long_text_success(tuple(attempts))
+                    self.performance.increment_longtext("detail_success")
                     return content
                 attempts.append(
                     LongTextAttemptDiagnostic(
@@ -543,11 +565,13 @@ class WeiboClient:
                     html, response.content_type
                 )
                 if classification == "login_html":
+                    self.performance.increment_error("auth_expired")
                     raise AuthenticationExpired(
                         "微博登录已过期，需要重新扫码。",
                         diagnostic=response.safe_diagnostic(classification),
                     )
                 if classification == "challenge_html":
+                    self.performance.increment_error("challenge")
                     raise ChallengeRequired(
                         "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。",
                         diagnostic=response.safe_diagnostic(classification),
@@ -652,7 +676,7 @@ class WeiboClient:
             )
 
     def _timeline_page(self, uid: str, page: int) -> tuple[list[dict], bool]:
-        self._wait_random(*PAGE_DELAY)
+        self._wait_random(*PAGE_DELAY, "page_pacing")
         js = self.http.json(
             API_CONTAINER,
             params={
@@ -662,6 +686,7 @@ class WeiboClient:
             },
             timeout=15,
             retries=4,
+            performance_category="timeline",
         )
 
         if "data" not in js:
@@ -676,10 +701,12 @@ class WeiboClient:
             combined = f"{msg}\n{url}".lower()
             challenge_markers = ("验证", "验证码", "安全验证")
             if any(marker in msg for marker in challenge_markers):
+                self.performance.increment_error("challenge")
                 raise RateLimited(
                     "微博要求额外验证或限制了访问。请稍后再试；本次不会生成伪完整备份。"
                 )
             if "登录" in msg or "login" in combined or "passport" in combined:
+                self.performance.increment_error("auth_expired")
                 raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
             limit_markers = ("访问频次", "频繁", "异常", "限制")
             if any(marker in msg for marker in limit_markers):
@@ -716,6 +743,7 @@ class WeiboClient:
             token in card_text
             for token in ("验证码", "访问频次", "异常", "验证", "登录")
         ):
+            self.performance.increment_error("challenge")
             raise RateLimited(
                 "微博返回了验证/限制页面，本次抓取不能证明完整性。请稍后再试。"
             )
@@ -728,6 +756,7 @@ class WeiboClient:
     def _rest_if_needed(self):
         if self.posts_since_batch_rest >= BATCH_POSTS:
             self._emit(f"已抓取一批微博，安全休息 {int(BATCH_DELAY)} 秒…")
+            self.performance.record_planned_wait("batch_rest", BATCH_DELAY)
             self.http.wait(BATCH_DELAY)
             self.posts_since_batch_rest = 0
 
@@ -735,10 +764,24 @@ class WeiboClient:
             self._emit(
                 f"已连续抓取 {SESSION_POSTS} 条，为降低风控概率休息 {int(SESSION_REST)} 秒…"
             )
+            self.performance.record_planned_wait("session_rest", SESSION_REST)
             self.http.wait(SESSION_REST)
             self.posts_since_session_rest = 0
 
     def fetch(self, uid: str, fetch_range: FetchRange) -> Archive:
+        performance = getattr(self, "performance", None)
+        if performance is None:
+            return self._fetch_impl(uid, fetch_range)
+        performance.begin()
+        try:
+            archive = self._fetch_impl(uid, fetch_range)
+        except BaseException:
+            performance.finish(successful=False)
+            raise
+        performance.finish(successful=True)
+        return archive
+
+    def _fetch_impl(self, uid: str, fetch_range: FetchRange) -> Archive:
         self.preheat()
         profile = self.fetch_profile(uid)
 

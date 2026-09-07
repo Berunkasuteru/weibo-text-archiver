@@ -24,7 +24,6 @@ BUNDLE_DIR = DIST_DIR / BUNDLE_NAME
 EXE_PATH = BUNDLE_DIR / "WeiboTextArchiver.exe"
 ZIP_NAME = "WeiboTextArchiver_Windows.zip"
 ZIP_PATH = RELEASE_DIR / ZIP_NAME
-FIRST_USE_NAME = "【先解压整个文件夹】使用说明.txt"
 
 
 def _safe_remove(path: Path) -> None:
@@ -43,7 +42,6 @@ def clean() -> None:
 
 def _copy_release_docs() -> None:
     shutil.copy2(ROOT / "README.md", BUNDLE_DIR / "README.md")
-    shutil.copy2(ROOT / FIRST_USE_NAME, BUNDLE_DIR / FIRST_USE_NAME)
     shutil.copy2(
         ROOT / "THIRD_PARTY_NOTICES.txt",
         BUNDLE_DIR / "THIRD_PARTY_NOTICES.txt",
@@ -137,7 +135,6 @@ def _verify_zip() -> None:
     required = {
         f"{BUNDLE_NAME}/WeiboTextArchiver.exe",
         f"{BUNDLE_NAME}/README.md",
-        f"{BUNDLE_NAME}/{FIRST_USE_NAME}",
         f"{BUNDLE_NAME}/THIRD_PARTY_NOTICES.txt",
     }
     missing = required - names

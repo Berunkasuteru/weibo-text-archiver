@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from .performance import PerformanceMetrics
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -122,10 +124,12 @@ class HttpClient:
         cookie_header: str = "",
         cancel_event: threading.Event | None = None,
         retry_notice: RetryNotice | None = None,
+        performance: PerformanceMetrics | None = None,
     ):
         self.cookie_header = cookie_header.strip()
         self.cancel_event = cancel_event or threading.Event()
         self.retry_notice = retry_notice
+        self.performance = performance or PerformanceMetrics()
         self.jar = http.cookiejar.CookieJar()
         context = ssl.create_default_context()
         self.opener = urllib.request.build_opener(
@@ -170,6 +174,7 @@ class HttpClient:
         headers: dict | None = None,
         timeout: float = 15,
         retries: int = 3,
+        performance_category: str = "other",
     ) -> ResponseData:
         if params:
             query = urllib.parse.urlencode(params)
@@ -198,9 +203,15 @@ class HttpClient:
             retry_delay = None
             retry_notice_status = None
             stop_retrying = False
+            self.performance.note_request_start()
+            request_started = self.performance.clock()
             try:
                 with self.opener.open(req, timeout=timeout) as resp:
                     body = resp.read()
+                    self.performance.record_request(
+                        performance_category,
+                        self.performance.clock() - request_started,
+                    )
                     return ResponseData(
                         body=body,
                         url=resp.geturl(),
@@ -210,6 +221,10 @@ class HttpClient:
                         ),
                     )
             except urllib.error.HTTPError as exc:
+                self.performance.record_request(
+                    performance_category,
+                    self.performance.clock() - request_started,
+                )
                 host, path = _safe_endpoint(exc.geturl() or url)
                 diagnostic = SafeRequestDiagnostic(
                     classification=f"http_{exc.code}",
@@ -221,6 +236,7 @@ class HttpClient:
                     ),
                 )
                 if exc.code in (403, 414, 429, 432):
+                    self.performance.increment_error(f"http_{exc.code}")
                     last_error = RateLimited(
                         f"微博限制了当前请求（HTTP {exc.code}）。请稍后再试。",
                         diagnostic=diagnostic,
@@ -243,6 +259,10 @@ class HttpClient:
                         restriction_retry_used or attempt + 1 >= max_attempts
                     )
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                self.performance.record_request(
+                    performance_category,
+                    self.performance.clock() - request_started,
+                )
                 host, path = _safe_endpoint(url)
                 reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
                 classification = "timeout" if isinstance(reason, TimeoutError) else "network_error"
@@ -266,6 +286,13 @@ class HttpClient:
                 retry_delay = _TRANSIENT_BACKOFF[
                     min(attempt, len(_TRANSIENT_BACKOFF) - 1)
                 ]
+                self.performance.increment_error("ordinary_retry")
+                self.performance.record_retry_wait("ordinary_backoff", retry_delay)
+            elif retry_notice_status is not None:
+                self.performance.record_retry_wait(
+                    f"http_{retry_notice_status}_cooldown",
+                    retry_delay,
+                )
             if retry_notice_status is not None and self.retry_notice is not None:
                 self.retry_notice(retry_notice_status, retry_delay)
             self.wait(retry_delay)
@@ -289,11 +316,13 @@ class HttpClient:
 
         if parse_diagnostic is not None:
             if parse_diagnostic.classification == "login_html":
+                self.performance.increment_error("auth_expired")
                 raise AuthenticationExpired(
                     "微博登录已过期，需要重新扫码。",
                     diagnostic=parse_diagnostic,
                 )
             if parse_diagnostic.classification == "challenge_html":
+                self.performance.increment_error("challenge")
                 raise ChallengeRequired(
                     "微博要求安全验证；本次导出已停止。请稍后在微博完成验证后重试。",
                     diagnostic=parse_diagnostic,

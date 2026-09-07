@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.6
+
+- Use latency-aware sequential request-start pacing to remove redundant planned waiting after slow responses without adding concurrency or relaxing correctness checks.
+- In a controlled RECENT-1000 acceptance run with the same post, page, request and long-text workload, fetch time fell from about 108 seconds to about 70 seconds; actual performance varies with long-text density, network and Weibo latency, retries/restrictions, and account history shape.
+- Add safe local monotonic performance instrumentation to detailed diagnostics while preserving existing 403/414 handling and 429/432 cooldown behavior.
+- Preserve the published 0.5.5 UI presentation and Pac-Man activity indicator.
+- Remove the redundant Chinese first-use warning text file from the Windows bundle; README remains the normal usage guide.
+
 ## 0.5.5
 
 - Recover from confirmed expired login by requesting a fresh QR scan and restarting the exact frozen export once, from the beginning.

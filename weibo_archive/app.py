@@ -245,12 +245,13 @@ class ActivityIndicator(tk.Canvas):
         try:
             if not self.winfo_exists():
                 return
+            self._running = True
+            self._frame = 0
+            self._draw_frame()
+            self._schedule()
         except tk.TclError:
-            return
-        self._running = True
-        self._frame = 0
-        self._draw_frame()
-        self._schedule()
+            self._running = False
+            self._after_id = None
 
     def stop(self) -> None:
         self._running = False
@@ -523,7 +524,8 @@ class App(tk.Tk):
             textvariable=self.recent_count_var,
         )
         self.recent_entry.pack(side="left", padx=(8, 6))
-        ttk.Label(recent_row, text="条").pack(side="left")
+        self.recent_suffix_label = ttk.Label(recent_row, text="条")
+        self.recent_suffix_label.pack(side="left")
 
         since_row = ttk.Frame(range_card)
         since_row.pack(fill="x", pady=2)
@@ -540,7 +542,8 @@ class App(tk.Tk):
             textvariable=self.since_date_var,
         )
         self.since_entry.pack(side="left", padx=(8, 6))
-        ttk.Label(since_row, text="起（YYYY-MM-DD）").pack(side="left")
+        self.since_suffix_label = ttk.Label(since_row, text="起（YYYY-MM-DD）")
+        self.since_suffix_label.pack(side="left")
 
         ttk.Label(
             range_card,
@@ -1725,6 +1728,10 @@ class App(tk.Tk):
 
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
+
+            performance = getattr(client, "performance", None)
+            if performance is not None:
+                self._worker_log(generation, "\n" + performance.render())
 
             self._emit(generation, "phase_export", None)
             save_normalized_archive(archive)
