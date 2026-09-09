@@ -10,7 +10,7 @@ from .models import Archive
 from .paths import CACHE_DIR
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _json_default(value):

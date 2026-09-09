@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.7
+
+- Stop treating high-confidence nested Weibo platform deletion/unavailable tombstones as original author-written text.
+- Store recognized tombstones as explicit incomplete content with `text=None`, `text_preview=None`, and no fabricated author body or preview.
+- Keep `FORMAT=WEIBO_AI_1`; `PREVIEW_ONLY` remains limited to records with a genuine non-empty timeline preview.
+- Preserve normal authored posts with similar wording unless the full nested tombstone structure and exact controlled notice both match.
+- Advance normalized cache writes to schema version 4 for explicit `platform_tombstone` semantics.
+
 ## 0.5.6
 
 - Use latency-aware sequential request-start pacing to remove redundant planned waiting after slow responses without adding concurrency or relaxing correctness checks.

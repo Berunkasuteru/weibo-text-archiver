@@ -37,7 +37,7 @@ DPAPI protects against casual plaintext disclosure and access from other Windows
 
 ## Local archive privacy
 
-`v7_cache/<uid>/last_success.json` is a normalized local archive. Version 3 adds fetch-time visibility state and intentionally retained `type`/`list_id`/valid-string `list_idstr` provenance. Version 2 stores source timestamp provenance, known UTC offsets, and optional author UIDs but has no visibility fact, so it must not be interpreted as a visibility-aware archive. Version 1 cannot recover the source offset or author UID. The application currently writes this cache but does not restore archives from it. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
+`v7_cache/<uid>/last_success.json` is a normalized local archive. Version 4 adds explicit `platform_tombstone` unavailable-content semantics. Version 3 adds fetch-time visibility state and intentionally retained `type`/`list_id`/valid-string `list_idstr` provenance, but must not be assumed to understand the version 4 tombstone reason. Version 2 stores source timestamp provenance, known UTC offsets, and optional author UIDs but has no visibility fact, so it must not be interpreted as a visibility-aware archive. Version 1 cannot recover the source offset or author UID. The application currently writes this cache but does not restore archives from it. It does not contain cookies, request headers, media URLs, full queries, response bodies, or long-text attempt diagnostics.
 
 It does contain post text and any explicitly marked timeline preview, so it remains personal archive data and should be protected like the exported Markdown files. Unversioned legacy cache files must not be silently treated as a trusted archive source.
 
@@ -47,6 +47,6 @@ Visibility filtering operates only on records already returned to the current au
 
 The application does not require administrator privileges, install a service, modify the firewall, or write to system directories.
 
-## Telemetry
+## Telemetry and update check
 
-The application includes no telemetry, usage-statistics upload, or automatic update check.
+The application includes no telemetry or usage-statistics upload. Once per launch, it performs one lightweight unauthenticated request to the public GitHub latest-release endpoint to compare strict stable version numbers. The request does not include a Weibo UID, Cookie, saved credential, archive text, exported content, or export settings. Failure is silent and does not affect normal use. The application does not automatically download, install, or self-update.

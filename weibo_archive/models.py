@@ -27,6 +27,7 @@ class ContentState(str, Enum):
 
 class IncompleteReason(str, Enum):
     CONTENT_UNAVAILABLE = "content_unavailable"
+    PLATFORM_TOMBSTONE = "platform_tombstone"
 
 
 class TimestampProvenance(str, Enum):

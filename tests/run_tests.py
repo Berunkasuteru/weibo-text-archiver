@@ -253,8 +253,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.5.6"
-    assert VERSION_DISPLAY == "0.5.6"
+    assert __version__ == "0.5.7"
+    assert VERSION_DISPLAY == "0.5.7"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -309,7 +309,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.6"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.5.7"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -549,7 +549,7 @@ def test_portable_archives_path_and_initial_output_defaults():
 
     with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
         root = Path(td)
-        packaged_exe = root / "WeiboTextArchiver_0.5.6_Windows" / "WeiboTextArchiver.exe"
+        packaged_exe = root / "WeiboTextArchiver_0.5.7_Windows" / "WeiboTextArchiver.exe"
         assert application_dir(
             frozen=True,
             executable=packaged_exe,
@@ -697,7 +697,7 @@ def test_final_polish_activity_status_and_localized_ui():
         app.withdraw()
         app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.5.6"
+        assert VERSION_DISPLAY == "0.5.7"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -1071,6 +1071,174 @@ def test_alpha4_parser_explicit_reasons_and_raw_immutability():
             assert post.retweet.text_preview == "转发预览……全文"
 
     assert raw == before
+
+
+def test_nested_platform_tombstone_semantics():
+    import threading
+
+    from weibo_archive import markdown_v5
+
+    notices = (
+        "抱歉，根据作者设置的微博可见时间范围，此微博已不可见。",
+        "抱歉，此微博已被作者删除。查看帮助： 网页链接",
+        "该账号因违反相关法律法规和政策，现已无法查看。查看帮助 网页链接",
+    )
+
+    def nested_raw(notice, *, post_id="rt-tombstone", user=None, **fields):
+        raw = {
+            "id": post_id,
+            "bid": "fixture-tombstone",
+            "created_at": "Wed Aug 12 18:30:00 +0800 2026",
+            "text": notice,
+        }
+        if user is not None:
+            raw["user"] = user
+        raw.update(fields)
+        return raw
+
+    def parent_raw(parent_id, retweet):
+        return {
+            "id": parent_id,
+            "bid": "parent-" + parent_id,
+            "created_at": "Thu Aug 13 00:10:00 +0800 2026",
+            "text": "普通转发评论",
+            "user": {"id": "1234567890", "screen_name": "测试用户"},
+            "retweeted_status": retweet,
+        }
+
+    for index, notice in enumerate(notices):
+        parsed = parse_post(parent_raw(str(index + 1), nested_raw(notice))).retweet
+        assert parsed is not None
+        assert parsed.content_state is ContentState.INCOMPLETE
+        assert parsed.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+        assert parsed.text is None
+        assert parsed.text_preview is None
+
+    overlapping_reason = parse_post(
+        parent_raw("overlap-parent", nested_raw(notices[0])),
+        retweet_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+    ).retweet
+    assert overlapping_reason.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+    assert overlapping_reason.text_preview is None
+
+    notice = notices[0]
+    authored = parse_post(
+        parent_raw(
+            "authored-parent",
+            nested_raw(
+                notice,
+                post_id="authored-retweet",
+                user={"id": "987654321", "screen_name": "普通作者"},
+                source="微博客户端",
+                reposts_count=0,
+                comments_count=0,
+                attitudes_count=0,
+            ),
+        )
+    ).retweet
+    assert authored is not None
+    assert authored.content_state is ContentState.COMPLETE
+    assert authored.text == notice
+
+    source_present = parse_post(
+        parent_raw(
+            "source-parent",
+            nested_raw(notice, post_id="source-retweet", source="微博客户端"),
+        )
+    ).retweet
+    assert source_present is not None
+    assert source_present.content_state is ContentState.COMPLETE
+    assert source_present.text == notice
+
+    top_level = parse_post(nested_raw(notice, post_id="top-level-same-text"))
+    assert top_level.content_state is ContentState.COMPLETE
+    assert top_level.text == notice
+
+    unproven_variant = parse_post(
+        parent_raw(
+            "unproven-parent",
+            nested_raw("抱歉，暂时没有查看权限。", post_id="unproven-retweet"),
+        )
+    ).retweet
+    assert unproven_variant is not None
+    assert unproven_variant.content_state is ContentState.COMPLETE
+
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    client._fetch_full_text_html = lambda _raw: (_ for _ in ()).throw(
+        AssertionError("a platform tombstone triggered long-text acquisition")
+    )
+    tombstone_parent = parent_raw("no-network-parent", nested_raw(notice))
+    hydration = client._hydrate_long_texts(tombstone_parent)
+    parsed_parent = parse_post(
+        hydration.raw,
+        incomplete_reason=hydration.top_incomplete_reason,
+        retweet_incomplete_reason=hydration.retweet_incomplete_reason,
+    )
+    assert parsed_parent.retweet.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+    assert client.unique_long_text_attempted == 0
+
+    first = parse_post(parent_raw("dedupe-1", nested_raw(notice)))
+    second = parse_post(parent_raw("dedupe-2", nested_raw(notice)))
+    archive = replace(build_archive(), posts=(first, second))
+    assert archive.integrity == ArchiveIntegrity(2, 0, 2, 0, 2)
+    legacy = archive_to_legacy_data(archive)
+    legacy_rt = legacy["weibo"][0]["retweet"]
+    assert legacy_rt["incomplete_reason"] == "platform_tombstone"
+    assert legacy_rt["text"] is None
+    assert legacy_rt["text_preview"] is None
+
+    from weibo_archive import storage
+
+    with tempfile.TemporaryDirectory(prefix="weibo_tombstone_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert cached["schema_version"] == 4
+    cached_rt = cached["posts"][0]["retweet"]
+    assert cached_rt["incomplete_reason"] == "platform_tombstone"
+    assert cached_rt["text"] is None
+    assert cached_rt["text_preview"] is None
+
+    full, _, _ = markdown_v5.build_markdown(legacy, archive.profile.id)
+    ai, _, _ = markdown_v5.build_ai_markdown(legacy, archive.profile.id)
+    for rendered in (full, ai):
+        assert notice not in rendered
+    assert "当前没有可保存的列表预览。" in full
+    assert "UNAVAILABLE" not in ai
+    assert ">[PREVIEW_ONLY｜全文无法验证]" not in ai
+    assert sum(
+        line.startswith(">[RT1｜") and "CONTENT=INCOMPLETE" in line
+        for line in ai.splitlines()
+    ) == 1
+    assert sum(line.startswith(">[=RT1｜") for line in ai.splitlines()) == 1
+
+    long_text = parse_post(
+        {
+            "id": "longtext-incomplete",
+            "created_at": "Thu Aug 13 00:10:00 +0800 2026",
+            "text": "真实列表预览……全文",
+            "user": {"id": "1234567890", "screen_name": "测试用户"},
+        },
+        incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+    )
+    assert long_text.text is None
+    assert long_text.text_preview == "真实列表预览……全文"
+    long_archive = replace(build_archive(), posts=(long_text,))
+    long_ai, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(long_archive),
+        long_archive.profile.id,
+    )
+    assert "[PREVIEW_ONLY｜全文无法验证]" in long_ai
+    assert "真实列表预览……全文" in long_ai
+    assert "[UNAVAILABLE｜" not in long_ai
 
 
 def test_longtext_detail_decoder():
@@ -2166,9 +2334,9 @@ def test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview():
         AI_COMPACT_OPTIONS,
     )
     assert text.count("CONTENT=INCOMPLETE") == 2
-    assert text.count("PREVIEW_ONLY") == 2  # one rule plus one record marker
-    assert text.count(">[PREVIEW_ONLY｜全文无法验证]") == 1
-    assert "当前没有可保存的列表预览" in text
+    assert text.count("PREVIEW_ONLY") == 1  # schema rule only; no preview exists
+    assert ">[PREVIEW_ONLY｜全文无法验证]" not in text
+    assert "UNAVAILABLE" not in text
     assert any(line.startswith(">[=RT1｜") for line in text.splitlines())
     assert stats["unique_retweets"] == 1
     assert stats["duplicate_retweets"] == 1
@@ -2869,7 +3037,7 @@ def test_invalid_author_uid_contract():
         finally:
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["posts"][0]["author_id"] is None
     assert payload["posts"][0]["retweet"]["author_id"] is None
 
@@ -3046,8 +3214,8 @@ def test_visibility_scope_filter_and_schema3_contract():
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
 
-    assert storage.SCHEMA_VERSION == 3
-    assert payload["schema_version"] == 3
+    assert storage.SCHEMA_VERSION == 4
+    assert payload["schema_version"] == 4
     assert payload["posts"][0]["visibility"] == {
         "state": "public",
         "raw_type": 0,
@@ -3616,7 +3784,7 @@ def test_export_does_not_mutate_normalized_archive():
             storage.CACHE_DIR = old_cache_dir
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["integrity"] == {
         "total_posts": 3,
         "complete_records": 3,
@@ -3653,7 +3821,7 @@ def test_alpha4_normalized_cache_contains_only_stable_semantics():
         raw = cache_path.read_text(encoding="utf-8")
         payload = json.loads(raw)
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["integrity"]["incomplete_records"] == 2
     assert payload["posts"][0]["retweet"]["content_state"] == "incomplete"
     assert payload["posts"][0]["retweet"]["text"] is None
@@ -3886,24 +4054,24 @@ def test_bounded_github_update_check():
         return open_fixture
 
     assert update_module.find_newer_github_version(
-        "0.5.6",
-        opener=opener_for(b'{"tag_name":"v0.5.7"}'),
-    ) == "0.5.7"
-    for tag in ("v0.5.6", "0.5.5", "v0.5.7-rc.1", "latest", "v1.2"):
+        "0.5.7",
+        opener=opener_for(b'{"tag_name":"v0.5.8"}'),
+    ) == "0.5.8"
+    for tag in ("v0.5.7", "0.5.6", "v0.5.8-rc.1", "latest", "v1.2"):
         assert update_module.find_newer_github_version(
-            "0.5.6",
+            "0.5.7",
             opener=opener_for(json.dumps({"tag_name": tag}).encode("utf-8")),
         ) is None
     assert update_module.find_newer_github_version(
-        "0.5.6",
+        "0.5.7",
         opener=opener_for(b"not json"),
     ) is None
     assert update_module.find_newer_github_version(
-        "0.5.6",
+        "0.5.7",
         opener=opener_for(b'{"wrong_field":"v9.9.9"}'),
     ) is None
     assert update_module.find_newer_github_version(
-        "0.5.6",
+        "0.5.7",
         opener=opener_for(b'{"tag_name":"v9.9.9"}', status=503),
     ) is None
 
@@ -3912,7 +4080,7 @@ def test_bounded_github_update_check():
         raise TimeoutError("offline fixture timeout")
 
     assert update_module.find_newer_github_version(
-        "0.5.6",
+        "0.5.7",
         opener=timeout_opener,
     ) is None
 
@@ -3927,7 +4095,7 @@ def test_bounded_github_update_check():
         )
 
     assert update_module.find_newer_github_version(
-        "0.5.6",
+        "0.5.7",
         opener=http_error_opener,
     ) is None
     assert observed_requests
@@ -5053,6 +5221,7 @@ def main():
         ("frozen model boundary", test_model_boundary),
         ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),
         ("Alpha4 parser explicit incomplete reasons", test_alpha4_parser_explicit_reasons_and_raw_immutability),
+        ("nested platform tombstone semantics", test_nested_platform_tombstone_semantics),
         ("long-text detail decoder", test_longtext_detail_decoder),
         ("non-JSON diagnostics contain no body/query", test_network_non_json_diagnostic_has_no_body_or_query),
         ("0.5.3 adaptive network backoff", test_performance_constants_and_adaptive_network_backoff),
@@ -5079,7 +5248,7 @@ def main():
         ("0.5 lossless RT references and empty top-level W", test_ai_retweet_reference_is_lossless_per_occurrence),
         ("0.5 invalid author UID contract", test_invalid_author_uid_contract),
         ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
-        ("0.5.2 visibility scope/filter and Schema 3", test_visibility_scope_filter_and_schema3_contract),
+        ("visibility scope/filter and current cache schema", test_visibility_scope_filter_and_schema3_contract),
         ("0.5.2 Full and AI visibility rendering", test_visibility_full_and_ai_rendering_contract),
         ("0.5 custom filter contract", test_custom_filter_contract),
         ("0.5 multi-output fetch-once contract", test_multi_output_fetch_once_and_isolation),

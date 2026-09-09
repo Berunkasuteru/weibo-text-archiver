@@ -667,9 +667,10 @@ def build_ai_markdown(
         out.append("[" + "｜".join(meta) + "]")
 
         if item_incomplete:
-            out.append("[PREVIEW_ONLY｜全文无法验证]")
             preview = incomplete_preview(item)
-            out.append(preview if preview else "当前没有可保存的列表预览。")
+            if preview:
+                out.append("[PREVIEW_ONLY｜全文无法验证]")
+                out.append(preview)
         else:
             body = normalize_text(item.get("text"))
             if body:
@@ -697,13 +698,10 @@ def build_ai_markdown(
             out.append(">" + "[" + "｜".join(rt_label_parts) + "]")
             if not reference:
                 if rt_incomplete:
-                    out.append(">[PREVIEW_ONLY｜全文无法验证]")
                     preview = incomplete_preview(rt)
-                    out.append(
-                        quote_markdown(preview)
-                        if preview
-                        else "> 当前没有可保存的列表预览。"
-                    )
+                    if preview:
+                        out.append(">[PREVIEW_ONLY｜全文无法验证]")
+                        out.append(quote_markdown(preview))
                 elif rt_text:
                     out.append(quote_markdown(rt_text))
 

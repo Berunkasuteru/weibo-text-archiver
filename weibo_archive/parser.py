@@ -26,6 +26,44 @@ _TOP_LEVEL_VISIBILITY_TYPES = {
     1: VisibilityState.PRIVATE,
 }
 
+_PLATFORM_TOMBSTONE_NOTICES = frozenset(
+    {
+        "抱歉，根据作者设置的微博可见时间范围，此微博已不可见。",
+        "抱歉，此微博已被作者删除。查看帮助： 网页链接",
+        "该账号因违反相关法律法规和政策，现已无法查看。查看帮助 网页链接",
+    }
+)
+
+
+def _normalized_notice(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _is_nested_platform_tombstone(
+    *,
+    nested_context: bool,
+    post_id: str,
+    visible_text: str,
+    author: str,
+    author_id: Optional[str],
+    source: str,
+    engagement: Engagement,
+    created_at: Optional[datetime],
+) -> bool:
+    """Recognize only cache-proven nested platform notices with tombstone structure."""
+    return bool(
+        nested_context
+        and post_id.strip()
+        and _normalized_notice(visible_text) in _PLATFORM_TOMBSTONE_NOTICES
+        and not author.strip()
+        and author_id is None
+        and not source.strip()
+        and engagement.reposts is None
+        and engagement.comments is None
+        and engagement.likes is None
+        and created_at is not None
+    )
+
 
 def _parse_visibility(value: Any, *, interpret: bool) -> VisibilityInfo:
     if not isinstance(value, dict):
@@ -199,6 +237,7 @@ def parse_post(
     incomplete_reason: IncompleteReason | None = None,
     retweet_incomplete_reason: IncompleteReason | None = None,
     interpret_visibility: bool = True,
+    _nested_context: bool = False,
 ) -> Post:
     if not isinstance(raw, dict):
         raise ValueError("post payload is not an object")
@@ -211,6 +250,30 @@ def parse_post(
     author = str(user.get("screen_name") or "") if isinstance(user, dict) else ""
     raw_author_id = user.get("id") if isinstance(user, dict) else None
     author_id = normalize_optional_uid(raw_author_id)
+    post_id = str(raw.get("id") or raw.get("mid") or "")
+    source = strip_html(raw.get("source") or "")
+    engagement = Engagement(
+        reposts=parse_count(raw.get("reposts_count")),
+        comments=parse_count(raw.get("comments_count")),
+        likes=parse_count(raw.get("attitudes_count")),
+    )
+    created_at, created_at_provenance = parse_created_at_fact(raw.get("created_at"))
+
+    platform_tombstone = _is_nested_platform_tombstone(
+        nested_context=_nested_context,
+        post_id=post_id,
+        visible_text=visible_text,
+        author=author,
+        author_id=author_id,
+        source=source,
+        engagement=engagement,
+        created_at=created_at,
+    )
+    effective_incomplete_reason = (
+        IncompleteReason.PLATFORM_TOMBSTONE
+        if platform_tombstone
+        else incomplete_reason
+    )
 
     location = str(
         raw.get("region_name")
@@ -229,37 +292,37 @@ def parse_post(
             allow_retweet=False,
             incomplete_reason=retweet_incomplete_reason,
             interpret_visibility=False,
+            _nested_context=True,
         )
 
     edit_count = parse_count(raw.get("edit_count")) or 0
-    created_at, created_at_provenance = parse_created_at_fact(raw.get("created_at"))
 
     return Post(
-        id=str(raw.get("id") or raw.get("mid") or ""),
+        id=post_id,
         bid=str(raw.get("bid") or ""),
         created_at=created_at,
         created_at_provenance=created_at_provenance,
-        text=None if incomplete_reason is not None else visible_text,
-        source=strip_html(raw.get("source") or ""),
+        text=None if effective_incomplete_reason is not None else visible_text,
+        source=source,
         location=location,
         author=author,
         author_id=author_id,
-        engagement=Engagement(
-            reposts=parse_count(raw.get("reposts_count")),
-            comments=parse_count(raw.get("comments_count")),
-            likes=parse_count(raw.get("attitudes_count")),
-        ),
+        engagement=engagement,
         media=_media_info(raw, article_from_text),
         retweet=retweet,
         edited=edit_count > 0,
         edit_count=edit_count,
         content_state=(
             ContentState.INCOMPLETE
-            if incomplete_reason is not None
+            if effective_incomplete_reason is not None
             else ContentState.COMPLETE
         ),
-        text_preview=visible_text if incomplete_reason is not None else None,
-        incomplete_reason=incomplete_reason,
+        text_preview=(
+            visible_text
+            if effective_incomplete_reason is IncompleteReason.CONTENT_UNAVAILABLE
+            else None
+        ),
+        incomplete_reason=effective_incomplete_reason,
         visibility=_parse_visibility(
             raw.get("visible"),
             interpret=interpret_visibility,

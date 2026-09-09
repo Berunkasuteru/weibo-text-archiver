@@ -1,6 +1,6 @@
 # DECISIONS
 
-Last updated: 2026-08-13
+Last updated: 2026-09-09
 
 This document records durable product and engineering decisions for Weibo Text Archiver.
 Do not reverse these decisions casually. If a decision changes, update this file with the reason.
@@ -97,7 +97,7 @@ Pinned records may still be included according to the product’s final selectio
 Supported V7 range concepts:
 
 - Full snapshot — default
-- Visible diagnostic `试抓50条`
+- Visible diagnostic / Test Export: 20 posts
 - Recent N
 - Since a date
 
@@ -276,15 +276,25 @@ Before taking over work, any coding agent should reread these repository sources
 
 ## D024 — Incomplete content is a narrow, explicit product state
 
-Alpha4 permits a long-text Post node to become `INCOMPLETE` only when both
-approved acquisition paths independently classify as `no_view_permission_html`.
+Two evidence-bounded paths may produce an `INCOMPLETE` Post node:
+
+1. A long-text node whose two approved acquisition paths independently classify
+   as `no_view_permission_html`; its timeline preview remains explicitly unverified.
+2. A nested retweet whose exact normalized text and missing-author/metadata shape
+   match a locally observed Weibo platform tombstone; the platform notice is not
+   retained as author text or as an author preview.
+
 Challenge and login markers take precedence over permission markers. Mixed,
 unknown, network, authentication, schema, and ID-mismatch failures remain fatal.
+Platform/system status text is evidence about content availability, not
+author-authored content. Exact notice text alone is insufficient: a record with
+normal author identity or ordinary metadata remains `COMPLETE`.
 
 Top-level posts and retweeted originals have independent frozen content state.
 `text=""` means a verified empty body; `text=None` means the body is unavailable.
-A timeline preview is stored separately and must never be heuristically promoted
-to complete content.
+A legitimate timeline preview is stored separately and must never be heuristically
+promoted to complete content. Platform tombstones have `text=None`,
+`text_preview=None`, and the explicit `platform_tombstone` reason.
 
 Acquisition diagnostics remain in client/network layers and never enter the
 Post model, Markdown, or normalized cache. Repeated confirmed-unavailable IDs use
@@ -292,6 +302,9 @@ a fetch-lifetime negative cache. A conservative global fail-closed fuse stops a
 run after three consecutive unique unavailable IDs, or when more than 20% of at
 least five unique long-text acquisitions are unavailable.
 
-Normalized cache schema version 1 records stable content and integrity semantics.
-Legacy cache without a schema version must not later be silently interpreted as
-a trusted mother archive.
+Normalized cache schema 4 adds the explicit `platform_tombstone` unavailable
+reason. Schema 3 may contain `content_state` / `incomplete_reason`, but it cannot
+be assumed to understand this reason. Schema 3 and older cache files remain
+historical local snapshots; current production does not read, migrate, restore,
+or delete them. Legacy cache without a schema version must not later be silently
+interpreted as a trusted mother archive.
