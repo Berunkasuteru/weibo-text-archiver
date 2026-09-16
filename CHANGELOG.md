@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+- Add a separate “图片备份…” tool for local backup of images explicitly returned by the current Weibo timeline response and successfully downloadable, independent of text export.
+- Support ordinary still images, GIF and the still component of Live Photo, preserving separate top-level and nested-retweet ownership. Video, card covers, avatars and article media are excluded.
+- Verify image signatures, size and SHA256; use atomic file/manifest writes and verify valid existing files before skipping them on rerun.
+- Report enumeration gaps when Weibo declares more media than the returned slots contain; do not imply complete historical media coverage or original-upload quality.
+- Keep image results independent of text archive success/integrity, with unchanged text cache schema 4 and `FORMAT=WEIBO_AI_1`.
+- Keep image CDN requests sequential and credential-free, using verified HTTPS and a fixed Weibo Referer.
+- Include the project's LICENSE in the Windows bundle and require it in ZIP verification.
+
 ## 0.5.7
 
 - Stop treating high-confidence nested Weibo platform deletion/unavailable tombstones as original author-written text.

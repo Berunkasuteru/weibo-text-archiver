@@ -1,6 +1,6 @@
 # DECISIONS
 
-Last updated: 2026-09-09
+Last updated: 2026-09-17
 
 This document records durable product and engineering decisions for Weibo Text Archiver.
 Do not reverse these decisions casually. If a decision changes, update this file with the reason.
@@ -308,3 +308,11 @@ be assumed to understand this reason. Schema 3 and older cache files remain
 historical local snapshots; current production does not read, migrate, restore,
 or delete them. Legacy cache without a schema version must not later be silently
 interpreted as a trusted mother archive.
+
+## D025 — Image backup is independent and explicitly bounded
+
+The optional image tool has its own models, parser, traversal, local files, schema-1 manifest, window and result state. It must not add media URLs or download status to Post/Archive, change text integrity, or couple image success to Markdown export.
+
+The product promise is “保存本次微博接口明确返回且可下载的图片。” Preserve and report declared media count, returned slot count and enumeration gaps; never hide gaps or promise all historical images or original-upload quality. v1 saves supported ordinary images, GIF and Live Photo still components, not videos, covers, avatars or article media.
+
+Use a separate verified-HTTPS CDN client with no Weibo Cookie or credentials, a fixed normal Weibo Referer and narrow image-host validation. Retain sequential request-start pacing; no concurrency or retry escalation. Atomic image/manifest writes and full local-file verification on rerun are preservation requirements. Text and image network tasks are mutually exclusive within the app.

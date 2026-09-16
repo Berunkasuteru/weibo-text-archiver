@@ -58,6 +58,7 @@ from .security import redact_text, save_detailed_error
 from .storage import save_normalized_archive
 from .tasking import TaskManager, TaskState
 from .update_check import find_newer_github_version, launch_official_release_page
+from .image_ui import image_task_active, open_image_window
 
 
 APP_TITLE = "Weibo Text Archiver"
@@ -667,6 +668,11 @@ class App(tk.Tk):
             command=lambda: self.start_export(trial=False),
         )
         self.export_btn.pack(side="right")
+        self.image_backup_btn = ttk.Button(
+            actions, text="图片备份…", style="Quiet.TButton",
+            command=lambda: open_image_window(self),
+        )
+        self.image_backup_btn.pack(side="right", padx=(0, 8))
 
         # Status
         status_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
@@ -1483,6 +1489,9 @@ class App(tk.Tk):
             pass
 
     def start_login(self, *, recovery: bool = False):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再开始其他微博任务。")
+            return
         if not recovery:
             self._pending_export_request = None
         try:
@@ -1556,6 +1565,9 @@ class App(tk.Tk):
                 self._emit(generation, "error", (str(exc), detail))
 
     def clear_login(self):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "请先完成或取消图片备份，再清除登录信息。")
+            return
         if not messagebox.askyesno(
             "清除登录信息",
             "删除本工具保存的微博登录状态？\n\n不会影响手机微博或浏览器登录。",
@@ -1624,6 +1636,9 @@ class App(tk.Tk):
         )
 
     def start_export(self, *, trial: bool):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再开始其他微博任务。")
+            return
         target_value = self.uid_var.get()
         if is_obvious_single_post_url(target_value):
             messagebox.showwarning(
@@ -1675,6 +1690,8 @@ class App(tk.Tk):
         self._launch_export_request(request)
 
     def _launch_export_request(self, request: ExportRequest) -> None:
+        if image_task_active(self):
+            return
         try:
             generation, cancel = self.tasks.start(TaskState.FETCHING)
         except RuntimeError:
@@ -1921,6 +1938,10 @@ class App(tk.Tk):
 
         # Invalidate the current generation immediately. Any later HTTP/worker
         # event is structurally incapable of touching the new UI state.
+        draining = [w for w in getattr(self, "_image_text_draining", ()) if w.is_alive()]
+        if getattr(self, "worker", None) is not None:
+            draining.append(self.worker)
+        self._image_text_draining = draining
         self.tasks.cancel()
         self._pending_export_request = None
         self._close_qr_window()
@@ -2066,6 +2087,9 @@ class App(tk.Tk):
         self._center_child_window(win)
 
     def _on_close(self):
+        if image_task_active(self):
+            self._image_window.request_close(close_app=True)
+            return
         if self.tasks.state in (
             TaskState.AUTHENTICATING,
             TaskState.FETCHING,
@@ -2080,6 +2104,9 @@ class App(tk.Tk):
         self.destroy()
 
     def destroy(self):
+        image_window = getattr(self, "_image_window", None)
+        if image_window is not None:
+            image_window.shutdown()
         if hasattr(self, "activity"):
             self.activity.stop()
         self._stop_activity_timer()

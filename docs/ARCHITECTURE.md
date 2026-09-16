@@ -139,6 +139,20 @@ nested RT 只保留结构有效的独立 raw provenance，0.5.2 不解释其 sem
 visibility，也不输出 per-RT semantic label。Full 不按 visibility 过滤；AI 与
 Custom 只按 top-level W 本地派生，不增加网络请求或不同快照。
 
+## Independent image backup (0.6.0)
+
+```text
+timeline raw
+├─ existing text client/parser → Post / Archive → Markdown
+└─ image client/parser → ImageRecord / ImageAsset → downloader / image manifest
+```
+
+这是数据边界示意，不表示一次抓取会自动同时运行两个工具。图片工具拥有独立的时间线遍历、窗口、冻结请求、取消与结果状态；不执行文本长文补全。主窗口只增加“图片备份…”入口和必要的网络任务互斥。
+
+Image models are not Post/Archive. Image failures do not alter text Archive integrity. Image manifest schema 1 is not the normalized text cache (schema 4), and `WEIBO_AI_1` remains unchanged.
+
+只有本次接口明确返回且可下载的图片在承诺范围内；声明数量、返回槽位和枚举缺口分别保留。图片 CDN 使用独立、无 Cookie 的顺序 HTTPS GET；视频不在 v1 范围内。远程 locator 只存在于运行时候选，不进入本地 manifest。图片与 manifest 均原子提交，恢复时先验证已有文件；COMPLETE / PARTIAL / CANCELLED / FAILED 与文本状态分离。
+
 ## Runtime dependency policy
 
 `weibo_archive/` 运行时不得：

@@ -41,6 +41,7 @@ def clean() -> None:
 
 
 def _copy_release_docs() -> None:
+    shutil.copy2(ROOT / "LICENSE", BUNDLE_DIR / "LICENSE")
     shutil.copy2(ROOT / "README.md", BUNDLE_DIR / "README.md")
     shutil.copy2(
         ROOT / "THIRD_PARTY_NOTICES.txt",
@@ -62,6 +63,10 @@ def _audit_bundle() -> None:
         "__pycache__",
         "tests",
         "cookie.txt",
+        "credential.dat",
+        "last_error.txt",
+        "last_success.json",
+        "manifest.json",
         "archives",
         "pil",
         "pillow",
@@ -135,6 +140,7 @@ def _verify_zip() -> None:
     required = {
         f"{BUNDLE_NAME}/WeiboTextArchiver.exe",
         f"{BUNDLE_NAME}/README.md",
+        f"{BUNDLE_NAME}/LICENSE",
         f"{BUNDLE_NAME}/THIRD_PARTY_NOTICES.txt",
     }
     missing = required - names

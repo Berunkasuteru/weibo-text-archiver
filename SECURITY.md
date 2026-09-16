@@ -13,6 +13,14 @@ ssl._create_unverified_context()
 
 Certificate verification failures stop the task rather than falling back to an insecure connection.
 
+### Independent image backup
+
+Image metadata discovery uses authenticated Weibo timeline requests to `m.weibo.cn`. Actual image GETs use a separate credential-free HTTPS client restricted to `wx<digits>.sinaimg.cn`, with the fixed Referer `https://m.weibo.cn/`. They receive no Weibo Cookie, saved credential or Authorization header; this client has no CookieJar and rejects redirects. TLS verification stays enabled. Downloads are sequential and validate bounded size, image signatures and MIME consistency before atomic local commit.
+
+Images and the separate schema-1 image manifest remain local. The manifest records source identity, relative local files, integrity facts and download results, but does not persist remote image URLs, cookies, request headers or post text. These local files can still contain personal information and image metadata and should be protected accordingly. Valid existing files are checked before reuse; cancellation does not delete previously saved images. Image results do not alter text archive integrity.
+
+The application uses no browser automation and sends no telemetry. Image backup does not broaden the existing public GitHub update check described below.
+
 ## Credentials and diagnostics
 
 Diagnostic logs and `last_error.txt` redact known credential fields, including:
