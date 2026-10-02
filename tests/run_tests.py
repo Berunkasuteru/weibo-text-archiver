@@ -1,0 +1,5291 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ast
+import copy
+import json
+import runpy
+import struct
+import subprocess
+import sys
+import tempfile
+from dataclasses import FrozenInstanceError, asdict, fields, replace
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from weibo_archive.client import (
+    BATCH_DELAY,
+    BATCH_POSTS,
+    ContentUnavailable,
+    HydrationOutcome,
+    IncompleteContent,
+    LONGTEXT_DELAY,
+    PAGE_DELAY,
+    PAGE_SIZE,
+    SESSION_POSTS,
+    SESSION_REST,
+    WeiboClient,
+    _embedded_status_from_detail,
+    _post_presentation_sort_key,
+)
+from weibo_archive.export_options import (
+    AI_COMPACT_OPTIONS,
+    FULL_ARCHIVE_OPTIONS,
+    AIVisibilityOptions,
+    CustomFilterOptions,
+    DateFormat,
+    ExportLayout,
+    ExportOptions,
+    ExportPreset,
+    build_export_selections,
+    filename_suffix_for_selection,
+    filter_archive,
+    filter_archive_visibility,
+    filter_report_notice,
+    options_for_preset,
+    parse_filter_terms,
+    visibility_scope_text,
+)
+from weibo_archive.exporter import (
+    archive_to_legacy_data,
+    export_markdown,
+    render_legacy_markdown,
+)
+from weibo_archive.models import (
+    Archive,
+    ArchiveIntegrity,
+    ContentState,
+    Engagement,
+    FetchRange,
+    FetchReport,
+    MediaInfo,
+    IncompleteReason,
+    Post,
+    RangeMode,
+    TimestampProvenance,
+    Termination,
+    UserProfile,
+    VisibilityInfo,
+    VisibilityState,
+    calculate_archive_integrity,
+)
+from weibo_archive.credentials import (
+    CredentialError,
+    CredentialStore,
+)
+from weibo_archive.parser import (
+    extract_mblogs,
+    parse_created_at_fact,
+    parse_post,
+    parse_profile,
+)
+from weibo_archive.performance import PerformanceMetrics
+from weibo_archive.network import (
+    AuthenticationExpired,
+    Cancelled,
+    ChallengeRequired,
+    HttpClient,
+    InvalidResponse,
+    NetworkError,
+    RateLimited,
+    ResponseData,
+    SafeRequestDiagnostic,
+    classify_non_json_response,
+)
+from weibo_archive.security import redact_text
+from weibo_archive.tasking import TaskManager, TaskState
+
+
+class _HistoricalTrialRange(FetchRange):
+    """Preserve accepted Full Archive golden provenance as historical test input."""
+
+    def label(self) -> str:
+        return "试抓50条"
+
+
+def build_archive() -> Archive:
+    return Archive(
+        profile=UserProfile(
+            id="1234567890",
+            screen_name="测试用户",
+            description="V7 模型→渲染器回归样本",
+            followers_count=321,
+            follow_count=45,
+            statuses_count=3,
+            location="北京",
+            verified=False,
+        ),
+        posts=(
+            Post(
+                id="1003", bid="b3",
+                created_at=datetime(2026, 8, 13, 0, 10),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
+                text="这是转发时写的评论。",
+                source="iPhone客户端", location="",
+                author="测试用户", author_id="1234567890",
+                engagement=Engagement(1, 1, 5),
+                media=MediaInfo(),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
+                retweet=Post(
+                    id="9001", bid="rb1",
+                    created_at=datetime(2026, 8, 10, 12, 0),
+                    created_at_provenance=TimestampProvenance.SOURCE_WALL,
+                    text="这是被转发的原文。",
+                    source="", location="",
+                    author="原作者", author_id="987654321",
+                    engagement=Engagement(12, 8, 99),
+                    media=MediaInfo(images=1),
+                    visibility=VisibilityInfo(
+                        VisibilityState.UNKNOWN,
+                        raw_type=10,
+                        raw_list_id=42,
+                    ),
+                ),
+            ),
+            Post(
+                id="1002", bid="b2",
+                created_at=datetime(2026, 8, 12, 18, 30),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
+                text="带图片的微博。",
+                source="iPhone客户端", location="上海",
+                author="测试用户", author_id="1234567890",
+                engagement=Engagement(3, 0, 21),
+                media=MediaInfo(images=3),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
+            ),
+            Post(
+                id="1001", bid="b1",
+                created_at=datetime(2026, 8, 11, 6, 24),
+                created_at_provenance=TimestampProvenance.SOURCE_WALL,
+                text="第一条原创微博。",
+                source="微博网页版", location="北京",
+                author="测试用户", author_id="1234567890",
+                engagement=Engagement(None, 2, 10),
+                media=MediaInfo(),
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC,
+                    raw_type=0,
+                    raw_list_id=0,
+                ),
+            ),
+        ),
+        fetch_range=_HistoricalTrialRange(RangeMode.TRIAL, limit=50),
+        report=FetchReport(
+            pages_fetched=1,
+            requests_made=7,
+            termination=Termination.TARGET_COUNT,
+            oldest_reached=datetime(2026, 8, 11, 6, 24),
+            newest_reached=datetime(2026, 8, 13, 0, 10),
+            profile_statuses_count=3,
+        ),
+        fetched_at=datetime(2026, 8, 13, 2, 0),
+    )
+
+
+def build_alpha3_archive() -> Archive:
+    """Use non-empty repost metadata without changing the accepted legacy fixture."""
+    archive = build_archive()
+    first = archive.posts[0]
+    retweet = replace(
+        first.retweet,
+        created_at=datetime(2026, 8, 10, 12, 0, 37),
+        source="Android客户端",
+        location="广州",
+    )
+    posts = (
+        replace(
+            first,
+            created_at=datetime(2026, 8, 13, 0, 10, 45),
+            retweet=retweet,
+        ),
+        replace(archive.posts[1], created_at=datetime(2026, 8, 12, 18, 30, 29)),
+        replace(archive.posts[2], created_at=datetime(2026, 8, 11, 6, 24, 11)),
+    )
+    return replace(archive, posts=posts)
+
+
+def _as_incomplete(post: Post, preview: str | None) -> Post:
+    return replace(
+        post,
+        text=None,
+        content_state=ContentState.INCOMPLETE,
+        text_preview=preview,
+        incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+    )
+
+
+def build_alpha4_archive() -> Archive:
+    archive = build_alpha3_archive()
+    first, second, third = archive.posts
+    first = replace(
+        first,
+        retweet=_as_incomplete(first.retweet, "原文列表预览……全文"),
+    )
+    second = _as_incomplete(second, "顶层列表预览……全文")
+    return replace(archive, posts=(first, second, third))
+
+
+def test_startup_import():
+    result = subprocess.run(
+        [sys.executable, "-c", "import weibo_archive.app; print('IMPORT_OK')"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    if result.returncode != 0 or "IMPORT_OK" not in result.stdout:
+        raise AssertionError(result.stdout + "\n" + result.stderr)
+
+
+def test_alpha4_version_and_gui_launcher():
+    from weibo_archive import VERSION_DISPLAY, __version__
+
+    assert __version__ == "0.6.0"
+    assert VERSION_DISPLAY == "0.6.0"
+
+    app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    assert "from . import VERSION_DISPLAY" in app_source
+    assert "__version__" not in app_source
+    assert "COOKIE_FILE" not in app_source
+    assert "load_cookie_header()" in app_source
+    assert "has_saved_login()" in app_source
+    assert "save_cookies(cookies)" in app_source
+    assert "clear_saved_login()" in app_source
+    assert "Alpha 1" not in app_source
+    assert "Alpha1" not in app_source
+
+    launcher = ROOT / "WeiboTextArchiver.pyw"
+    namespace = runpy.run_path(str(launcher), run_name="alpha4_launcher_import_test")
+    assert callable(namespace["main"])
+    assert callable(namespace["_show_startup_error"])
+
+    user_visible_startup_files = (
+        ROOT / "tools" / "windows" / "START.bat",
+        ROOT / "tools" / "windows" / "CHECK_ENV.bat",
+        ROOT / "tools" / "windows" / "TEST.bat",
+        ROOT / "tests" / "RUN_TESTS.bat",
+        ROOT / "README.md",
+        ROOT / "tools" / "windows" / "BUILD_WINDOWS.bat",
+        launcher,
+    )
+    for path in user_visible_startup_files:
+        source = path.read_text(encoding="utf-8-sig")
+        assert "Weibo Archive V7.0 Alpha 1" not in source
+        assert "Alpha1" not in source
+
+    windows_tools = ROOT / "tools" / "windows"
+    for name in ("BUILD_WINDOWS.bat", "CHECK_ENV.bat", "START.bat", "TEST.bat"):
+        source = (windows_tools / name).read_text(encoding="utf-8-sig")
+        assert 'for %%I in ("%~dp0..\\..") do set "ROOT=%%~fI"' in source
+        assert 'cd /d "%ROOT%"' in source
+    assert "python -m weibo_archive.app" in (
+        windows_tools / "START.bat"
+    ).read_text(encoding="utf-8-sig")
+    assert "%ROOT%\\tests\\run_tests.py" in (
+        windows_tools / "TEST.bat"
+    ).read_text(encoding="utf-8-sig")
+    assert "%ROOT%\\tools\\build\\environment_check.py" in (
+        windows_tools / "CHECK_ENV.bat"
+    ).read_text(encoding="utf-8-sig")
+
+
+def test_windows_preview_packaging_contract():
+    from weibo_archive import VERSION_DISPLAY
+    from weibo_archive.app import APP_TITLE, TEST_EXPORT_LIMIT, App
+    from weibo_archive.models import RangeMode
+    from weibo_archive.paths import resource_path
+
+    assert APP_TITLE == "Weibo Text Archiver"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.6.0"
+    assert TEST_EXPORT_LIMIT == 20
+    trial_range = App._selected_range(object(), True)
+    assert trial_range.mode is RangeMode.TRIAL
+    assert trial_range.limit == 20
+
+    class Value:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+    formal_controls = type(
+        "FormalRangeControls",
+        (),
+        {
+            "range_mode_var": Value(RangeMode.RECENT.value),
+            "recent_count_var": Value("37"),
+        },
+    )()
+    formal_range = App._selected_range(formal_controls, False)
+    assert formal_range.mode is RangeMode.RECENT
+    assert formal_range.limit == 37
+    png_path = ROOT / "assets" / "app_icon.png"
+    ico_path = ROOT / "assets" / "app_icon.ico"
+    assert png_path.is_file()
+    assert ico_path.is_file()
+    assert resource_path("assets/app_icon.png").resolve() == png_path.resolve()
+
+    png_header = png_path.read_bytes()[:24]
+    assert png_header[:8] == b"\x89PNG\r\n\x1a\n"
+    assert struct.unpack(">II", png_header[16:24]) == (512, 512)
+
+    ico = ico_path.read_bytes()
+    reserved, image_type, count = struct.unpack("<HHH", ico[:6])
+    assert (reserved, image_type) == (0, 1)
+    sizes = set()
+    for index in range(count):
+        width_byte, height_byte = struct.unpack_from("BB", ico, 6 + index * 16)
+        width = width_byte or 256
+        height = height_byte or 256
+        if width == height:
+            sizes.add(width)
+    assert {16, 24, 32, 48, 64, 128, 256} <= sizes
+
+    generator = ROOT / "tools" / "generate_icon.py"
+    generator_source = generator.read_text(encoding="utf-8")
+    assert "def _render_mini_eater" in generator_source
+    assert "dark-mode-first Mini Eater mascot" in generator_source
+    assert "_render_balanced" not in generator_source
+    assert "document" not in generator_source.lower()
+    assert "arrow" not in generator_source.lower()
+    assert 'BODY_CYAN = "#13B8B2"' in generator_source
+    assert 'FACE_WHITE = "#F7F8F4"' in generator_source
+    assert 'FEATURE_INK = "#18353B"' in generator_source
+    assert "tiny = size <= 24" in generator_source
+    assert "fill=BODY_CYAN" in generator_source
+    assert "_write_ico({size: _render_mini_eater(size)" in generator_source
+
+    import tkinter as tk
+
+    icon_root = tk.Tk()
+    icon_root.withdraw()
+    try:
+        photo = tk.PhotoImage(master=icon_root, file=str(png_path))
+        assert photo.transparency_get(0, 0)
+        body = photo.get(256, 32)
+        face = photo.get(256, 130)
+        eye = photo.get(180, 188)
+        intake = photo.get(256, 300)
+        assert body[1] > 150 and body[2] > 140 and body[0] < 60
+        assert min(face) > 235
+        assert eye[0] < 40 and eye[1] < 80 and eye[2] < 90
+        assert intake[0] < 40 and intake[1] < 80 and intake[2] < 90
+    finally:
+        icon_root.destroy()
+    result = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    spec = (ROOT / "tools" / "build" / "weibo_text_archiver.spec").read_text(
+        encoding="utf-8"
+    )
+    assert "console=False" in spec
+    assert "exclude_binaries=True" in spec
+    assert "COLLECT(" in spec
+    assert "onefile" not in spec.lower()
+    assert "assets/app_icon.png" not in spec  # Native Path joins remain portable.
+    assert '"assets" / "app_icon.png"' in spec
+    assert '"assets" / "app_icon.ico"' in spec
+    assert '"PIL"' in spec
+    assert "Path(SPECPATH).resolve().parents[1]" in spec
+
+    build_script = (ROOT / "tools" / "windows" / "BUILD_WINDOWS.bat").read_text(
+        encoding="utf-8-sig"
+    )
+    assert 'set "ROOT=%%~fI"' in build_script
+    assert "tools/build/requirements-build.txt" in build_script
+    assert "tools\\build\\requirements-build.txt" in build_script
+    assert "tools\\build\\weibo_text_archiver.spec" in build_script
+
+    environment_check = (
+        ROOT / "tools" / "build" / "environment_check.py"
+    ).read_text(encoding="utf-8")
+    assert "Path(__file__).resolve().parents[2]" in environment_check
+
+    package_source = (ROOT / "tools" / "package_windows_release.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'BUNDLE_NAME = f"WeiboTextArchiver_{__version__}_Windows"' in package_source
+    assert 'ZIP_NAME = "WeiboTextArchiver_Windows.zip"' in package_source
+    assert 'f"{digest}  {ZIP_NAME}\\n"' in package_source
+    assert '"archives"' in package_source
+    assert not (ROOT / "【先解压整个文件夹】使用说明.txt").exists()
+
+    package_namespace = runpy.run_path(
+        str(ROOT / "tools" / "package_windows_release.py"),
+        run_name="package_audit_contract_test",
+    )
+    audit_bundle = package_namespace["_audit_bundle"]
+    with tempfile.TemporaryDirectory(prefix="weibo_package_audit_") as td:
+        bundle = Path(td) / "bundle"
+        bundle.mkdir()
+        executable = bundle / "WeiboTextArchiver.exe"
+        executable.write_bytes(b"MZ offline fixture")
+        (bundle / "README.md").write_text("legitimate documentation", encoding="utf-8")
+        audit_bundle.__globals__["BUNDLE_DIR"] = bundle
+        audit_bundle.__globals__["EXE_PATH"] = executable
+        audit_bundle()
+
+        runtime_archives = bundle / "aRcHiVeS"
+        runtime_archives.mkdir()
+        (runtime_archives / "private-export.md").write_text("private", encoding="utf-8")
+        try:
+            audit_bundle()
+        except RuntimeError as exc:
+            assert "aRcHiVeS" in str(exc)
+        else:
+            raise AssertionError("runtime Archives directory entered an audited bundle")
+
+    gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    for ignored in (".venv-build/", "/build/", "/dist/", "/release/"):
+        assert ignored in gitignore
+
+    requirements = (
+        ROOT / "tools" / "build" / "requirements-build.txt"
+    ).read_text(encoding="utf-8")
+    assert "PyInstaller==" in requirements
+    assert "Pillow==" in requirements
+    for old_root_helper in (
+        "BUILD_WINDOWS.bat",
+        "CHECK_ENV.bat",
+        "START.bat",
+        "TEST.bat",
+        "environment_check.py",
+        "requirements-build.txt",
+        "weibo_text_archiver.spec",
+    ):
+        assert not (ROOT / old_root_helper).exists()
+
+    runtime_imports = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "weibo_archive").glob("*.py")
+    )
+    assert "from PIL" not in runtime_imports
+    assert "import PIL" not in runtime_imports
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert readme.startswith("# Weibo Text Archiver\n")
+    for current_positioning in (
+        "本地 Markdown 归档",
+        "完整归档",
+        "AI 分析版",
+        "程序不内置 LLM",
+        "由用户主动向该服务披露文件内容",
+        "最近 20 条",
+    ):
+        assert current_positioning in readme
+    assert not (ROOT / "README_先看.txt").exists()
+    assert not (ROOT / "docs" / "ROADMAP.md").exists()
+    assert not (ROOT / "启动微博文字导出器.bat").exists()
+    assert not (ROOT / "环境检查.bat").exists()
+    assert (ROOT / "docs" / "ARCHITECTURE.md").is_file()
+    assert (ROOT / "docs" / "SOURCE_NOTES.md").is_file()
+    assert (ROOT / "THIRD_PARTY_NOTICES.txt").is_file()
+
+    app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    for chinese_ui_text in (
+        "扫码登录 / 更新",
+        "登录账号",
+        "目标账号",
+        "导出范围",
+        "导出内容",
+        "保存位置",
+        "测试导出",
+        "快速验证 · 最近",
+        "开始导出 →",
+        "清除登录信息",
+        "正在读取",
+        "正在生成归档",
+    ):
+        assert chinese_ui_text in app_source
+    for obsolete_english_ui in (
+        'self._section_label("ACCOUNT")',
+        'self._section_label("TARGET")',
+        'self._section_label("RANGE")',
+        'self._section_label("OUTPUT")',
+        'self._section_label("SAVE TO")',
+        'self.status_var.set("Fetching")',
+        'self.status_var.set("Exporting")',
+        'self.status_var.set("Ready")',
+    ):
+        assert obsolete_english_ui not in app_source
+    for obsolete_action in ("试抓 50 条", "开始备份 →", 'text="清除登录"'):
+        assert obsolete_action not in app_source
+    client_source = (ROOT / "weibo_archive" / "client.py").read_text(encoding="utf-8")
+    assert "V7 " not in app_source
+    assert "V7 " not in client_source
+
+
+def test_portable_archives_path_and_initial_output_defaults():
+    import weibo_archive.app as app_module
+    from weibo_archive.app import App
+    from weibo_archive.paths import (
+        application_dir,
+        default_output_dir,
+        fallback_output_dir,
+        prepare_output_dir,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="weibo_archives_path_") as td:
+        root = Path(td)
+        packaged_exe = root / "WeiboTextArchiver_0.5.7_Windows" / "WeiboTextArchiver.exe"
+        assert application_dir(
+            frozen=True,
+            executable=packaged_exe,
+        ) == packaged_exe.resolve().parent
+
+        source_root = root / "source"
+        source_root.mkdir()
+        preferred = default_output_dir(frozen=False, source_root=source_root)
+        assert preferred == source_root.resolve() / "Archives"
+        assert not preferred.exists()
+
+        blocked_preferred = root / "blocked-application" / "Archives"
+        blocked_preferred.parent.mkdir()
+        blocked_preferred.write_text("not a directory", encoding="utf-8")
+        fallback = fallback_output_dir(home=root / "home")
+        resolved = prepare_output_dir(blocked_preferred, fallback=fallback)
+        assert resolved == fallback
+        assert fallback.is_dir()
+
+        custom = root / "chosen-by-user"
+        unused_fallback = root / "must-not-be-used"
+        assert prepare_output_dir(custom) == custom
+        assert custom.is_dir()
+        assert not unused_fallback.exists()
+
+        blocked_custom = root / "blocked-custom"
+        blocked_custom.write_text("not a directory", encoding="utf-8")
+        try:
+            prepare_output_dir(blocked_custom)
+        except OSError as exc:
+            assert str(blocked_custom) in str(exc)
+        else:
+            raise AssertionError("a failing custom path must not silently use fallback")
+
+    paths_source = (ROOT / "weibo_archive" / "paths.py").read_text(encoding="utf-8")
+    assert "微博文字备份" not in paths_source
+    assert "Desktop" not in paths_source
+    for migration_operation in ("shutil", ".rename(", ".replace(", ".unlink("):
+        assert migration_operation not in paths_source
+
+    original_has_saved_login = app_module.has_saved_login
+    app_module.has_saved_login = lambda: False
+    app = None
+    try:
+        app = App()
+        app.withdraw()
+        assert app.full_output_var.get() is True
+        assert app.ai_output_var.get() is True
+        assert app.custom_output_var.get() is False
+        assert Path(app.output_var.get()) == ROOT / "Archives"
+        selections = app._selected_export_selections()
+        assert tuple(selection.preset for selection in selections) == (
+            ExportPreset.AI_COMPACT,
+            ExportPreset.FULL_ARCHIVE,
+        )
+        assert selections[0].visibility_states == frozenset(
+            {VisibilityState.PUBLIC}
+        )
+    finally:
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_has_saved_login
+
+
+def test_activity_indicator_lifecycle():
+    import time
+    import tkinter as tk
+
+    from weibo_archive.app import ActivityIndicator
+
+    root = tk.Tk()
+    root.withdraw()
+    indicator = ActivityIndicator(root)
+    indicator.pack()
+    root.update_idletasks()
+    try:
+        assert indicator._after_id is None
+        indicator.start()
+        first_after_id = indicator._after_id
+        assert first_after_id is not None
+        indicator.start()
+        assert indicator._after_id == first_after_id
+
+        deadline = time.monotonic() + 0.20
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(0.01)
+        assert indicator._frame > 0
+
+        indicator.stop()
+        stopped_frame = indicator._frame
+        assert indicator._after_id is None
+        assert indicator._running is False
+        root.update()
+        assert indicator._frame == stopped_frame
+
+        indicator.start()
+        assert indicator._after_id is not None
+        indicator.destroy()
+        root.update_idletasks()
+        assert indicator._after_id is None
+        assert indicator._running is False
+    finally:
+        root.destroy()
+
+
+def test_final_polish_activity_status_and_localized_ui():
+    import time
+    import tkinter as tk
+    from tkinter import ttk
+
+    import weibo_archive.app as app_module
+    from weibo_archive import VERSION_DISPLAY
+    from weibo_archive.app import (
+        APP_SUBTITLE,
+        APP_TITLE,
+        ActivityIndicator,
+        TEST_EXPORT_LIMIT,
+        App,
+        activity_status_text,
+        format_elapsed_time,
+    )
+
+    expected_times = {
+        0: "00:00",
+        9: "00:09",
+        59: "00:59",
+        60: "01:00",
+        3599: "59:59",
+        3600: "1:00:00",
+        7322: "2:02:02",
+    }
+    for seconds, expected in expected_times.items():
+        assert format_elapsed_time(seconds) == expected
+    assert activity_status_text(0, 0) == "已读取 0 条 · 用时 00:00"
+    assert activity_status_text(1, 9) == "已读取 1 条 · 用时 00:09"
+    assert activity_status_text(347, 42) == "已读取 347 条 · 用时 00:42"
+    assert activity_status_text(1000, 3600) == "已读取 1,000 条 · 用时 1:00:00"
+
+    original_has_saved_login = app_module.has_saved_login
+    app_module.has_saved_login = lambda: False
+    app = None
+    try:
+        app = App()
+        app.withdraw()
+        app.update_idletasks()
+        assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
+        assert VERSION_DISPLAY == "0.6.0"
+        assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
+        assert app.full_output_var.get() is True
+        assert app.ai_output_var.get() is True
+        assert app.custom_output_var.get() is False
+        assert app.ai_followers_var.get() is False
+        assert app.ai_friends_var.get() is False
+        assert app.ai_private_var.get() is False
+        assert [button.cget("text") for button in app.output_buttons] == [
+            "AI 分析版",
+            "完整归档",
+            "自定义导出",
+        ]
+        assert [str(button.cget("state")) for button in app.ai_visibility_buttons] == [
+            "normal",
+            "normal",
+            "normal",
+        ]
+        app.ai_output_var.set(False)
+        app._update_content_controls()
+        assert [str(button.cget("state")) for button in app.ai_visibility_buttons] == [
+            "disabled",
+            "disabled",
+            "disabled",
+        ]
+        app.ai_output_var.set(True)
+        app._update_content_controls()
+        assert TEST_EXPORT_LIMIT == 20
+        assert app.trial_btn.cget("text") == "测试导出"
+        assert app.trial_hint_label.cget("text") == "快速验证 · 最近 20 条"
+        assert app.trial_btn.cget("style") == "Quiet.TButton"
+        assert app.stop_btn.cget("style") == "Quiet.TButton"
+        assert app.login_btn.cget("style") == "Quiet.TButton"
+        assert app.output_choose_btn.cget("style") == "Quiet.TButton"
+        assert app.export_btn.cget("style") == "Primary.TButton"
+        assert app.clear_login_btn.cget("style") == "Quiet.TButton"
+        assert app.custom_settings_btn.cget("style") == "Quiet.TButton"
+        assert app.details_btn.cget("style") == "Quiet.TButton"
+        assert app.login_var.get() == "○ 未登录"
+
+        app.deiconify()
+        app.update()
+        assert app.winfo_width() >= 780
+        assert app.winfo_reqwidth() <= app.winfo_width()
+        assert app.recent_entry.master is app.recent_suffix_label.master
+        assert app.since_entry.master is app.since_suffix_label.master
+        recent_gap = app.recent_suffix_label.winfo_x() - (
+            app.recent_entry.winfo_x() + app.recent_entry.winfo_width()
+        )
+        since_gap = app.since_suffix_label.winfo_x() - (
+            app.since_entry.winfo_x() + app.since_entry.winfo_width()
+        )
+        assert 0 <= recent_gap <= 12
+        assert 0 <= since_gap <= 12
+        assert app.recent_suffix_label.cget("text") == "条"
+        assert app.since_suffix_label.cget("text") == "起（YYYY-MM-DD）"
+        bottom = max(
+            child.winfo_y() + child.winfo_height()
+            for child in app.root_frame.winfo_children()
+            if child.winfo_manager()
+        )
+        assert bottom <= app.root_frame.winfo_height()
+        for required_widget in (
+            app.uid_entry,
+            app.recent_entry,
+            app.since_entry,
+            app.trial_btn,
+            app.export_btn,
+            app.details_btn,
+        ):
+            assert required_widget.winfo_viewable()
+        app.withdraw()
+
+        app._start_activity_timer()
+        first_after_id = app._activity_after_id
+        first_started_at = app._activity_started_at
+        assert first_after_id is not None
+        app._start_activity_timer()
+        assert app._activity_after_id == first_after_id
+        assert app._activity_started_at == first_started_at
+        assert app._activity_read_count == 0
+
+        app._set_activity_read_count(347)
+        assert app._activity_read_count == 347
+        assert isinstance(app.activity, ActivityIndicator)
+
+        app._stop_activity_timer()
+        assert app._activity_after_id is None
+        assert app._activity_timer_running is False
+        stopped_count = app._activity_read_count
+        time.sleep(0.02)
+        app.update()
+        assert app._activity_read_count == stopped_count
+
+        app._start_activity_timer()
+        assert app._activity_read_count == 0
+        assert app._activity_after_id is not None
+        assert app._activity_started_at != first_started_at
+
+        app.tasks.start(TaskState.FETCHING)
+        app._set_running(True)
+        assert str(app.trial_btn.cget("state")) == "disabled"
+        assert str(app.export_btn.cget("state")) == "disabled"
+        assert str(app.stop_btn.cget("state")) == "normal"
+        assert [
+            str(button.cget("state")) for button in app.ai_visibility_buttons
+        ] == ["disabled", "disabled", "disabled"]
+        app.tasks.cancel()
+        app.tasks.transition(TaskState.READY)
+        app._set_running(False)
+        assert str(app.trial_btn.cget("state")) == "normal"
+        assert str(app.export_btn.cget("state")) == "normal"
+        assert str(app.stop_btn.cget("state")) == "disabled"
+
+        app.custom_output_var.set(True)
+        app._update_content_controls()
+        app._open_custom_settings()
+        app.update_idletasks()
+        custom_windows = [
+            child for child in app.winfo_children() if isinstance(child, tk.Toplevel)
+        ]
+        assert custom_windows
+        custom_window = custom_windows[-1]
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        checkbuttons = [
+            widget
+            for widget in descendants(custom_window)
+            if isinstance(widget, ttk.Checkbutton)
+        ]
+        dialog_buttons = {
+            widget.cget("text"): widget
+            for widget in descendants(custom_window)
+            if isinstance(widget, ttk.Button)
+        }
+        assert dialog_buttons["保存设置"].cget("style") == "Primary.TButton"
+        assert dialog_buttons["取消"].cget("style") == "Primary.TButton"
+        assert dialog_buttons["保存设置"].winfo_height() == dialog_buttons["取消"].winfo_height()
+        by_text = {widget.cget("text"): widget for widget in checkbuttons}
+        for label in (
+            "按可见范围筛选",
+            "公开",
+            "粉丝可见",
+            "好友圈",
+            "仅自己可见",
+            "未知",
+        ):
+            assert label in by_text
+        assert all(
+            str(by_text[label].cget("state")) == "disabled"
+            for label in ("公开", "粉丝可见", "好友圈", "仅自己可见", "未知")
+        )
+        custom_window.destroy()
+    finally:
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_has_saved_login
+
+
+def test_parser_contract():
+    basic = json.loads((ROOT / "tests/fixtures/profile_basic.json").read_text(encoding="utf-8"))
+    detail = json.loads((ROOT / "tests/fixtures/profile_detail.json").read_text(encoding="utf-8"))
+    timeline = json.loads((ROOT / "tests/fixtures/timeline_page.json").read_text(encoding="utf-8"))
+
+    profile = parse_profile("1234567890", basic, detail)
+    assert profile.screen_name == "测试用户"
+    assert profile.location == "北京"
+    assert profile.education == "测试大学"
+    assert profile.company == "测试公司"
+
+    mblogs = extract_mblogs(timeline["data"]["cards"])
+    assert len(mblogs) == 3
+
+    posts = [parse_post(x) for x in mblogs]
+    assert posts[0].author_id == "1234567890"
+    assert posts[0].created_at_provenance is TimestampProvenance.SOURCE_OFFSET
+    assert posts[0].created_at.isoformat() == "2026-08-13T00:10:00+08:00"
+    assert posts[0].retweet is not None
+    assert posts[0].retweet.author == "原作者"
+    assert posts[0].retweet.author_id == "987654321"
+    assert posts[0].retweet.created_at_provenance is TimestampProvenance.SOURCE_OFFSET
+    assert posts[0].retweet.created_at.isoformat() == "2026-08-10T12:00:00+08:00"
+    assert posts[0].retweet.media.images == 1
+
+    assert posts[1].media.images == 3
+    assert posts[1].location == "上海"
+    assert "带图片的微博" in posts[1].text
+
+    # Core semantic invariant: API field missing != explicit zero.
+    assert posts[2].engagement.reposts is None
+    assert posts[1].engagement.comments == 0
+
+
+def test_visibility_parser_and_model_contract():
+    fixture = json.loads(
+        (ROOT / "tests/fixtures/visibility_posts.json").read_text(encoding="utf-8")
+    )
+    posts = [parse_post(raw) for raw in fixture["top_level"]]
+    assert [post.visibility.state for post in posts] == [
+        VisibilityState.PUBLIC,
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+        VisibilityState.PRIVATE,
+    ]
+    assert posts[2].visibility.raw_list_id == 777
+    assert posts[2].visibility.raw_list_idstr == "fixture-list"
+
+    def parsed_visible(value):
+        return parse_post(
+            {
+                "id": "visibility-case",
+                "text": "fixture",
+                "user": {"id": "100", "screen_name": "fixture-user"},
+                "visible": value,
+            }
+        ).visibility
+
+    for malformed in (
+        None,
+        [],
+        {},
+        {"list_id": 0},
+        {"type": True, "list_id": 0},
+        {"type": "0", "list_id": 0},
+        {"type": 0},
+        {"type": 0, "list_id": False},
+        {"type": 0, "list_id": "0"},
+    ):
+        assert parsed_visible(malformed).state is VisibilityState.UNKNOWN
+
+    unknown = parsed_visible({"type": 999, "list_id": 12})
+    assert unknown.state is VisibilityState.UNKNOWN
+    assert unknown.raw_type == 999 and unknown.raw_list_id == 12
+
+    malformed_optional = parsed_visible(
+        {"type": 0, "list_id": 51, "list_idstr": ["not", "a", "string"]}
+    )
+    assert malformed_optional.state is VisibilityState.PUBLIC
+    assert malformed_optional.raw_list_idstr is None
+
+    nested = parse_post(fixture["nested"])
+    assert nested.visibility.state is VisibilityState.PUBLIC
+    assert nested.retweet is not None
+    assert nested.retweet.visibility == VisibilityInfo(
+        state=VisibilityState.UNKNOWN,
+        raw_type=10,
+        raw_list_id=42,
+        raw_list_idstr="nested-list",
+    )
+
+    before = nested.visibility
+    try:
+        nested.visibility = VisibilityInfo(state=VisibilityState.PRIVATE)
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("Post visibility is not frozen")
+    assert nested.visibility is before
+
+
+def test_model_boundary():
+    post_fields = {f.name for f in fields(Post)}
+    assert "raw" not in post_fields
+    assert "json" not in post_fields
+
+    p = build_archive().posts[0]
+    try:
+        p.text = "mutation should fail"
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("Post is not frozen")
+
+
+def test_alpha4_post_invariants_and_integrity_combinations():
+    base = build_archive().posts[1]
+    media_only = replace(base, id="media", text="", media=MediaInfo(images=1))
+    assert media_only.content_state is ContentState.COMPLETE
+    assert media_only.text == ""
+
+    incomplete = _as_incomplete(replace(base, id="inc"), None)
+    assert incomplete.text is None
+    assert incomplete.text_preview is None
+
+    invalid_changes = (
+        {"text": None},
+        {"text_preview": "preview"},
+        {"incomplete_reason": IncompleteReason.CONTENT_UNAVAILABLE},
+        {
+            "id": "",
+            "text": None,
+            "content_state": ContentState.INCOMPLETE,
+            "incomplete_reason": IncompleteReason.CONTENT_UNAVAILABLE,
+        },
+        {
+            "text": "preview must not be text",
+            "content_state": ContentState.INCOMPLETE,
+            "incomplete_reason": IncompleteReason.CONTENT_UNAVAILABLE,
+        },
+        {
+            "text": None,
+            "content_state": ContentState.INCOMPLETE,
+            "incomplete_reason": None,
+        },
+    )
+    for changes in invalid_changes:
+        try:
+            replace(base, **changes)
+        except (TypeError, ValueError):
+            pass
+        else:
+            raise AssertionError(f"invalid Post state accepted: {changes}")
+
+    complete_retweet = replace(base, id="rt-complete")
+    incomplete_retweet = _as_incomplete(replace(base, id="rt-incomplete"), "预览")
+    posts = (
+        replace(base, id="both-complete", retweet=complete_retweet),
+        replace(_as_incomplete(replace(base, id="top-incomplete"), "预览"), retweet=complete_retweet),
+        replace(base, id="retweet-incomplete", retweet=incomplete_retweet),
+        replace(_as_incomplete(replace(base, id="both-incomplete"), "预览"), retweet=incomplete_retweet),
+    )
+    integrity = calculate_archive_integrity(posts)
+    assert integrity == ArchiveIntegrity(4, 1, 3, 2, 2)
+    assert integrity.complete_records + integrity.incomplete_records == integrity.total_posts
+
+    archive = replace(build_archive(), posts=posts)
+    assert archive.integrity == integrity
+    assert "integrity" not in {field.name for field in fields(Archive)}
+
+
+def test_alpha4_parser_explicit_reasons_and_raw_immutability():
+    raw = {
+        "id": "top",
+        "text": "<p>顶层预览……全文</p>",
+        "user": {"screen_name": "用户"},
+        "retweeted_status": {
+            "id": "retweet",
+            "text": "<p>转发预览……全文</p>",
+            "user": {"screen_name": "原作者"},
+        },
+    }
+    before = copy.deepcopy(raw)
+
+    combinations = (
+        (None, None, ContentState.COMPLETE, ContentState.COMPLETE),
+        (IncompleteReason.CONTENT_UNAVAILABLE, None, ContentState.INCOMPLETE, ContentState.COMPLETE),
+        (None, IncompleteReason.CONTENT_UNAVAILABLE, ContentState.COMPLETE, ContentState.INCOMPLETE),
+        (
+            IncompleteReason.CONTENT_UNAVAILABLE,
+            IncompleteReason.CONTENT_UNAVAILABLE,
+            ContentState.INCOMPLETE,
+            ContentState.INCOMPLETE,
+        ),
+    )
+    for top_reason, retweet_reason, top_state, retweet_state in combinations:
+        post = parse_post(
+            raw,
+            incomplete_reason=top_reason,
+            retweet_incomplete_reason=retweet_reason,
+        )
+        assert post.content_state is top_state
+        assert post.retweet.content_state is retweet_state
+        if top_state is ContentState.INCOMPLETE:
+            assert post.text is None
+            assert post.text_preview == "顶层预览……全文"
+        if retweet_state is ContentState.INCOMPLETE:
+            assert post.retweet.text is None
+            assert post.retweet.text_preview == "转发预览……全文"
+
+    assert raw == before
+
+
+def test_nested_platform_tombstone_semantics():
+    import threading
+
+    from weibo_archive import markdown_v5
+
+    notices = (
+        "抱歉，根据作者设置的微博可见时间范围，此微博已不可见。",
+        "抱歉，此微博已被作者删除。查看帮助： 网页链接",
+        "该账号因违反相关法律法规和政策，现已无法查看。查看帮助 网页链接",
+    )
+
+    def nested_raw(notice, *, post_id="rt-tombstone", user=None, **fields):
+        raw = {
+            "id": post_id,
+            "bid": "fixture-tombstone",
+            "created_at": "Wed Aug 12 18:30:00 +0800 2026",
+            "text": notice,
+        }
+        if user is not None:
+            raw["user"] = user
+        raw.update(fields)
+        return raw
+
+    def parent_raw(parent_id, retweet):
+        return {
+            "id": parent_id,
+            "bid": "parent-" + parent_id,
+            "created_at": "Thu Aug 13 00:10:00 +0800 2026",
+            "text": "普通转发评论",
+            "user": {"id": "1234567890", "screen_name": "测试用户"},
+            "retweeted_status": retweet,
+        }
+
+    for index, notice in enumerate(notices):
+        parsed = parse_post(parent_raw(str(index + 1), nested_raw(notice))).retweet
+        assert parsed is not None
+        assert parsed.content_state is ContentState.INCOMPLETE
+        assert parsed.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+        assert parsed.text is None
+        assert parsed.text_preview is None
+
+    overlapping_reason = parse_post(
+        parent_raw("overlap-parent", nested_raw(notices[0])),
+        retweet_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+    ).retweet
+    assert overlapping_reason.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+    assert overlapping_reason.text_preview is None
+
+    notice = notices[0]
+    authored = parse_post(
+        parent_raw(
+            "authored-parent",
+            nested_raw(
+                notice,
+                post_id="authored-retweet",
+                user={"id": "987654321", "screen_name": "普通作者"},
+                source="微博客户端",
+                reposts_count=0,
+                comments_count=0,
+                attitudes_count=0,
+            ),
+        )
+    ).retweet
+    assert authored is not None
+    assert authored.content_state is ContentState.COMPLETE
+    assert authored.text == notice
+
+    source_present = parse_post(
+        parent_raw(
+            "source-parent",
+            nested_raw(notice, post_id="source-retweet", source="微博客户端"),
+        )
+    ).retweet
+    assert source_present is not None
+    assert source_present.content_state is ContentState.COMPLETE
+    assert source_present.text == notice
+
+    top_level = parse_post(nested_raw(notice, post_id="top-level-same-text"))
+    assert top_level.content_state is ContentState.COMPLETE
+    assert top_level.text == notice
+
+    unproven_variant = parse_post(
+        parent_raw(
+            "unproven-parent",
+            nested_raw("抱歉，暂时没有查看权限。", post_id="unproven-retweet"),
+        )
+    ).retweet
+    assert unproven_variant is not None
+    assert unproven_variant.content_state is ContentState.COMPLETE
+
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    client._fetch_full_text_html = lambda _raw: (_ for _ in ()).throw(
+        AssertionError("a platform tombstone triggered long-text acquisition")
+    )
+    tombstone_parent = parent_raw("no-network-parent", nested_raw(notice))
+    hydration = client._hydrate_long_texts(tombstone_parent)
+    parsed_parent = parse_post(
+        hydration.raw,
+        incomplete_reason=hydration.top_incomplete_reason,
+        retweet_incomplete_reason=hydration.retweet_incomplete_reason,
+    )
+    assert parsed_parent.retweet.incomplete_reason is IncompleteReason.PLATFORM_TOMBSTONE
+    assert client.unique_long_text_attempted == 0
+
+    first = parse_post(parent_raw("dedupe-1", nested_raw(notice)))
+    second = parse_post(parent_raw("dedupe-2", nested_raw(notice)))
+    archive = replace(build_archive(), posts=(first, second))
+    assert archive.integrity == ArchiveIntegrity(2, 0, 2, 0, 2)
+    legacy = archive_to_legacy_data(archive)
+    legacy_rt = legacy["weibo"][0]["retweet"]
+    assert legacy_rt["incomplete_reason"] == "platform_tombstone"
+    assert legacy_rt["text"] is None
+    assert legacy_rt["text_preview"] is None
+
+    from weibo_archive import storage
+
+    with tempfile.TemporaryDirectory(prefix="weibo_tombstone_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert cached["schema_version"] == 4
+    cached_rt = cached["posts"][0]["retweet"]
+    assert cached_rt["incomplete_reason"] == "platform_tombstone"
+    assert cached_rt["text"] is None
+    assert cached_rt["text_preview"] is None
+
+    full, _, _ = markdown_v5.build_markdown(legacy, archive.profile.id)
+    ai, _, _ = markdown_v5.build_ai_markdown(legacy, archive.profile.id)
+    for rendered in (full, ai):
+        assert notice not in rendered
+    assert "当前没有可保存的列表预览。" in full
+    assert "UNAVAILABLE" not in ai
+    assert ">[PREVIEW_ONLY｜全文无法验证]" not in ai
+    assert sum(
+        line.startswith(">[RT1｜") and "CONTENT=INCOMPLETE" in line
+        for line in ai.splitlines()
+    ) == 1
+    assert sum(line.startswith(">[=RT1｜") for line in ai.splitlines()) == 1
+
+    long_text = parse_post(
+        {
+            "id": "longtext-incomplete",
+            "created_at": "Thu Aug 13 00:10:00 +0800 2026",
+            "text": "真实列表预览……全文",
+            "user": {"id": "1234567890", "screen_name": "测试用户"},
+        },
+        incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+    )
+    assert long_text.text is None
+    assert long_text.text_preview == "真实列表预览……全文"
+    long_archive = replace(build_archive(), posts=(long_text,))
+    long_ai, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(long_archive),
+        long_archive.profile.id,
+    )
+    assert "[PREVIEW_ONLY｜全文无法验证]" in long_ai
+    assert "真实列表预览……全文" in long_ai
+    assert "[UNAVAILABLE｜" not in long_ai
+
+
+def test_longtext_detail_decoder():
+    html = (
+        '<script>window.__DATA__={"status":'
+        '{"id":"42","text":"<p>完整长微博正文</p>","isLongText":true},'
+        '"call":"ok","other":{"x":1}}</script>'
+    )
+    status = _embedded_status_from_detail(html)
+    assert status is not None
+    assert status["id"] == "42"
+    assert "完整长微博正文" in status["text"]
+
+
+def _fixture_bytes(name: str) -> bytes:
+    return (ROOT / "tests" / "fixtures" / name).read_bytes()
+
+
+def _longtext_client(fake_request):
+    import threading
+
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *args, **kwargs: None,
+    )
+    client._wait_random = lambda *args: None
+    client.http.request = fake_request
+    return client
+
+
+def test_network_non_json_diagnostic_has_no_body_or_query():
+    http = HttpClient()
+    body = _fixture_bytes("longtext_no_permission.html")
+    query_secret = "fixture_query_secret"
+
+    http.request = lambda *args, **kwargs: ResponseData(
+        body=body,
+        url=(
+            "https://m.weibo.cn/statuses/extend"
+            f"?id=9000000000000001&alt={query_secret}"
+        ),
+        status=200,
+        content_type="text/html",
+    )
+
+    try:
+        http.json_response("https://m.weibo.cn/statuses/extend")
+    except InvalidResponse as exc:
+        diagnostic = exc.diagnostic
+        assert diagnostic is not None
+        assert diagnostic.classification == "no_view_permission_html"
+        assert diagnostic.host == "m.weibo.cn"
+        assert diagnostic.path == "/statuses/extend"
+        assert diagnostic.status == 200
+        assert diagnostic.content_type == "text/html"
+        assert diagnostic.body_bytes == len(body)
+        rendered = str(exc) + repr(diagnostic)
+        assert query_secret not in rendered
+        assert "暂无查看权限" not in rendered
+        assert "?" not in diagnostic.path
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+    else:
+        raise AssertionError("HTML permission page was accepted as JSON")
+
+
+def test_performance_constants_and_adaptive_network_backoff():
+    import threading
+    import urllib.error
+
+    assert PAGE_SIZE == 100
+    assert PAGE_DELAY == (0.2, 0.5)
+    assert LONGTEXT_DELAY == (0.2, 0.4)
+    assert BATCH_POSTS == 1000
+    assert BATCH_DELAY == 3.0
+    assert SESSION_POSTS == 2000
+    assert SESSION_REST == 120.0
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(
+            self,
+            url="https://m.weibo.cn/api/container/getIndex",
+            *,
+            body=b"{}",
+            content_type="application/json",
+        ):
+            self.url = url
+            self.body = body
+            self.headers = {"Content-Type": content_type}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+        def geturl(self):
+            return self.url
+
+    class SequenceOpener:
+        def __init__(self, outcomes):
+            self.outcomes = list(outcomes)
+            self.calls = 0
+
+        def open(self, _request, timeout=None):
+            self.calls += 1
+            if not self.outcomes:
+                raise AssertionError("unexpected extra request attempt")
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    def http_error(code):
+        return urllib.error.HTTPError(
+            "https://m.weibo.cn/api/container/getIndex?fixture=secret",
+            code,
+            "fixture error",
+            {"Content-Type": "application/json"},
+            None,
+        )
+
+    def configured_http(
+        outcomes,
+        *,
+        retry_notice=None,
+        cancel_event=None,
+        mock_wait=True,
+    ):
+        http = HttpClient(
+            cancel_event=cancel_event,
+            retry_notice=retry_notice,
+        )
+        opener = SequenceOpener(outcomes)
+        waits = []
+        http.opener = opener
+        if mock_wait:
+            http.wait = waits.append
+        return http, opener, waits
+
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(403), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 403
+        assert exc.__cause__ is None
+        assert exc.__context__ is None
+    else:
+        raise AssertionError("HTTP 403 was retried or accepted")
+    assert opener.calls == 1
+    assert waits == []
+    assert notices == []
+
+    challenge = "<html>安全验证</html>".encode("utf-8")
+    http, opener, waits = configured_http(
+        [FakeResponse(body=challenge, content_type="text/html")]
+    )
+    try:
+        http.json_response("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except ChallengeRequired as exc:
+        assert exc.diagnostic.classification == "challenge_html"
+    else:
+        raise AssertionError("challenge HTML was accepted")
+    assert opener.calls == 1
+    assert waits == []
+
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(429), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 2
+    assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
+    assert notices == [(429, waits[0])]
+
+    http, opener, waits = configured_http(
+        [http_error(429), http_error(429), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 429
+    else:
+        raise AssertionError("repeated HTTP 429 was accepted")
+    assert opener.calls == 2
+    assert len(waits) == 1 and 60.0 <= waits[0] <= 120.0
+
+    notices = []
+    http, opener, waits = configured_http(
+        [http_error(432), FakeResponse()],
+        retry_notice=lambda status, seconds: notices.append((status, seconds)),
+    )
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 2
+    assert waits == [120.0]
+    assert notices == [(432, 120.0)]
+
+    http, opener, waits = configured_http(
+        [http_error(432), http_error(432), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except RateLimited as exc:
+        assert exc.diagnostic.status == 432
+    else:
+        raise AssertionError("repeated HTTP 432 was accepted")
+    assert opener.calls == 2
+    assert waits == [120.0]
+
+    transient = lambda: urllib.error.URLError(TimeoutError("fixture timeout"))
+    http, opener, waits = configured_http(
+        [transient(), transient(), FakeResponse()]
+    )
+    response = http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    assert response.status == 200
+    assert opener.calls == 3
+    assert waits == [1.0, 3.0]
+    class FakeClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, seconds):
+            self.value += seconds
+
+    clock = FakeClock()
+    metrics = PerformanceMetrics(clock=clock)
+    metrics.begin()
+    for elapsed in (1.0, 3.0, 9.0):
+        metrics.record_request("longtext_extend", elapsed)
+    metrics.record_planned_wait("page_pacing", 2.0)
+    metrics.record_planned_wait("longtext_pacing", 3.0)
+    metrics.record_retry_wait("ordinary_backoff", 2.0)
+    metrics.increment_longtext("unique_attempted")
+    metrics.increment_longtext("extend_success")
+    metrics.increment_error("ordinary_retry")
+    clock.advance(25.0)
+    metrics.finish(successful=True)
+    snapshot = metrics.snapshot()
+    assert snapshot["status"] == "fetch_success"
+    assert snapshot["total_wall_time"] == 25.0
+    assert snapshot["request_time"] == 13.0
+    assert snapshot["planned_wait_time"] == 5.0
+    assert snapshot["retry_wait_time"] == 2.0
+    assert snapshot["other_time"] == 5.0
+    assert snapshot["request_count"] == 3
+    assert snapshot["requests"]["longtext_extend"] == {
+        "count": 3,
+        "mean": 13.0 / 3.0,
+        "p50": 3.0,
+        "p95": 9.0,
+    }
+    rendered = metrics.render()
+    for forbidden in (
+        "SUB=",
+        "Cookie",
+        "credential",
+        "containerid",
+        "post_id",
+        "fixture-secret",
+    ):
+        assert forbidden not in rendered
+
+    failed = PerformanceMetrics(clock=clock)
+    failed.begin()
+    clock.advance(1.0)
+    failed.finish(successful=False)
+    assert failed.snapshot()["status"] == "fetch_failed"
+    assert "status: fetch_failed" in failed.render()
+    assert "status: fetch_success" not in failed.render()
+
+    class FakeResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            clock.advance(2.5)
+            return b"{}"
+
+        def geturl(self):
+            return "https://m.weibo.cn/api/container/getIndex"
+
+    timed = PerformanceMetrics(clock=clock)
+    http = HttpClient(cancel_event=threading.Event(), performance=timed)
+    http.opener = type("Opener", (), {"open": lambda *_args, **_kwargs: FakeResponse()})()
+    http.request(
+        "https://m.weibo.cn/api/container/getIndex",
+        performance_category="timeline",
+    )
+    assert timed.snapshot()["requests"]["timeline"]["p50"] == 2.5
+
+    outcomes = [
+        urllib.error.URLError(TimeoutError("fixture timeout")),
+        FakeResponse(),
+    ]
+
+    class RetryOpener:
+        def open(self, *_args, **_kwargs):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                clock.advance(0.5)
+                raise outcome
+            return outcome
+
+    retried = PerformanceMetrics(clock=clock)
+    retry_http = HttpClient(cancel_event=threading.Event(), performance=retried)
+    retry_http.opener = RetryOpener()
+    retry_http.wait = clock.advance
+    retry_http.request(
+        "https://m.weibo.cn/api/container/getIndex",
+        retries=2,
+        performance_category="timeline",
+    )
+    retry_snapshot = retried.snapshot()
+    assert retry_snapshot["requests"]["timeline"]["count"] == 2
+    assert retry_snapshot["retry_waits"]["ordinary_backoff"] == 1.0
+    assert retry_snapshot["planned_wait_time"] == 0.0
+    assert retry_snapshot["errors"]["ordinary_retry"] == 1
+
+    spacing_clock = FakeClock()
+    spacing = PerformanceMetrics(clock=spacing_clock)
+    spacing.note_request_start()
+    spacing_clock.advance(0.1)
+    assert abs(spacing.remaining_start_spacing(0.3) - 0.2) < 1e-9
+    spacing_clock.advance(0.5)
+    assert spacing.remaining_start_spacing(0.3) == 0.0
+    assert spacing.remaining_start_spacing(-1.0) == 0.0
+
+    paced_client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    paced_client.performance = PerformanceMetrics(clock=spacing_clock)
+    paced_client.http.performance = paced_client.performance
+    waits = []
+    paced_client.http.wait = waits.append
+    original_uniform = __import__("weibo_archive.client", fromlist=["random"]).random.uniform
+    __import__("weibo_archive.client", fromlist=["random"]).random.uniform = (
+        lambda _low, _high: 0.3
+    )
+    try:
+        paced_client.performance.note_request_start()
+        spacing_clock.advance(0.1)
+        paced_client._wait_random(0.2, 0.5, "page_pacing")
+        paced_client.performance.note_request_start()
+        spacing_clock.advance(0.8)
+        paced_client._wait_random(0.2, 0.5, "page_pacing")
+    finally:
+        __import__("weibo_archive.client", fromlist=["random"]).random.uniform = original_uniform
+    assert abs(waits[0] - 0.2) < 1e-9
+    assert waits[1] == 0.0
+    assert abs(paced_client.performance.planned_waits["page_pacing"] - 0.2) < 1e-9
+    assert paced_client.performance.retry_waits["ordinary_backoff"] == 0.0
+
+    progress = []
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda message, data=None: progress.append((message, data)),
+    )
+    client.http.retry_notice(429, 87.4)
+    assert progress == [
+        (
+            "微博暂时限制访问（HTTP 429），正在休息约 87 秒后重试…",
+            {"cooldown_status": 429, "cooldown_seconds": 87},
+        )
+    ]
+
+    cancel_event = threading.Event()
+    cancel_notices = []
+
+    def cancel_on_notice(status, seconds):
+        cancel_notices.append((status, seconds))
+        cancel_event.set()
+
+    http, opener, waits = configured_http(
+        [http_error(432), FakeResponse()],
+        retry_notice=cancel_on_notice,
+        cancel_event=cancel_event,
+        mock_wait=False,
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except Cancelled:
+        pass
+    else:
+        raise AssertionError("cancellation during cooldown was ignored")
+    assert opener.calls == 1
+    assert cancel_notices == [(432, 120.0)]
+
+    http, opener, waits = configured_http(
+        [transient(), transient(), transient(), FakeResponse()]
+    )
+    try:
+        http.request("https://m.weibo.cn/api/container/getIndex", retries=4)
+    except NetworkError as exc:
+        assert exc.diagnostic.classification == "timeout"
+    else:
+        raise AssertionError("ordinary transient failures exceeded the retry cap")
+    assert opener.calls == 3
+    assert waits == [1.0, 3.0]
+
+
+def test_non_json_classifier_prioritizes_challenge_and_login():
+    assert classify_non_json_response(
+        "<html>安全验证 暂无查看权限</html>",
+        "text/html",
+    ) == "challenge_html"
+    assert classify_non_json_response(
+        "<html>请登录 passport login 暂无查看权限</html>",
+        "text/html",
+    ) == "login_html"
+    assert classify_non_json_response(
+        "<html>暂无查看权限</html>",
+        "text/html",
+    ) == "no_view_permission_html"
+
+
+def test_authentication_expiry_classification_and_propagation():
+    import threading
+
+    login_html = "<html>请登录 passport login</html>".encode("utf-8")
+    challenge_html = "<html>安全验证 验证码</html>".encode("utf-8")
+
+    for body, expected in (
+        (login_html, AuthenticationExpired),
+        (challenge_html, ChallengeRequired),
+    ):
+        http = HttpClient()
+        http.request = lambda *_args, body=body, **_kwargs: ResponseData(
+            body=body,
+            url="https://m.weibo.cn/api/container/getIndex?fixture=secret",
+            status=200,
+            content_type="text/html",
+        )
+        try:
+            http.json_response("https://m.weibo.cn/api/container/getIndex")
+        except expected as exc:
+            assert exc.diagnostic.path == "/api/container/getIndex"
+            assert "fixture=secret" not in repr(exc.diagnostic)
+        else:
+            raise AssertionError("explicit login/challenge HTML lost its classification")
+
+    def profile_client(payload):
+        client = WeiboClient(
+            cookie_header="",
+            cancel_event=threading.Event(),
+            progress=lambda *_args, **_kwargs: None,
+        )
+        client.http.json = lambda *_args, **_kwargs: payload
+        return client
+
+    for payload in (
+        {"ok": 0, "msg": "请先登录"},
+        {"ok": 0, "url": "https://passport.weibo.cn/signin/login"},
+    ):
+        try:
+            profile_client(payload).fetch_profile("123")
+        except AuthenticationExpired:
+            pass
+        else:
+            raise AssertionError("explicit profile login evidence was not propagated")
+
+    try:
+        profile_client({"ok": 0, "msg": "请完成安全验证"}).fetch_profile("123")
+    except ChallengeRequired:
+        pass
+    else:
+        raise AssertionError("profile challenge incorrectly became login expiry")
+
+    try:
+        profile_client({"ok": 0, "url": "/ambiguous/next-step"}).fetch_profile("123")
+    except InvalidResponse:
+        pass
+    else:
+        raise AssertionError("ambiguous profile URL triggered automatic reauthentication")
+
+    for payload, expected in (
+        ({"ok": 0, "msg": "请重新登录"}, AuthenticationExpired),
+        ({"ok": 0, "url": "https://passport.weibo.cn/signin/login"}, AuthenticationExpired),
+        ({"ok": 0, "msg": "请完成安全验证"}, RateLimited),
+        ({"ok": 0, "url": "/ambiguous/next-step"}, InvalidResponse),
+    ):
+        timeline = WeiboClient(
+            cookie_header="",
+            cancel_event=threading.Event(),
+            progress=lambda *_args, **_kwargs: None,
+        )
+        timeline._wait_random = lambda *_args: None
+        timeline.http.json = lambda *_args, payload=payload, **_kwargs: payload
+        try:
+            timeline._timeline_page("123", 1)
+        except expected:
+            pass
+        else:
+            raise AssertionError("timeline authentication classification was ambiguous")
+
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=threading.Event(),
+        progress=lambda *_args, **_kwargs: None,
+    )
+    responses = iter(
+        [
+            {"data": {"userInfo": {"id": "123", "screen_name": "fixture"}}},
+            AuthenticationExpired("expired during optional profile detail"),
+        ]
+    )
+
+    def profile_sequence(*_args, **_kwargs):
+        outcome = next(responses)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    client.http.json = profile_sequence
+    client._wait_random = lambda *_args: None
+    try:
+        client.fetch_profile("123")
+    except AuthenticationExpired:
+        pass
+    else:
+        raise AssertionError("optional profile-detail catch swallowed login expiry")
+
+    extend_login = _longtext_client(
+        lambda url, **_kwargs: ResponseData(login_html, url, 200, "text/html")
+    )
+    try:
+        extend_login._fetch_full_text_html({"id": "42"})
+    except AuthenticationExpired:
+        assert not extend_login.unavailable_cache
+        assert not extend_login.long_text_diagnostics
+    else:
+        raise AssertionError("extend login expiry became long-text incompleteness")
+
+    def login_on_detail(url, **_kwargs):
+        if url.endswith("/statuses/extend"):
+            return ResponseData(
+                b'{"ok":1,"data":{}}',
+                url,
+                200,
+                "application/json",
+            )
+        return ResponseData(login_html, url, 200, "text/html")
+
+    detail_login = _longtext_client(login_on_detail)
+    try:
+        detail_login._fetch_full_text_html({"id": "42"})
+    except AuthenticationExpired:
+        assert not detail_login.unavailable_cache
+        assert "42" not in detail_login.long_text_diagnostics
+    else:
+        raise AssertionError("detail login expiry became long-text incompleteness")
+
+
+def test_longtext_permission_failure_preserves_two_safe_attempts():
+    body = _fixture_bytes("longtext_no_permission.html")
+    calls = []
+
+    def fake_request(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/statuses/extend"):
+            final_url = url + "?id=9000000000000001&alt=fixture_query_secret"
+        else:
+            final_url = url
+        return ResponseData(
+            body=body,
+            url=final_url,
+            status=200,
+            content_type="text/html",
+        )
+
+    client = _longtext_client(fake_request)
+    raw = {
+        "id": "parent-post",
+        "text": "转发微博",
+        "retweeted_status": {
+            "id": "9000000000000001",
+            "isLongText": True,
+            "text": "只有列表摘要……全文",
+        },
+    }
+
+    try:
+        client._fetch_full_text_html(raw["retweeted_status"])
+    except ContentUnavailable as exc:
+        assert exc.post_id == "9000000000000001"
+        assert exc.reason is IncompleteReason.CONTENT_UNAVAILABLE
+        assert len(exc.attempts) == 2
+        assert [attempt.fallback for attempt in exc.attempts] == ["extend", "detail"]
+        assert [attempt.outcome for attempt in exc.attempts] == [
+            "no_view_permission_html",
+            "no_view_permission_html",
+        ]
+        assert all(attempt.status == 200 for attempt in exc.attempts)
+        assert all(attempt.content_type == "text/html" for attempt in exc.attempts)
+        assert all(attempt.body_bytes == len(body) for attempt in exc.attempts)
+        rendered = str(exc)
+        assert "fixture_query_secret" not in rendered
+        assert "暂无查看权限" not in rendered
+        assert "只有列表摘要" not in rendered
+        assert "9000000000000001" not in client.long_text_cache
+        assert client.long_text_diagnostics["9000000000000001"] == exc.attempts
+    else:
+        raise AssertionError("permission failure silently returned truncated content")
+
+    assert calls == [
+        "https://m.weibo.cn/statuses/extend",
+        "https://m.weibo.cn/detail/9000000000000001",
+    ]
+
+
+def test_longtext_mixed_or_challenge_outcomes_remain_fatal():
+    permission = _fixture_bytes("longtext_no_permission.html")
+    unknown = _fixture_bytes("longtext_detail_missing_status.html")
+    timeout = NetworkError(
+        "timeout",
+        diagnostic=SafeRequestDiagnostic(
+            classification="timeout",
+            host="m.weibo.cn",
+            path="/detail/42",
+        ),
+    )
+
+    cases = []
+
+    def permission_then_timeout(url, **kwargs):
+        if url.endswith("/statuses/extend"):
+            return ResponseData(permission, url, 200, "text/html")
+        raise timeout
+
+    cases.append((permission_then_timeout, ["no_view_permission_html", "timeout"]))
+
+    def permission_then_unknown(url, **kwargs):
+        body = permission if url.endswith("/statuses/extend") else unknown
+        return ResponseData(body, url, 200, "text/html")
+
+    cases.append(
+        (permission_then_unknown, ["no_view_permission_html", "embedded_status_absent"])
+    )
+
+    challenge = "<html>安全验证 暂无查看权限</html>".encode("utf-8")
+
+    def challenge_with_permission_marker(url, **kwargs):
+        return ResponseData(challenge, url, 200, "text/html")
+
+    cases.append((challenge_with_permission_marker, ChallengeRequired))
+
+    login = "<html>请登录 passport login 暂无查看权限</html>".encode("utf-8")
+
+    def login_with_permission_marker(url, **kwargs):
+        return ResponseData(login, url, 200, "text/html")
+
+    cases.append((login_with_permission_marker, AuthenticationExpired))
+
+    for fake_request, expected in cases[:2]:
+        client = _longtext_client(fake_request)
+        try:
+            client._fetch_full_text_html({"id": "42"})
+        except ContentUnavailable:
+            raise AssertionError("mixed/challenge response became recoverable")
+        except IncompleteContent as exc:
+            assert [attempt.outcome for attempt in exc.attempts] == expected
+            assert "42" not in client.unavailable_cache
+        else:
+            raise AssertionError("mixed/challenge response was accepted")
+
+    for fake_request, expected_exception in cases[2:]:
+        client = _longtext_client(fake_request)
+        try:
+            client._fetch_full_text_html({"id": "42"})
+        except expected_exception:
+            assert "42" not in client.unavailable_cache
+            assert "42" not in client.long_text_diagnostics
+        else:
+            raise AssertionError("session-wide login/challenge response was swallowed")
+
+
+def test_longtext_cancelled_is_not_converted_to_incomplete():
+    import threading
+
+    cancel = threading.Event()
+    cancel.set()
+    client = WeiboClient(
+        cookie_header="",
+        cancel_event=cancel,
+        progress=lambda *args, **kwargs: None,
+    )
+    try:
+        client._fetch_full_text_html({"id": "42"})
+    except Cancelled:
+        assert not client.unavailable_cache
+    else:
+        raise AssertionError("cancelled long-text acquisition did not remain cancelled")
+
+
+def test_unavailable_negative_cache_is_deterministic():
+    permission = _fixture_bytes("longtext_no_permission.html")
+    calls = []
+
+    def fake_request(url, **kwargs):
+        calls.append(url)
+        return ResponseData(permission, url, 200, "text/html")
+
+    client = _longtext_client(fake_request)
+    raw = {
+        "id": "parent",
+        "text": "用户评论",
+        "retweeted_status": {
+            "id": "9000000000000001",
+            "isLongText": True,
+            "text": "列表预览……全文",
+        },
+    }
+
+    for _ in range(5):
+        outcome = client._hydrate_long_texts(raw)
+        assert outcome.retweet_incomplete_reason is IncompleteReason.CONTENT_UNAVAILABLE
+
+    assert len(calls) == 2
+    assert client.unique_long_text_attempted == 1
+    assert client.unique_content_unavailable == 1
+    assert client.unavailable_cache == {
+        "9000000000000001": IncompleteReason.CONTENT_UNAVAILABLE
+    }
+    assert "9000000000000001" not in client.long_text_cache
+
+
+def test_top_and_retweet_hydration_states_are_independent():
+    raw = {
+        "id": "top",
+        "isLongText": True,
+        "text": "顶层预览……全文",
+        "user": {"screen_name": "用户"},
+        "retweeted_status": {
+            "id": "retweet",
+            "isLongText": True,
+            "text": "转发预览……全文",
+            "user": {"screen_name": "原作者"},
+        },
+    }
+
+    for unavailable_ids, expected_states in (
+        ({"retweet"}, (ContentState.COMPLETE, ContentState.INCOMPLETE)),
+        ({"top"}, (ContentState.INCOMPLETE, ContentState.COMPLETE)),
+        ({"top", "retweet"}, (ContentState.INCOMPLETE, ContentState.INCOMPLETE)),
+    ):
+        client = _longtext_client(lambda *args, **kwargs: None)
+        calls = []
+
+        def fetch_full(node):
+            post_id = str(node["id"])
+            calls.append(post_id)
+            if post_id in unavailable_ids:
+                raise ContentUnavailable(
+                    post_id,
+                    reason=IncompleteReason.CONTENT_UNAVAILABLE,
+                )
+            return f"<p>{post_id} 的完整正文</p>"
+
+        client._fetch_full_text_html = fetch_full
+        before = copy.deepcopy(raw)
+        outcome = client._hydrate_long_texts(raw)
+        post = parse_post(
+            outcome.raw,
+            incomplete_reason=outcome.top_incomplete_reason,
+            retweet_incomplete_reason=outcome.retweet_incomplete_reason,
+        )
+        client._validate_post_hydration(post, outcome)
+        assert (post.content_state, post.retweet.content_state) == expected_states
+        assert calls == ["top", "retweet"]
+        assert raw == before
+
+
+def test_runtime_post_parse_validation_fails_closed():
+    client = _longtext_client(lambda *args, **kwargs: None)
+    complete = build_archive().posts[0]
+
+    for outcome in (
+        HydrationOutcome(
+            raw={},
+            top_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+        ),
+        HydrationOutcome(
+            raw={},
+            retweet_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+        ),
+    ):
+        try:
+            client._validate_post_hydration(complete, outcome)
+        except IncompleteContent:
+            pass
+        else:
+            raise AssertionError("parser safety regression was not rejected")
+
+
+def test_longtext_global_safety_fuse_thresholds_and_unique_ids():
+    attempts = (
+        type("Attempt", (), {"summary": lambda self: "safe"})(),
+    )
+
+    consecutive = _longtext_client(lambda *args, **kwargs: None)
+    for post_id in ("1", "2"):
+        consecutive._begin_long_text_acquisition(post_id)
+        consecutive._record_content_unavailable(post_id, attempts)
+    consecutive._begin_long_text_acquisition("3")
+    try:
+        consecutive._record_content_unavailable("3", attempts)
+    except IncompleteContent as exc:
+        assert "连续 3 个" in str(exc)
+    else:
+        raise AssertionError("three consecutive unavailable IDs did not trip fuse")
+
+    ratio = _longtext_client(lambda *args, **kwargs: None)
+    ratio._begin_long_text_acquisition("1")
+    ratio._record_content_unavailable("1", attempts)
+    for post_id in ("2", "3", "4"):
+        ratio._begin_long_text_acquisition(post_id)
+        ratio._record_long_text_success()
+    ratio._begin_long_text_acquisition("5")
+    try:
+        ratio._record_content_unavailable("5", attempts)
+    except IncompleteContent:
+        assert ratio.unique_content_unavailable == 2
+        assert ratio.unique_long_text_attempted == 5
+    else:
+        raise AssertionError("more than 20 percent unavailable did not trip fuse")
+
+    ratio_crossed_by_success = _longtext_client(lambda *args, **kwargs: None)
+    for post_id, unavailable in (
+        ("1", True),
+        ("2", False),
+        ("3", True),
+        ("4", False),
+    ):
+        ratio_crossed_by_success._begin_long_text_acquisition(post_id)
+        if unavailable:
+            ratio_crossed_by_success._record_content_unavailable(post_id, attempts)
+        else:
+            ratio_crossed_by_success._record_long_text_success()
+    ratio_crossed_by_success._begin_long_text_acquisition("5")
+    try:
+        ratio_crossed_by_success._record_long_text_success()
+    except IncompleteContent:
+        assert ratio_crossed_by_success.unique_content_unavailable == 2
+        assert ratio_crossed_by_success.unique_long_text_attempted == 5
+        assert ratio_crossed_by_success.consecutive_unique_unavailable == 0
+    else:
+        raise AssertionError("ratio crossing on a successful fifth ID did not trip fuse")
+
+    sparse = _longtext_client(lambda *args, **kwargs: None)
+    for number in range(1, 1001):
+        post_id = str(number)
+        sparse._begin_long_text_acquisition(post_id)
+        if number in (1, 500, 1000):
+            sparse._record_content_unavailable(post_id, attempts)
+        else:
+            sparse._record_long_text_success()
+    sparse._begin_long_text_acquisition("1000")
+    sparse._record_content_unavailable("1000", attempts)
+    assert sparse.unique_long_text_attempted == 1000
+    assert sparse.unique_content_unavailable == 3
+
+
+def test_longtext_detail_fallback_success_after_extend_schema_failure():
+    extend_body = _fixture_bytes("longtext_extend_missing_content.json")
+    detail_body = _fixture_bytes("longtext_detail_success.html")
+    calls = []
+
+    def fake_request(url, **kwargs):
+        calls.append(url)
+        if url.endswith("/statuses/extend"):
+            return ResponseData(
+                extend_body,
+                url + "?id=9000000000000001",
+                200,
+                "application/json",
+            )
+        return ResponseData(detail_body, url, 200, "text/html")
+
+    client = _longtext_client(fake_request)
+    content = client._fetch_full_text_html({"id": "9000000000000001"})
+    assert content == "<p>详情页中的完整长微博正文</p>"
+    attempts = client.long_text_diagnostics["9000000000000001"]
+    assert [attempt.outcome for attempt in attempts] == [
+        "json_missing_full_text",
+        "success",
+    ]
+    assert attempts[0].json_keys == ("data", "ok")
+    assert attempts[0].data_keys == (
+        "attitudes_count",
+        "comments_count",
+        "reposts_count",
+    )
+    assert attempts[1].embedded_status_present is True
+    assert attempts[1].id_matches is True
+    assert len(calls) == 2
+
+
+def test_longtext_extend_supported_shapes_do_not_call_detail():
+    cases = (
+        ("longtext_extend_success.json", "data.longTextContent"),
+        ("longtext_extend_nested_success.json", "data.longText.longTextContent"),
+    )
+    for fixture, expected_field in cases:
+        body = _fixture_bytes(fixture)
+        calls = []
+
+        def fake_request(url, **kwargs):
+            calls.append(url)
+            if not url.endswith("/statuses/extend"):
+                raise AssertionError("detail fallback should not run after extend success")
+            return ResponseData(
+                body,
+                url + "?id=9000000000000001",
+                200,
+                "application/json",
+            )
+
+        client = _longtext_client(fake_request)
+        content = client._fetch_full_text_html({"id": "9000000000000001"})
+        assert "完整长微博正文" in content
+        attempts = client.long_text_diagnostics["9000000000000001"]
+        assert len(attempts) == 1
+        assert attempts[0].outcome == "success"
+        assert attempts[0].content_field == expected_field
+        assert attempts[0].content_chars == len(content)
+        assert "9000000000000001" not in client.unavailable_cache
+        assert calls == ["https://m.weibo.cn/statuses/extend"]
+
+
+def test_longtext_detail_id_mismatch_fails_closed():
+    extend_body = _fixture_bytes("longtext_extend_missing_content.json")
+    detail_body = _fixture_bytes("longtext_detail_success.html").replace(
+        b'"9000000000000001"', b'"9999999999999999"'
+    )
+
+    def fake_request(url, **kwargs):
+        if url.endswith("/statuses/extend"):
+            return ResponseData(extend_body, url, 200, "application/json")
+        return ResponseData(detail_body, url, 200, "text/html")
+
+    client = _longtext_client(fake_request)
+    try:
+        client._fetch_full_text_html({"id": "9000000000000001"})
+    except IncompleteContent as exc:
+        assert exc.attempts[-1].outcome == "embedded_status_id_mismatch"
+        assert exc.attempts[-1].embedded_status_present is True
+        assert exc.attempts[-1].id_matches is False
+        assert "9000000000000001" not in client.long_text_cache
+    else:
+        raise AssertionError("mismatched embedded status was accepted as full text")
+
+
+def test_longtext_unknown_detail_schema_fails_closed():
+    extend_body = _fixture_bytes("longtext_extend_missing_content.json")
+    detail_body = _fixture_bytes("longtext_detail_missing_status.html")
+
+    def fake_request(url, **kwargs):
+        if url.endswith("/statuses/extend"):
+            return ResponseData(extend_body, url, 200, "application/json")
+        return ResponseData(detail_body, url, 200, "text/html")
+
+    client = _longtext_client(fake_request)
+    try:
+        client._fetch_full_text_html({"id": "9000000000000001"})
+    except IncompleteContent as exc:
+        assert [attempt.outcome for attempt in exc.attempts] == [
+            "json_missing_full_text",
+            "embedded_status_absent",
+        ]
+        assert exc.attempts[-1].embedded_status_present is False
+        assert "9000000000000001" not in client.long_text_cache
+    else:
+        raise AssertionError("unknown detail schema was treated as complete content")
+
+
+def test_exporter_golden():
+    archive = build_archive()
+    expected_full = (ROOT / "tests/golden/model_full.md").read_text(encoding="utf-8")
+    expected_ai = (ROOT / "tests/golden/model_ai.md").read_text(encoding="utf-8")
+
+    full_text, _ = render_legacy_markdown(archive)
+    _, ai_text = render_legacy_markdown(
+        replace(archive, fetch_range=FetchRange.trial(20))
+    )
+    assert full_text == expected_full
+    assert ai_text == expected_ai
+
+
+def test_alpha3_exporter_goldens_and_single_output():
+    archive = build_alpha3_archive()
+    cases = (
+        (
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+            "model_alpha3_full.md",
+        ),
+        (
+            AI_COMPACT_OPTIONS,
+            "AI分析版",
+            "model_alpha3_ai.md",
+        ),
+        (
+            ExportOptions(
+                layout=ExportLayout.FULL,
+                include_source=False,
+                include_location=False,
+                include_engagement=False,
+                date_format=DateFormat.DATE_ONLY,
+            ),
+            "自定义_完整",
+            "model_alpha3_custom_minimal.md",
+        ),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_export_") as td:
+        output_dir = Path(td)
+        for options, suffix, golden_name in cases:
+            for existing in output_dir.glob("*.md"):
+                existing.unlink()
+            expected = (ROOT / "tests/golden" / golden_name).read_text(encoding="utf-8")
+            render_archive = (
+                replace(archive, fetch_range=FetchRange.trial(20))
+                if options.layout is ExportLayout.AI
+                else archive
+            )
+            output, stats = export_markdown(render_archive, output_dir, options, suffix)
+            assert output.read_text(encoding="utf-8") == expected
+            assert stats["count"] == 3
+            expected_range = "测试导出20条" if options.layout is ExportLayout.AI else "测试导出50条"
+            assert expected_range in output.name
+            assert list(output_dir.glob("*.md")) == [output]
+
+
+def test_alpha4_incomplete_full_and_ai_goldens():
+    archive = build_alpha4_archive()
+    cases = (
+        (FULL_ARCHIVE_OPTIONS, "完整", "model_alpha4_incomplete_full.md"),
+        (AI_COMPACT_OPTIONS, "AI分析版", "model_alpha4_incomplete_ai.md"),
+    )
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_alpha4_export_") as td:
+        output_dir = Path(td)
+        for options, suffix, golden_name in cases:
+            expected = (ROOT / "tests/golden" / golden_name).read_text(encoding="utf-8")
+            render_archive = (
+                replace(archive, fetch_range=FetchRange.trial(20))
+                if options.layout is ExportLayout.AI
+                else archive
+            )
+            output, stats = export_markdown(render_archive, output_dir, options, suffix)
+            rendered = output.read_text(encoding="utf-8")
+            assert rendered == expected
+            assert stats["count"] == 3
+            assert "全文无法验证" in rendered
+            assert "列表预览……全文" in rendered
+
+
+def test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview():
+    from weibo_archive import markdown_v5
+
+    archive = build_archive()
+    retweet = _as_incomplete(archive.posts[0].retweet, None)
+    first = replace(archive.posts[0], id="2001", retweet=retweet)
+    second = replace(archive.posts[0], id="2002", retweet=retweet)
+    data = archive_to_legacy_data(replace(archive, posts=(first, second)))
+
+    text, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert text.count("CONTENT=INCOMPLETE") == 2
+    assert text.count("PREVIEW_ONLY") == 1  # schema rule only; no preview exists
+    assert ">[PREVIEW_ONLY｜全文无法验证]" not in text
+    assert "UNAVAILABLE" not in text
+    assert any(line.startswith(">[=RT1｜") for line in text.splitlines())
+    assert stats["unique_retweets"] == 1
+    assert stats["duplicate_retweets"] == 1
+
+
+def test_ai_compact_attribution_and_field_schema():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    posts = list(archive.posts)
+    posts[1] = replace(
+        posts[1],
+        media=MediaInfo(images=3, videos=2, article=True),
+    )
+    data = archive_to_legacy_data(replace(archive, posts=tuple(posts)))
+    text, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+
+    assert "FORMAT=WEIBO_AI_1" in text
+    assert "VISIBILITY: VIS on W" in text
+    assert "STRUCTURE: W is a top-level rendered record;" in text
+    assert "SELF requires exact non-empty UID equality" in text
+    assert "//@ text is preserved but unparsed" in text
+    assert "P alone does not prove event location" in text
+    assert "known source offset is preserved" in text
+    assert "UNKNOWN is not zero" in text
+    assert "referenced media is not included" in text
+    assert "PREVIEW_ONLY is INCOMPLETE and not full text" in text
+    assert "TEXT=EMPTY is a verified complete empty body" in text
+    assert (
+        'ABSENT: Missing I/V/A means canonical zero/false. Missing S/P means unavailable or '
+        'not emitted by this export configuration, not "no source/location".'
+    ) in text
+    assert "SOURCE_IDS=file-local" in text
+    assert "=RT* omits only a body identical to the first RT* body" in text
+    assert "must not be inherited from another" in text
+    rule_order = [
+        "ATTRIBUTION:",
+        "VISIBILITY:",
+        "TEXT_CHAIN:",
+        "MEDIA:",
+        "CONTENT:",
+        "TIME:",
+        "P:",
+        "STRUCTURE:",
+        "ENGAGEMENT:",
+        "ABSENT:",
+        "SOURCE_IDS=",
+        "REFERENCE:",
+        "AGGREGATES:",
+    ]
+    assert [text.index(f"\n{rule}") for rule in rule_order] == sorted(
+        text.index(f"\n{rule}") for rule in rule_order
+    )
+    assert "TIME_TZ=" not in text
+    assert "来源字典：S1=" in text
+    assert "来源3种" not in text
+    assert "客户端(" not in text
+    assert "摘要：共3条" in text
+    assert stats["count"] == 3
+    assert stats["unique_retweets"] == 1
+
+    lines = text.splitlines()
+    rich_top = next(line for line in lines if "P=上海" in line)
+    assert rich_top == "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3 V2 A1｜R=3 C=0 L=21]"
+    repost = next(line for line in lines if line.startswith(">[RT1"))
+    assert repost == ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99]"
+    assert all(line.startswith("[W｜") for line in lines if line.startswith("[W"))
+    assert "｜地=" not in text
+    assert "地=发布位置" not in text
+
+    incomplete_data = archive_to_legacy_data(build_alpha4_archive())
+    incomplete_text, _, _ = markdown_v5.build_ai_markdown(
+        incomplete_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3｜R=3 C=0 L=21｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert ">[RT1｜@原作者｜2026-08-10 12:00｜S2｜P=广州｜I1｜R=12 C=8 L=99｜CONTENT=INCOMPLETE]" in incomplete_text
+    assert incomplete_text.count("PREVIEW_ONLY") == 3  # one rule plus two records
+
+    empty_post = replace(archive.posts[1], text="")
+    empty_data = archive_to_legacy_data(replace(archive, posts=(empty_post,)))
+    empty_text, _, empty_stats = markdown_v5.build_ai_markdown(
+        empty_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "[W｜2026-08-12 18:30｜VIS=PUBLIC｜S1｜P=上海｜I3｜R=3 C=0 L=21｜TEXT=EMPTY]" in empty_text
+    assert "仅媒体1条" in empty_text
+    assert "[PREVIEW_ONLY｜" not in empty_text
+    assert empty_stats["media_only_posts"] == 1
+
+
+def test_semantic_time_provenance_and_presentation_contract():
+    source = "Thu Aug 13 00:10:00 +0800 2026"
+    for simulated_local in (
+        datetime(2026, 8, 13, tzinfo=timezone.utc),
+        datetime(2026, 8, 13, tzinfo=timezone(timedelta(hours=8))),
+    ):
+        parsed, provenance = parse_created_at_fact(source, now=simulated_local)
+        assert parsed.isoformat() == "2026-08-13T00:10:00+08:00"
+        assert provenance is TimestampProvenance.SOURCE_OFFSET
+
+    wall, provenance = parse_created_at_fact("2026-08-13 00:10:00")
+    assert wall.isoformat() == "2026-08-13T00:10:00"
+    assert wall.tzinfo is None
+    assert provenance is TimestampProvenance.SOURCE_WALL
+
+    fixed_now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+    expected = {
+        "刚刚": datetime(2026, 8, 13, 12, 0),
+        "5分钟前": datetime(2026, 8, 13, 11, 55),
+        "5小时前": datetime(2026, 8, 13, 7, 0),
+        "昨天 05:30": datetime(2026, 8, 12, 5, 30),
+    }
+    for raw, expected_value in expected.items():
+        parsed, provenance = parse_created_at_fact(raw, now=fixed_now)
+        assert parsed == expected_value and parsed.tzinfo is None
+        assert provenance is TimestampProvenance.RELATIVE_UNVERIFIED
+    assert parse_created_at_fact("UNKNOWN") == (
+        None,
+        TimestampProvenance.UNKNOWN,
+    )
+
+    archive = build_alpha3_archive()
+    plus_eight = timezone(timedelta(hours=8))
+    top = replace(
+        archive.posts[0],
+        created_at=datetime(2026, 8, 13, 0, 10, tzinfo=plus_eight),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        retweet=replace(
+            archive.posts[0].retweet,
+            created_at=datetime(2026, 8, 10, 12, 0, tzinfo=plus_eight),
+            created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        ),
+    )
+    archive = replace(archive, posts=(top,))
+    data = archive_to_legacy_data(archive)
+    from weibo_archive import markdown_v5
+
+    full, _, _ = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    ai, _, _ = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "## 2026-08-13 00:10+08:00" in full
+    assert "日期：2026-08-10 12:00+08:00" in full
+    assert "[W｜2026-08-13 00:10+08:00｜" in ai
+    assert "2026-08-10 12:00+08:00" in ai
+    rules_start = ai.index("ATTRIBUTION:")
+    rules_end = ai.index("\n", ai.index("AGGREGATES:"))
+    assert "+08:00" not in ai[rules_start:rules_end]
+
+    nonlocal_source = "Thu Aug 13 00:10:00 -1000 2026"
+    nonlocal_time, provenance = parse_created_at_fact(nonlocal_source)
+    assert nonlocal_time.isoformat() == "2026-08-13T00:10:00-10:00"
+    assert provenance is TimestampProvenance.SOURCE_OFFSET
+    minus_ten = replace(
+        top,
+        created_at=nonlocal_time,
+        created_at_provenance=provenance,
+        retweet=None,
+    )
+    nonlocal_data = archive_to_legacy_data(replace(archive, posts=(minus_ten,)))
+    nonlocal_full, _, _ = markdown_v5.build_markdown(
+        nonlocal_data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    nonlocal_ai, _, _ = markdown_v5.build_ai_markdown(
+        nonlocal_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "## 2026-08-13 00:10-10:00" in nonlocal_full
+    assert "[W｜2026-08-13 00:10-10:00｜" in nonlocal_ai
+
+    date_only = ExportOptions(layout=ExportLayout.AI, date_format=DateFormat.DATE_ONLY)
+    date_only_ai, _, _ = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        date_only,
+    )
+    assert "2026-08-13 TZ=+08:00" in date_only_ai
+
+    relative = replace(
+        top,
+        created_at=datetime(2026, 8, 13, 0, 10),
+        created_at_provenance=TimestampProvenance.RELATIVE_UNVERIFIED,
+    )
+    relative_data = archive_to_legacy_data(replace(archive, posts=(relative,)))
+    relative_ai, _, _ = markdown_v5.build_ai_markdown(
+        relative_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "TIME_BASIS=RELATIVE_UNVERIFIED" in relative_ai
+
+    later_wall_earlier_utc = replace(
+        top,
+        id="100",
+        created_at=datetime(
+            2026, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=14))
+        ),
+    )
+    earlier_wall_later_utc = replace(
+        top,
+        id="200",
+        created_at=datetime(
+            2026, 8, 13, 9, 0, tzinfo=timezone(timedelta(hours=-10))
+        ),
+    )
+    assert _post_presentation_sort_key(later_wall_earlier_utc) > (
+        _post_presentation_sort_key(earlier_wall_later_utc)
+    )
+    assert later_wall_earlier_utc.created_at.astimezone(timezone.utc) < (
+        earlier_wall_later_utc.created_at.astimezone(timezone.utc)
+    )
+    ordering_data = archive_to_legacy_data(
+        replace(
+            archive,
+            posts=(earlier_wall_later_utc, later_wall_earlier_utc),
+        )
+    )
+    ordering_ai, _, _ = markdown_v5.build_ai_markdown(
+        ordering_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    ordering_lines = [
+        line for line in ordering_ai.splitlines() if line.startswith("[W｜")
+    ]
+    assert "2026-08-13 10:00+14:00" in ordering_lines[0]
+    assert "2026-08-13 09:00-10:00" in ordering_lines[1]
+
+    mixed_offset = replace(
+        top,
+        id="9004",
+        created_at=datetime(
+            2099, 8, 13, 10, 0, tzinfo=timezone(timedelta(hours=14))
+        ),
+        retweet=None,
+    )
+    mixed_relative = replace(
+        top,
+        id="9003",
+        created_at=datetime(2026, 8, 13, 9, 30),
+        created_at_provenance=TimestampProvenance.RELATIVE_UNVERIFIED,
+        retweet=None,
+    )
+    mixed_wall = replace(
+        top,
+        id="9001",
+        created_at=datetime(2000, 8, 13, 9, 0),
+        created_at_provenance=TimestampProvenance.SOURCE_WALL,
+        retweet=None,
+    )
+    mixed_unknown = replace(
+        top,
+        id="9000",
+        created_at=None,
+        created_at_provenance=TimestampProvenance.UNKNOWN,
+        retweet=None,
+    )
+    mixed_posts = (mixed_wall, mixed_unknown, mixed_relative, mixed_offset)
+    mixed_order = sorted(
+        mixed_posts,
+        key=_post_presentation_sort_key,
+        reverse=True,
+    )
+    assert [post.id for post in mixed_order] == ["9004", "9003", "9001", "9000"]
+    assert mixed_offset.created_at.isoformat() == "2099-08-13T10:00:00+14:00"
+    assert mixed_wall.created_at.tzinfo is None
+    assert mixed_relative.created_at.tzinfo is None
+    assert mixed_unknown.created_at is None
+
+    mixed_archive = replace(archive, posts=mixed_posts)
+    mixed_data = archive_to_legacy_data(mixed_archive)
+    assert [
+        item["id"] for item in markdown_v5.prepare_items(mixed_data)
+    ] == ["9004", "9003", "9001", "9000"]
+    mixed_filtered, mixed_report = filter_archive(
+        mixed_archive,
+        CustomFilterOptions(
+            start_date=date(2099, 8, 13),
+            end_date=date(2099, 8, 13),
+        ),
+    )
+    assert [post.id for post in mixed_filtered.posts] == ["9004"]
+    assert mixed_report.unknown_timestamp_count == 2
+
+    import threading
+
+    class MixedTimeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.events = []
+            self.progress = lambda message, data=None: self.events.append((message, data))
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=4)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page == 1:
+                return [
+                    _fake_mblog(9104, "Thu Aug 13 10:00:00 +1400 2099"),
+                    _fake_mblog(9103, "5分钟前"),
+                    _fake_mblog(9101, "2000-08-13 09:00:00"),
+                    _fake_mblog(9100, "UNKNOWN"),
+                ], False
+            return [], True
+
+    mixed_client = MixedTimeClient()
+    fetched_mixed = mixed_client.fetch("1234567890", FetchRange.all())
+    assert [post.id for post in fetched_mixed.posts] == [
+        "9104",
+        "9103",
+        "9101",
+        "9100",
+    ]
+    assert fetched_mixed.report.newest_reached.isoformat() == (
+        "2099-08-13T10:00:00+14:00"
+    )
+    assert fetched_mixed.report.oldest_reached.isoformat() == "2000-08-13T09:00:00"
+    assert fetched_mixed.posts[0].created_at.utcoffset() == timedelta(hours=14)
+    assert fetched_mixed.posts[1].created_at_provenance is (
+        TimestampProvenance.RELATIVE_UNVERIFIED
+    )
+    progress_payloads = [
+        data
+        for message, data in mixed_client.events
+        if message.startswith("已获得") and data is not None
+    ]
+    assert progress_payloads[-1]["frontier"] == "2000-08-13"
+
+    since_mixed = MixedTimeClient().fetch(
+        "1234567890",
+        FetchRange.since_date(date(2100, 1, 1)),
+    )
+    assert {post.id for post in since_mixed.posts} == {"9103", "9100"}
+    assert since_mixed.report.termination is Termination.NATURAL
+
+    midnight = replace(
+        top,
+        created_at=datetime(2026, 8, 13, 0, 10, tzinfo=plus_eight),
+    )
+    filtered, report = filter_archive(
+        replace(archive, posts=(midnight, relative)),
+        CustomFilterOptions(
+            start_date=date(2026, 8, 13),
+            end_date=date(2026, 8, 13),
+        ),
+    )
+    assert filtered.posts == (midnight,)
+    assert report.unknown_timestamp_count == 1
+
+    snapshot = Archive(
+        profile=archive.profile,
+        posts=archive.posts,
+        fetch_range=archive.fetch_range,
+        report=archive.report,
+    )
+    assert snapshot.fetched_at.utcoffset() is not None
+
+
+def test_semantic_engagement_empty_rt_and_self_identity():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    base = archive.posts[0]
+    self_empty_rt = replace(
+        base.retweet,
+        id="self-empty",
+        text="",
+        author="目标账号别名",
+        author_id=archive.profile.id,
+        source="Android客户端",
+        location="广州",
+        engagement=Engagement(None, 0, 10),
+        media=MediaInfo(images=1),
+    )
+    first = replace(
+        base,
+        id="3001",
+        text="正文 //@同名: 保留原文",
+        engagement=Engagement(None, 0, 10),
+        retweet=self_empty_rt,
+    )
+    second = replace(base, id="3000", retweet=self_empty_rt)
+    semantic_archive = replace(archive, posts=(first, second))
+    data = archive_to_legacy_data(semantic_archive)
+
+    full, _, _ = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    ai, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "转 未知 · 评 0 · 赞 10" in full
+    assert "R=UNKNOWN C=0 L=10" in ai
+    assert "已验证为目标账号自转发" in full
+    assert ">[RT1｜SELF｜@目标账号别名｜" in ai
+    assert "【已验证正文为空】" in full
+    assert "TEXT=EMPTY" in ai
+    assert "Android客户端" in full and "P=广州" in ai and "I1" in ai
+    assert "//@同名: 保留原文" in full and "//@同名: 保留原文" in ai
+    assert any(line.startswith(">[=RT1｜") for line in ai.splitlines())
+    assert stats["unique_retweets"] == 1
+    assert stats["duplicate_retweets"] == 1
+    self_rt_line = next(line for line in ai.splitlines() if line.startswith(">[RT1"))
+    assert archive.profile.id not in self_rt_line
+
+    same_name_different_uid = replace(
+        self_empty_rt,
+        id="different-uid",
+        author="测试用户",
+        author_id="9999999999",
+    )
+    missing_uid = replace(
+        self_empty_rt,
+        id="missing-uid",
+        author="测试用户",
+        author_id=None,
+    )
+    ordinary_archive = replace(
+        archive,
+        posts=(
+            replace(base, id="4001", retweet=same_name_different_uid),
+            replace(base, id="4000", retweet=missing_uid),
+        ),
+    )
+    ordinary_ai, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(ordinary_archive),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert "｜SELF｜" not in ordinary_ai
+    assert "9999999999" not in ordinary_ai
+
+    parsed = parse_post(
+        {
+            "id": "5000",
+            "created_at": "2026-08-13 00:10:00",
+            "text": "counts",
+            "comments_count": 0,
+            "attitudes_count": "0",
+            "user": {"screen_name": "用户"},
+        }
+    )
+    assert parsed.engagement == Engagement(None, 0, 0)
+    assert parsed.author_id is None
+
+    w_body = "正文🙂\n第二行//@某人:保留这段🚀"
+    rt_body = "转发正文🧭\n第二行//@另一人:原样保留✨"
+    body_post = replace(
+        base,
+        id="emoji-w",
+        text=w_body,
+        retweet=replace(base.retweet, id="emoji-rt", text=rt_body),
+    )
+    body_data = archive_to_legacy_data(replace(archive, posts=(body_post,)))
+    body_full, _, _ = markdown_v5.build_markdown(
+        body_data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    body_ai, _, _ = markdown_v5.build_ai_markdown(
+        body_data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert w_body in body_full and w_body in body_ai
+    quoted_rt_body = "> 转发正文🧭\n> 第二行//@另一人:原样保留✨"
+    assert quoted_rt_body in body_full and quoted_rt_body in body_ai
+    assert "VIA" not in body_full and "VIA" not in body_ai
+
+
+def test_ai_retweet_reference_is_lossless_per_occurrence():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    base = archive.posts[0]
+    shared_body = "shared repost body"
+    first_rt = replace(
+        base.retweet,
+        id="900",
+        created_at=datetime(2026, 8, 10, 10, 0),
+        text=shared_body,
+        author="Target Alias",
+        author_id=archive.profile.id,
+        source="Source A",
+        location="Place A",
+        engagement=Engagement(10, 2, 3),
+        media=MediaInfo(images=1),
+    )
+    second_rt = replace(
+        first_rt,
+        created_at=datetime(2026, 8, 9, 9, 0),
+        author="Other Snapshot Author",
+        author_id="9999999999",
+        source="Source B",
+        location="Place B",
+        engagement=Engagement(999, 888, 777),
+        media=MediaInfo(videos=2, article=True),
+    )
+    first = replace(
+        base,
+        id="7002",
+        created_at=datetime(2026, 8, 13, 1, 0),
+        retweet=first_rt,
+    )
+    second = replace(
+        base,
+        id="7001",
+        created_at=datetime(2026, 8, 12, 1, 0),
+        retweet=second_rt,
+    )
+    text, _, stats = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(replace(archive, posts=(first, second))),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+
+    source_dictionary = next(
+        line for line in text.splitlines() if line.startswith("来源字典：")
+    )
+    source_codes = dict(
+        entry.split("=", 1)
+        for entry in source_dictionary.removeprefix("来源字典：").split("；")
+    )
+    source_a_code = next(code for code, value in source_codes.items() if value == "Source A")
+    source_b_code = next(code for code, value in source_codes.items() if value == "Source B")
+
+    full_line = next(line for line in text.splitlines() if line.startswith(">[RT1｜"))
+    reference_line = next(
+        line for line in text.splitlines() if line.startswith(">[=RT1｜")
+    )
+    for fact in (
+        "SELF",
+        "@Target Alias",
+        "2026-08-10 10:00",
+        source_a_code,
+        "P=Place A",
+        "I1",
+        "R=10 C=2 L=3",
+    ):
+        assert fact in full_line
+    for fact in (
+        "@Other Snapshot Author",
+        "2026-08-09 09:00",
+        source_b_code,
+        "P=Place B",
+        "V2 A1",
+        "R=999 C=888 L=777",
+    ):
+        assert fact in reference_line
+    assert "SELF" not in reference_line
+    assert text.count(shared_body) == 1
+    assert stats["unique_retweets"] == 1
+    assert stats["duplicate_retweets"] == 1
+    assert "Metadata on every RT*/=RT* line belongs to that occurrence" in text
+    assert "must not be inherited from another" in text
+
+    complete_rt = replace(first_rt, id="901", text="verified complete body")
+    incomplete_rt = _as_incomplete(complete_rt, "unverified timeline preview")
+    complete_post = replace(first, id="7102", retweet=complete_rt)
+    incomplete_post = replace(second, id="7101", retweet=incomplete_rt)
+    variant_text, _, variant_stats = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(
+            replace(archive, posts=(complete_post, incomplete_post))
+        ),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    variant_lines = [
+        line for line in variant_text.splitlines() if line.startswith(">[RT1｜")
+    ]
+    assert len(variant_lines) == 2
+    assert not any(line.startswith(">[=RT1｜") for line in variant_text.splitlines())
+    assert "verified complete body" in variant_text
+    assert ">[PREVIEW_ONLY｜全文无法验证]" in variant_text
+    assert "> unverified timeline preview" in variant_text
+    assert any("CONTENT=INCOMPLETE" in line for line in variant_lines)
+    assert variant_stats["unique_retweets"] == 1
+    assert variant_stats["duplicate_retweets"] == 0
+
+    empty_top = replace(base, id="7200", text="", retweet=None, media=MediaInfo())
+    empty_text, _, _ = markdown_v5.build_ai_markdown(
+        archive_to_legacy_data(replace(archive, posts=(empty_top,))),
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    empty_header = next(line for line in empty_text.splitlines() if line.startswith("[W｜"))
+    assert "TEXT=EMPTY" in empty_header
+    assert "CONTENT=INCOMPLETE" not in empty_header
+    assert "[PREVIEW_ONLY｜" not in empty_text
+
+
+def test_invalid_author_uid_contract():
+    from weibo_archive import markdown_v5, storage
+
+    no_nested = object()
+
+    def raw_post(author_id, *, nested_id=no_nested):
+        raw = {
+            "id": "uid-top",
+            "created_at": "2026-08-13 00:10:00",
+            "text": "正文",
+            "user": {"id": author_id, "screen_name": "测试用户"},
+        }
+        if nested_id is not no_nested:
+            raw["retweeted_status"] = {
+                "id": "uid-rt",
+                "created_at": "2026-08-12 00:10:00",
+                "text": "原文",
+                "user": {"id": nested_id, "screen_name": "测试用户"},
+            }
+        return raw
+
+    for invalid in (0, "0", "", "   ", None, False, "00000"):
+        assert parse_post(raw_post(invalid)).author_id is None
+
+    for invalid in (0, "0", None):
+        parsed = parse_post(raw_post("1234567890", nested_id=invalid))
+        assert parsed.author_id == "1234567890"
+        assert parsed.retweet is not None and parsed.retweet.author_id is None
+
+    valid = parse_post(raw_post(1234567890, nested_id="1234567890"))
+    assert valid.author_id == "1234567890"
+    assert valid.retweet.author_id == "1234567890"
+    assert markdown_v5.is_verified_self_retweet(
+        {"author_id": valid.retweet.author_id},
+        valid.author_id,
+    )
+
+    for invalid in (None, "", "0", "00000", False):
+        assert not markdown_v5.is_verified_self_retweet(
+            {"author_id": invalid},
+            "1234567890",
+        )
+        assert not markdown_v5.is_verified_self_retweet(
+            {"author_id": "1234567890"},
+            invalid,
+        )
+
+    base = build_alpha3_archive().posts[0]
+    for invalid in ("0", "00000", " 0 "):
+        try:
+            replace(base, author_id=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid canonical author_id accepted: {invalid!r}")
+
+    defensive_data = archive_to_legacy_data(build_alpha3_archive())
+    defensive_rt = defensive_data["weibo"][0]["retweet"]
+    defensive_rt["screen_name"] = defensive_data["user"]["screen_name"]
+    defensive_rt["author_id"] = "00000"
+    defensive_ai, _, _ = markdown_v5.build_ai_markdown(
+        defensive_data,
+        defensive_data["user"]["id"],
+        AI_COMPACT_OPTIONS,
+    )
+    assert "｜SELF｜" not in defensive_ai
+
+    cached_post = parse_post(raw_post(0, nested_id="00000"))
+    archive = replace(build_alpha3_archive(), posts=(cached_post,))
+    with tempfile.TemporaryDirectory(prefix="weibo_uid_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        try:
+            storage.CACHE_DIR = Path(td)
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 4
+    assert payload["posts"][0]["author_id"] is None
+    assert payload["posts"][0]["retweet"]["author_id"] is None
+
+
+def test_export_options_resolution_and_snapshot():
+    assert options_for_preset(ExportPreset.FULL_ARCHIVE) == FULL_ARCHIVE_OPTIONS
+    assert options_for_preset(ExportPreset.AI_COMPACT) == AI_COMPACT_OPTIONS
+    assert filename_suffix_for_selection(
+        ExportPreset.FULL_ARCHIVE,
+        FULL_ARCHIVE_OPTIONS,
+    ) == "完整"
+    assert filename_suffix_for_selection(
+        ExportPreset.AI_COMPACT,
+        AI_COMPACT_OPTIONS,
+    ) == "AI分析版"
+
+    custom = ExportOptions(
+        layout=ExportLayout.AI,
+        include_source=False,
+        include_location=True,
+        include_engagement=False,
+        date_format=DateFormat.DATE_ONLY,
+    )
+    snapshot = options_for_preset(ExportPreset.CUSTOM, custom)
+    assert snapshot is custom
+    assert filename_suffix_for_selection(ExportPreset.CUSTOM, snapshot) == "自定义_AI分析"
+    assert "preset" not in {field.name for field in fields(ExportOptions)}
+
+    try:
+        snapshot.include_source = True
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("ExportOptions is not frozen")
+
+    later_gui_value = replace(custom, include_source=True)
+    assert snapshot.include_source is False
+    assert later_gui_value.include_source is True
+
+
+def test_visibility_scope_filter_and_schema3_contract():
+    from weibo_archive import storage
+
+    base = build_alpha3_archive().posts[0]
+    states = (
+        VisibilityState.PUBLIC,
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+        VisibilityState.PRIVATE,
+        VisibilityState.UNKNOWN,
+    )
+    archive = replace(
+        build_alpha3_archive(),
+        posts=tuple(
+            replace(
+                base,
+                id=f"visibility-{state.value}",
+                bid=f"visibility-{state.value}",
+                text=f"visibility body {state.value}",
+                retweet=None if state is VisibilityState.FRIENDS else base.retweet,
+                visibility=VisibilityInfo(
+                    state,
+                    raw_type={
+                        VisibilityState.PUBLIC: 0,
+                        VisibilityState.FOLLOWERS: 10,
+                        VisibilityState.FRIENDS: 6,
+                        VisibilityState.PRIVATE: 1,
+                    }.get(state, 999),
+                    raw_list_id=0,
+                ),
+            )
+            for state in states
+        ),
+    )
+
+    default_ai = AIVisibilityOptions()
+    assert default_ai.included_states == frozenset({VisibilityState.PUBLIC})
+    public_only, report = filter_archive_visibility(
+        archive,
+        default_ai.included_states,
+    )
+    assert [post.visibility.state for post in public_only.posts] == [
+        VisibilityState.PUBLIC
+    ]
+    assert report.fetched_count == 5
+    assert report.matched_count == 1
+    assert report.unknown_excluded_count == 1
+
+    mixed_scope = AIVisibilityOptions(
+        include_followers=True,
+        include_friends=True,
+        include_private=True,
+    ).included_states
+    assert visibility_scope_text(mixed_scope) == (
+        "PUBLIC,FOLLOWERS,FRIENDS,PRIVATE"
+    )
+    mixed, mixed_report = filter_archive_visibility(archive, mixed_scope)
+    assert [post.visibility.state for post in mixed.posts] == list(states[:-1])
+    assert mixed_report.unknown_excluded_count == 1
+
+    try:
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset(),
+        )
+    except ValueError as exc:
+        assert "至少选择一种" in str(exc)
+    else:
+        raise AssertionError("empty enabled visibility scope must be rejected")
+
+    custom, custom_report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset(
+                {VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+            ),
+        ),
+    )
+    assert [post.visibility.state for post in custom.posts] == [
+        VisibilityState.FOLLOWERS,
+        VisibilityState.FRIENDS,
+    ]
+    assert custom_report.unknown_visibility_count == 1
+    assert "1 条记录可见范围未知" in filter_report_notice(custom_report)
+
+    composed, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            include_original=True,
+            include_reposts=False,
+            keywords=("friends",),
+            start_date=base.created_at.date(),
+            end_date=base.created_at.date(),
+            visibility_filter_enabled=True,
+            visibilities=frozenset(
+                {VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+            ),
+        ),
+    )
+    assert [post.visibility.state for post in composed.posts] == [
+        VisibilityState.FRIENDS
+    ]
+    with tempfile.TemporaryDirectory(prefix="weibo_custom_visibility_full_") as td:
+        custom_full_output, _ = export_markdown(
+            composed,
+            Path(td),
+            FULL_ARCHIVE_OPTIONS,
+            "自定义_完整",
+            visibility_scope="FOLLOWERS,FRIENDS",
+        )
+        custom_full_text = custom_full_output.read_text(encoding="utf-8")
+    assert "> 可见范围筛选：FOLLOWERS,FRIENDS" in custom_full_text
+    assert "> 可见范围：未筛选" not in custom_full_text
+
+    unknown_custom, unknown_custom_report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            visibility_filter_enabled=True,
+            visibilities=frozenset({VisibilityState.UNKNOWN}),
+        ),
+    )
+    assert [post.visibility.state for post in unknown_custom.posts] == [
+        VisibilityState.UNKNOWN
+    ]
+    assert unknown_custom_report.unknown_visibility_count == 0
+
+    with tempfile.TemporaryDirectory(prefix="weibo_visibility_schema3_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    assert storage.SCHEMA_VERSION == 4
+    assert payload["schema_version"] == 4
+    assert payload["posts"][0]["visibility"] == {
+        "state": "public",
+        "raw_type": 0,
+        "raw_list_id": 0,
+        "raw_list_idstr": None,
+    }
+    assert payload["posts"][-1]["visibility"]["state"] == "unknown"
+    assert "visible" not in payload["posts"][0]
+    storage_source = (ROOT / "weibo_archive/storage.py").read_text(encoding="utf-8")
+    assert "read_text(" not in storage_source
+    assert "json.load" not in storage_source
+    assert not any(name.startswith("load_") for name in vars(storage))
+
+
+def test_visibility_full_and_ai_rendering_contract():
+    from weibo_archive import markdown_v5
+
+    base_archive = build_alpha3_archive()
+    first, second, third = base_archive.posts
+    archive = replace(
+        base_archive,
+        posts=(
+            replace(
+                first,
+                visibility=VisibilityInfo(
+                    VisibilityState.PUBLIC, raw_type=0, raw_list_id=0
+                ),
+            ),
+            replace(
+                second,
+                visibility=VisibilityInfo(
+                    VisibilityState.FOLLOWERS, raw_type=10, raw_list_id=0
+                ),
+            ),
+            replace(
+                third,
+                visibility=VisibilityInfo(
+                    VisibilityState.UNKNOWN, raw_type=999, raw_list_id=0
+                ),
+            ),
+        ),
+    )
+    data = archive_to_legacy_data(archive)
+
+    full, _, full_count = markdown_v5.build_markdown(
+        data,
+        archive.profile.id,
+        FULL_ARCHIVE_OPTIONS,
+    )
+    assert full_count == 3
+    assert "可见范围（抓取时）：公开" in full
+    assert "可见范围（抓取时）：粉丝可见" in full
+    assert "可见范围（抓取时）：未知" in full
+    assert "转发原文可见范围" not in full
+
+    ai, _, stats = markdown_v5.build_ai_markdown(
+        data,
+        archive.profile.id,
+        AI_COMPACT_OPTIONS,
+    )
+    assert stats["count"] == 3
+    assert "FORMAT=WEIBO_AI_1" in ai
+    assert "VISIBILITY: VIS on W" in ai
+    assert "VIS=PUBLIC" in ai
+    assert "VIS=FOLLOWERS" in ai
+    assert "VIS=UNKNOWN" in ai
+    rt_lines = [line for line in ai.splitlines() if line.startswith(">[RT")]
+    assert rt_lines and all("VIS=" not in line for line in rt_lines)
+
+    public_archive, visibility_report = filter_archive_visibility(
+        archive,
+        frozenset({VisibilityState.PUBLIC}),
+    )
+    with tempfile.TemporaryDirectory(prefix="weibo_visibility_render_") as td:
+        output, output_stats = export_markdown(
+            public_archive,
+            Path(td),
+            AI_COMPACT_OPTIONS,
+            "AI分析版",
+            visibility_scope="PUBLIC",
+            unknown_visibility_excluded_count=(
+                visibility_report.unknown_excluded_count
+            ),
+        )
+        rendered = output.read_text(encoding="utf-8")
+    assert output_stats["count"] == 1
+    assert "VISIBILITY_SCOPE=PUBLIC" in rendered
+    assert "1 条记录的可见范围无法确认，未纳入 AI 分析版。" in rendered
+    assert "VISIBILITY_INPUT_W" not in rendered
+    assert "VISIBILITY_INCLUDED_W" not in rendered
+
+
+def test_custom_filter_contract():
+    archive = build_alpha4_archive()
+    repost, incomplete_original, complete_original = archive.posts
+    complete_original = replace(
+        complete_original,
+        text="AI and #ChatGPT# research",
+    )
+    unknown_time = replace(
+        incomplete_original,
+        id="1000",
+        bid="b0",
+        created_at=None,
+        created_at_provenance=TimestampProvenance.UNKNOWN,
+        text_preview="未知时间的 GPT 列表预览",
+    )
+    archive = replace(
+        archive,
+        posts=(repost, incomplete_original, complete_original, unknown_time),
+    )
+    original_integrity = archive.integrity
+
+    originals, _ = filter_archive(
+        archive,
+        CustomFilterOptions(include_original=True, include_reposts=False),
+    )
+    assert [post.id for post in originals.posts] == ["1002", "1001", "1000"]
+
+    reposts, _ = filter_archive(
+        archive,
+        CustomFilterOptions(include_original=False, include_reposts=True),
+    )
+    assert [post.id for post in reposts.posts] == ["1003"]
+
+    all_posts, _ = filter_archive(archive, CustomFilterOptions())
+    assert all_posts.posts == archive.posts
+    assert unknown_time in all_posts.posts
+
+    try:
+        CustomFilterOptions(include_original=False, include_reposts=False)
+    except ValueError as exc:
+        assert "至少选择一种" in str(exc)
+    else:
+        raise AssertionError("empty content-type selection must be rejected")
+
+    chinese, chinese_report = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("原文列表",)),
+    )
+    assert [post.id for post in chinese.posts] == ["1003"]
+    assert chinese.posts[0].retweet.content_state is ContentState.INCOMPLETE
+    with tempfile.TemporaryDirectory(prefix="weibo_custom_filter_export_") as td:
+        output, stats = export_markdown(
+            chinese,
+            Path(td),
+            ExportOptions(),
+            "自定义_完整",
+            selection_notice=filter_report_notice(chinese_report),
+        )
+        rendered = output.read_text(encoding="utf-8")
+        assert stats["count"] == 1
+        assert "自定义筛选：匹配 1 / 本次抓取 4" in rendered
+        assert "全文无法验证" in rendered
+
+    ascii_match, _ = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("chatgpt",)),
+    )
+    assert [post.id for post in ascii_match.posts] == ["1001"]
+
+    keyword_or, _ = filter_archive(
+        archive,
+        CustomFilterOptions(keywords=("不存在", "顶层列表")),
+    )
+    assert [post.id for post in keyword_or.posts] == ["1002"]
+
+    type_and_keyword, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            include_original=True,
+            include_reposts=False,
+            keywords=("原文列表",),
+        ),
+    )
+    assert type_and_keyword.posts == ()
+    assert parse_filter_terms("AI, ai，中文\n#话题#") == ("AI", "中文", "#话题#")
+
+    date_slice, report = filter_archive(
+        archive,
+        CustomFilterOptions(
+            start_date=date(2026, 8, 12),
+            end_date=date(2026, 8, 12),
+        ),
+    )
+    assert [post.id for post in date_slice.posts] == ["1002"]
+    assert report.fetched_count == 4
+    assert report.matched_count == 1
+    assert report.unknown_timestamp_count == 1
+    assert "1 条记录时间未知" in filter_report_notice(report)
+
+    boundary, _ = filter_archive(
+        archive,
+        CustomFilterOptions(
+            start_date=date(2026, 8, 11),
+            end_date=date(2026, 8, 13),
+        ),
+    )
+    assert [post.id for post in boundary.posts] == ["1003", "1002", "1001"]
+    assert archive.integrity == original_integrity
+    assert archive.posts[0] is repost
+    assert archive.posts[1].content_state is ContentState.INCOMPLETE
+    assert archive.posts[0].retweet.content_state is ContentState.INCOMPLETE
+
+
+def test_multi_output_fetch_once_and_isolation():
+    import threading
+    import weibo_archive.app as app_module
+
+    archive = build_alpha4_archive()
+    custom_filter = CustomFilterOptions(
+        include_original=True,
+        include_reposts=False,
+        keywords=("第一条",),
+    )
+    two_outputs = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=False,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+    one_output = build_export_selections(
+        include_full=True,
+        include_ai=False,
+        include_custom=False,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+    three_outputs = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=True,
+        custom_options=ExportOptions(),
+        custom_filter=custom_filter,
+    )
+
+    try:
+        build_export_selections(
+            include_full=False,
+            include_ai=False,
+            include_custom=False,
+            custom_options=ExportOptions(),
+            custom_filter=custom_filter,
+        )
+    except ValueError as exc:
+        assert "至少选择一种输出" in str(exc)
+    else:
+        raise AssertionError("an empty output selection must be rejected")
+
+    class FakeWorker:
+        def __init__(self):
+            self.events = []
+            self.logs = []
+
+        def _emit(self, generation, kind, payload=None):
+            self.events.append((generation, kind, payload))
+
+        def _worker_log(self, generation, text):
+            self.logs.append((generation, text))
+
+    original_values = (
+        app_module.load_cookie_header,
+        app_module.WeiboClient,
+        app_module.save_normalized_archive,
+        app_module.export_markdown,
+    )
+    credential_loads = []
+    try:
+        with tempfile.TemporaryDirectory(prefix="weibo_multi_export_") as td:
+            folder = Path(td)
+            app_module.load_cookie_header = lambda: (
+                credential_loads.append(True) or "SUB=offline-fixture"
+            )
+
+            def run(
+                selections,
+                failing_suffix=None,
+                *,
+                permission_once=False,
+                fallback_dir=None,
+                source_archive=archive,
+            ):
+                fetch_calls = []
+                saved_archives = []
+                rendered = []
+                permission_raised = False
+
+                class FakeClient:
+                    def __init__(self, **_kwargs):
+                        pass
+
+                    def fetch(self, uid, fetch_range):
+                        fetch_calls.append((uid, fetch_range))
+                        return source_archive
+
+                def fake_export(
+                    render_archive,
+                    output_dir,
+                    options,
+                    filename_suffix,
+                    *,
+                    before_commit=None,
+                    selection_notice=None,
+                    visibility_scope=None,
+                    unknown_visibility_excluded_count=0,
+                ):
+                    nonlocal permission_raised
+                    if before_commit:
+                        before_commit()
+                    if permission_once and not permission_raised:
+                        permission_raised = True
+                        raise PermissionError("fixture application directory is read-only")
+                    if filename_suffix == failing_suffix:
+                        raise OSError("fixture write failure")
+                    rendered.append(
+                        (
+                            filename_suffix,
+                            render_archive,
+                            tuple(post.id for post in render_archive.posts),
+                            selection_notice,
+                            visibility_scope,
+                            unknown_visibility_excluded_count,
+                        )
+                    )
+                    path = output_dir / f"{filename_suffix}.md"
+                    return path, {
+                        "count": len(render_archive.posts),
+                        "output_bytes": 10,
+                        "output_chars": 10,
+                        "layout": options.layout.value,
+                    }
+
+                app_module.WeiboClient = FakeClient
+                app_module.save_normalized_archive = saved_archives.append
+                app_module.export_markdown = fake_export
+                worker = FakeWorker()
+                request = app_module.ExportRequest(
+                    uid=archive.profile.id,
+                    fetch_range=FetchRange.trial(20),
+                    output_dir=folder,
+                    export_selections=selections,
+                    fallback_dir=fallback_dir,
+                )
+                app_module.App._export_worker(
+                    worker,
+                    1,
+                    threading.Event(),
+                    request,
+                )
+                done = [event for event in worker.events if event[1] == "done"]
+                assert len(done) == 1
+                return fetch_calls, saved_archives, rendered, done[0][2]
+
+            fetch_calls, saved, rendered, result = run(one_output)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 1 and rendered[0][1] is archive
+            assert len(result["outputs"]) == 1 and not result["failures"]
+
+            fetch_calls, saved, rendered, result = run(two_outputs)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 2
+            assert rendered[0][1] is not archive and rendered[1][1] is archive
+            assert all(
+                item[2] == ("1003", "1002", "1001") for item in rendered
+            )
+            assert rendered[0][4] == "PUBLIC"
+            assert rendered[1][4] == "UNFILTERED"
+            assert len(result["outputs"]) == 2 and not result["failures"]
+
+            fetch_calls, saved, rendered, result = run(three_outputs)
+            assert len(fetch_calls) == 1
+            assert saved == [archive]
+            assert len(rendered) == 3
+            assert rendered[0][1] is not archive and rendered[1][1] is archive
+            assert rendered[0][2] == rendered[1][2] == ("1003", "1002", "1001")
+            assert rendered[2][2] == ("1001",)
+            assert "匹配 1 / 本次抓取 3" in rendered[2][3]
+            assert len(result["outputs"]) == 3 and not result["failures"]
+
+            fetch_calls, _, rendered, result = run(
+                two_outputs,
+                failing_suffix="AI分析版",
+            )
+            assert len(fetch_calls) == 1
+            assert len(rendered) == 1
+            assert [item["label"] for item in result["outputs"]] == ["完整归档"]
+            assert [item["label"] for item in result["failures"]] == ["AI 分析版"]
+
+            fallback = folder / "Documents" / "WeiboTextArchiver" / "Archives"
+            fetch_calls, _, rendered, result = run(
+                two_outputs,
+                permission_once=True,
+                fallback_dir=fallback,
+            )
+            assert len(fetch_calls) == 1
+            assert len(rendered) == 2
+            assert result["output_dir"] == fallback
+            assert all(item["path"].parent == fallback for item in result["outputs"])
+            assert not result["failures"]
+
+            mixed_archive = replace(
+                archive,
+                posts=(
+                    replace(
+                        archive.posts[0],
+                        visibility=VisibilityInfo(
+                            VisibilityState.PUBLIC, raw_type=0, raw_list_id=0
+                        ),
+                    ),
+                    replace(
+                        archive.posts[1],
+                        visibility=VisibilityInfo(
+                            VisibilityState.FOLLOWERS, raw_type=10, raw_list_id=0
+                        ),
+                    ),
+                    replace(
+                        archive.posts[2],
+                        visibility=VisibilityInfo(
+                            VisibilityState.UNKNOWN, raw_type=999, raw_list_id=0
+                        ),
+                    ),
+                ),
+            )
+            public_ai = build_export_selections(
+                include_full=False,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=custom_filter,
+            )
+            fetch_calls, saved, rendered, result = run(
+                public_ai,
+                source_archive=mixed_archive,
+            )
+            assert len(fetch_calls) == 1
+            assert fetch_calls[0][1] == FetchRange.trial(20)
+            assert saved == [mixed_archive]
+            assert rendered[0][2] == ("1003",)
+            assert rendered[0][1].posts[0].retweet is mixed_archive.posts[0].retweet
+            assert rendered[0][4] == "PUBLIC"
+            assert rendered[0][5] == 1
+            visibility_report = result["outputs"][0]["visibility_report"]
+            assert visibility_report.fetched_count == 3
+            assert visibility_report.matched_count == 1
+            assert visibility_report.unknown_excluded_count == 1
+
+            followers_ai = build_export_selections(
+                include_full=False,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=custom_filter,
+                ai_visibility=AIVisibilityOptions(include_followers=True),
+            )
+            fetch_calls, _, rendered, _ = run(
+                followers_ai,
+                source_archive=mixed_archive,
+            )
+            assert len(fetch_calls) == 1
+            assert rendered[0][2] == ("1003", "1002")
+            assert rendered[0][4] == "PUBLIC,FOLLOWERS"
+            assert len(credential_loads) == 7
+    finally:
+        (
+            app_module.load_cookie_header,
+            app_module.WeiboClient,
+            app_module.save_normalized_archive,
+            app_module.export_markdown,
+        ) = original_values
+
+
+def test_alpha3_field_policy_applies_to_main_and_repost():
+    from weibo_archive import markdown_v5
+
+    archive = build_alpha3_archive()
+    data = archive_to_legacy_data(archive)
+    minimal_full = ExportOptions(
+        layout=ExportLayout.FULL,
+        include_source=False,
+        include_location=False,
+        include_engagement=False,
+        date_format=DateFormat.DATE_ONLY,
+    )
+    full_text, _, _ = markdown_v5.build_markdown(data, archive.profile.id, minimal_full)
+    for hidden in (
+        "iPhone客户端",
+        "微博网页版",
+        "Android客户端",
+        "位置：上海",
+        "位置：北京",
+        "位置：广州",
+        "转 1 · 评 1 · 赞 5",
+        "转 12 · 评 8 · 赞 99",
+    ):
+        assert hidden not in full_text
+    assert "- 所在地：北京" in full_text
+    assert "## 2026-08-13" in full_text
+    assert "日期：2026-08-10" in full_text
+    assert "这是转发时写的评论。" in full_text
+    assert "这是被转发的原文。" in full_text
+    assert "图片×1" in full_text
+
+    minimal_ai = replace(minimal_full, layout=ExportLayout.AI)
+    ai_text, _, _ = markdown_v5.build_ai_markdown(data, archive.profile.id, minimal_ai)
+    for hidden in (
+        "S1",
+        "来源字典",
+        "来源3种",
+        "S*=发布来源",
+        "R=转发",
+        "R=1 C=1 L=5",
+        "R=12 C=8 L=99",
+        "｜P=上海",
+        "｜P=北京",
+        "｜P=广州",
+    ):
+        assert hidden not in ai_text
+    assert "所在地=北京" in ai_text
+    assert "[W｜2026-08-13｜VIS=PUBLIC]" in ai_text
+    assert "[RT1｜@原作者｜2026-08-10｜I1]" in ai_text
+    assert "这是转发时写的评论。" in ai_text
+    assert "这是被转发的原文。" in ai_text
+
+    ids_before = [item["id"] for item in markdown_v5.prepare_items(data)]
+    date_only_data = archive_to_legacy_data(archive)
+    ids_after = [item["id"] for item in markdown_v5.prepare_items(date_only_data)]
+    assert ids_after == ids_before
+
+
+def test_export_does_not_mutate_normalized_archive():
+    from weibo_archive import markdown_v5, storage
+
+    archive = build_alpha3_archive()
+    plus_eight = timezone(timedelta(hours=8))
+    first = replace(
+        archive.posts[0],
+        created_at=datetime(2026, 8, 13, 0, 10, 45, tzinfo=plus_eight),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        retweet=replace(
+            archive.posts[0].retweet,
+            created_at=datetime(2026, 8, 10, 12, 0, 37, tzinfo=plus_eight),
+            created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        ),
+    )
+    archive = replace(
+        archive,
+        posts=(first, *archive.posts[1:]),
+        fetched_at=datetime(2026, 8, 13, 2, 0, tzinfo=plus_eight),
+    )
+    before = asdict(archive)
+    data_before = archive_to_legacy_data(archive)
+
+    markdown_v5.build_markdown(data_before, archive.profile.id, FULL_ARCHIVE_OPTIONS)
+    markdown_v5.build_ai_markdown(data_before, archive.profile.id, AI_COMPACT_OPTIONS)
+    assert asdict(archive) == before
+
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+
+    assert payload["schema_version"] == 4
+    assert payload["integrity"] == {
+        "total_posts": 3,
+        "complete_records": 3,
+        "incomplete_records": 0,
+        "incomplete_top_level": 0,
+        "incomplete_retweets": 0,
+    }
+    assert payload["posts"][0]["content_state"] == "complete"
+    assert payload["posts"][0]["text_preview"] is None
+    assert payload["posts"][0]["incomplete_reason"] is None
+    assert payload["posts"][0]["source"] == "iPhone客户端"
+    assert payload["posts"][0]["author_id"] == "1234567890"
+    assert payload["posts"][0]["created_at_provenance"] == "source_offset"
+    assert payload["posts"][0]["created_at"].endswith("+08:00")
+    restored = datetime.fromisoformat(payload["posts"][0]["created_at"])
+    assert restored == first.created_at and restored.utcoffset() == timedelta(hours=8)
+    assert payload["posts"][0]["retweet"]["source"] == "Android客户端"
+    assert payload["posts"][0]["retweet"]["author_id"] == "987654321"
+    assert payload["posts"][0]["retweet"]["location"] == "广州"
+    assert payload["posts"][0]["retweet"]["engagement"]["likes"] == 99
+
+
+def test_alpha4_normalized_cache_contains_only_stable_semantics():
+    from weibo_archive import storage
+
+    archive = build_alpha4_archive()
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_alpha4_cache_") as td:
+        old_cache_dir = storage.CACHE_DIR
+        storage.CACHE_DIR = Path(td)
+        try:
+            cache_path = storage.save_normalized_archive(archive)
+        finally:
+            storage.CACHE_DIR = old_cache_dir
+        raw = cache_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+
+    assert payload["schema_version"] == 4
+    assert payload["integrity"]["incomplete_records"] == 2
+    assert payload["posts"][0]["retweet"]["content_state"] == "incomplete"
+    assert payload["posts"][0]["retweet"]["text"] is None
+    assert payload["posts"][0]["retweet"]["text_preview"].endswith("全文")
+    assert payload["posts"][0]["retweet"]["incomplete_reason"] == "content_unavailable"
+
+    keys = set()
+
+    def collect_keys(value):
+        if isinstance(value, dict):
+            keys.update(value)
+            for child in value.values():
+                collect_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_keys(child)
+
+    collect_keys(payload)
+    for forbidden_key in (
+        "attempts",
+        "outcome",
+        "body_bytes",
+        "json_keys",
+        "query",
+        "cookie",
+        "token",
+    ):
+        assert forbidden_key not in keys
+
+
+def test_completion_integrity_warning_text():
+    from weibo_archive.app import completion_integrity_lines
+
+    assert completion_integrity_lines(ArchiveIntegrity(3, 3, 0, 0, 0)) == []
+    lines = completion_integrity_lines(ArchiveIntegrity(3, 1, 2, 1, 1))
+    assert lines == [
+        "完整记录：1",
+        "不完整记录：2",
+        "其中：顶层正文 1 · 转发原文 1",
+        "无法验证的内容已在 Markdown 中明确标记。",
+    ]
+
+
+def test_atomic_export_preserves_existing_final_on_cancel_or_failure():
+    archive = replace(build_alpha3_archive(), fetch_range=FetchRange.trial(20))
+
+    class SimulatedCancel(Exception):
+        pass
+
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_atomic_") as td:
+        output_dir = Path(td)
+        final = output_dir / "测试用户_1234567890_测试导出20条_完整.md"
+        final.write_text("existing user archive", encoding="utf-8")
+
+        def cancel_before_commit():
+            raise SimulatedCancel("cancel before atomic replace")
+
+        try:
+            export_markdown(
+                archive,
+                output_dir,
+                FULL_ARCHIVE_OPTIONS,
+                "完整",
+                before_commit=cancel_before_commit,
+            )
+        except SimulatedCancel:
+            pass
+        else:
+            raise AssertionError("simulated cancellation did not stop commit")
+
+        assert final.read_text(encoding="utf-8") == "existing user archive"
+        assert not list(output_dir.glob("*.tmp"))
+        assert not (output_dir / "测试用户_1234567890_测试导出20条_完整_2.md").exists()
+
+        def fail_before_commit():
+            raise OSError("simulated write failure")
+
+        try:
+            export_markdown(
+                archive,
+                output_dir,
+                FULL_ARCHIVE_OPTIONS,
+                "完整",
+                before_commit=fail_before_commit,
+            )
+        except OSError:
+            pass
+        else:
+            raise AssertionError("simulated failure did not stop commit")
+
+        assert final.read_text(encoding="utf-8") == "existing user archive"
+        assert not list(output_dir.glob("*.tmp"))
+
+
+def test_collision_safe_export_preserves_every_snapshot():
+    archive = replace(build_alpha3_archive(), fetch_range=FetchRange.trial(20))
+    expected_name = "测试用户_1234567890_测试导出20条_完整.md"
+
+    with tempfile.TemporaryDirectory(prefix="weibo_collision_safe_") as td:
+        output_dir = Path(td)
+        first_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert first_path == output_dir / expected_name
+        first_bytes = first_path.read_bytes()
+
+        second_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert second_path == output_dir / expected_name.replace(".md", "_2.md")
+        assert first_path.read_bytes() == first_bytes
+        second_bytes = second_path.read_bytes()
+
+        third_path, _ = export_markdown(
+            archive,
+            output_dir,
+            FULL_ARCHIVE_OPTIONS,
+            "完整",
+        )
+        assert third_path == output_dir / expected_name.replace(".md", "_3.md")
+        assert first_path.read_bytes() == first_bytes
+        assert second_path.read_bytes() == second_bytes
+        assert third_path.read_bytes() == first_bytes
+        assert not list(output_dir.glob("*.tmp"))
+
+
+def test_day0_uid_guard_and_user_facing_wording():
+    import weibo_archive.app as app_module
+
+    for accepted, expected in (
+        ("123456789", "123456789"),
+        ("https://weibo.com/u/123456789", "123456789"),
+        ("https://m.weibo.cn/u/123456789", "123456789"),
+        ("ambiguous text 123456789", "123456789"),
+    ):
+        assert not app_module.is_obvious_single_post_url(accepted)
+        assert app_module.extract_uid(accepted) == expected
+
+    for rejected in (
+        "https://m.weibo.cn/detail/1234567890123456",
+        "m.weibo.cn/detail/1234567890123456",
+        "https://weibo.com/status/1234567890123456",
+        "https://www.weibo.cn/status/1234567890123456",
+    ):
+        assert app_module.is_obvious_single_post_url(rejected)
+
+    assert not app_module.is_obvious_single_post_url(
+        "https://example.com/detail/1234567890123456"
+    )
+    assert not app_module.is_obvious_single_post_url("not a URL /detail/ 123456")
+
+    class Value:
+        def get(self):
+            return "https://m.weibo.cn/detail/1234567890123456"
+
+    warnings = []
+    original_warning = app_module.messagebox.showwarning
+    app_module.messagebox.showwarning = lambda title, text: warnings.append(
+        (title, text)
+    )
+    try:
+        app_module.App.start_export(type("GuardHarness", (), {"uid_var": Value()})(), trial=False)
+    finally:
+        app_module.messagebox.showwarning = original_warning
+    assert len(warnings) == 1
+    assert warnings[0][0] == "需要账号主页"
+    assert "不是单条微博链接" in warnings[0][1]
+
+    app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
+    for login_status in (
+        "● 已保存登录信息",
+        "○ 未登录",
+        "○ 登录已过期，请重新扫码",
+    ):
+        assert login_status in app_source
+    for removed in (
+        "任务失败；未把旧缓存伪装成成功结果。",
+        "任务已取消；迟到的旧任务事件将被忽略。",
+        "正在退出的旧网络请求即使迟到也不会影响界面。",
+        "正在启动独立抓取核心",
+    ):
+        assert removed not in app_source
+    for replacement in (
+        "本次导出未完成，没有生成不完整的成功结果。",
+        "任务已取消；未完成内容不会保存为成功归档。",
+        "正在开始读取微博",
+    ):
+        assert replacement in app_source
+
+
+def test_bounded_github_update_check():
+    import urllib.error
+
+    import weibo_archive.app as app_module
+    import weibo_archive.update_check as update_module
+
+    class FakeResponse:
+        def __init__(self, body, status=200):
+            self.body = body
+            self.status = status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, limit):
+            assert limit == 65537
+            return self.body
+
+    observed_requests = []
+
+    def opener_for(body, status=200):
+        def open_fixture(request, timeout):
+            assert timeout == 3.0
+            assert request.full_url == update_module.GITHUB_LATEST_RELEASE_API
+            header_names = {name.casefold() for name in request.headers}
+            assert "cookie" not in header_names
+            assert "authorization" not in header_names
+            observed_requests.append(request.full_url)
+            return FakeResponse(body, status)
+
+        return open_fixture
+
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=opener_for(b'{"tag_name":"v0.5.8"}'),
+    ) == "0.5.8"
+    for tag in ("v0.5.7", "0.5.6", "v0.5.8-rc.1", "latest", "v1.2"):
+        assert update_module.find_newer_github_version(
+            "0.5.7",
+            opener=opener_for(json.dumps({"tag_name": tag}).encode("utf-8")),
+        ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=opener_for(b"not json"),
+    ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=opener_for(b'{"wrong_field":"v9.9.9"}'),
+    ) is None
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=opener_for(b'{"tag_name":"v9.9.9"}', status=503),
+    ) is None
+
+    def timeout_opener(_request, timeout):
+        assert timeout == 3.0
+        raise TimeoutError("offline fixture timeout")
+
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=timeout_opener,
+    ) is None
+
+    def http_error_opener(_request, timeout):
+        assert timeout == 3.0
+        raise urllib.error.HTTPError(
+            update_module.GITHUB_LATEST_RELEASE_API,
+            500,
+            "fixture",
+            {},
+            None,
+        )
+
+    assert update_module.find_newer_github_version(
+        "0.5.7",
+        opener=http_error_opener,
+    ) is None
+    assert observed_requests
+
+    launched = []
+    assert update_module.launch_official_release_page(launched.append)
+    assert launched == [update_module.GITHUB_LATEST_RELEASE_PAGE]
+
+    starts = []
+
+    class FakeThread:
+        def __init__(self, *, target, daemon):
+            assert daemon is True
+            self.target = target
+
+        def start(self):
+            starts.append(self.target)
+
+    class UpdateHarness:
+        _update_check_started = False
+
+        def _update_check_worker(self):
+            raise AssertionError("fake thread must not execute the network worker")
+
+    original_thread = app_module.threading.Thread
+    app_module.threading.Thread = FakeThread
+    try:
+        harness = UpdateHarness()
+        app_module.App._start_update_check(harness)
+        app_module.App._start_update_check(harness)
+    finally:
+        app_module.threading.Thread = original_thread
+    assert len(starts) == 1
+
+    original_login = app_module.has_saved_login
+    app = None
+    try:
+        app_module.has_saved_login = lambda: False
+        app = app_module.App()
+        app.withdraw()
+        app.tasks.transition(TaskState.READY)
+        generation, _ = app.tasks.start(TaskState.FETCHING)
+        app.events.put((None, "update_available", "0.5.6"))
+        app._poll_events()
+        assert app.tasks.state is TaskState.FETCHING
+        assert app.tasks.accepts(generation)
+        assert app.update_notice_label.cget("text") == "发现新版本 0.5.6"
+    finally:
+        if app is not None:
+            app.destroy()
+        app_module.has_saved_login = original_login
+
+
+def test_safe_system_launcher():
+    from weibo_archive.app import launch_with_system
+
+    launched = []
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_launch_") as td:
+        target = Path(td) / "archive.md"
+        target.write_text("ok", encoding="utf-8")
+        ok, error = launch_with_system(target, launched.append)
+        assert ok and not error
+        assert launched == [str(target)]
+
+        target.unlink()
+        ok, error = launch_with_system(target, launched.append)
+        assert not ok and "不存在" in error
+
+        def broken_launcher(_):
+            raise OSError("no association")
+
+        folder = Path(td)
+        ok, error = launch_with_system(folder, broken_launcher)
+        assert not ok and "无法打开" in error
+
+
+def test_generation_guard():
+    manager = TaskManager()
+    manager.transition(TaskState.READY)
+
+    gen1, cancel1 = manager.start(TaskState.FETCHING)
+    assert manager.accepts(gen1)
+    manager.cancel()
+    assert cancel1.is_set()
+    assert not manager.accepts(gen1)
+
+    manager.transition(TaskState.READY)
+    gen2, _ = manager.start(TaskState.FETCHING)
+    assert gen2 != gen1
+    assert manager.accepts(gen2)
+    assert not manager.accepts(gen1)
+
+
+def test_expired_login_worker_retry_limit_and_frozen_request():
+    import threading
+
+    import weibo_archive.app as app_module
+
+    archive = build_archive()
+    selections = build_export_selections(
+        include_full=True,
+        include_ai=True,
+        include_custom=True,
+        custom_options=ExportOptions(include_source=False),
+        custom_filter=CustomFilterOptions(
+            keywords=("frozen",),
+            visibility_filter_enabled=True,
+            visibilities=frozenset({VisibilityState.PRIVATE}),
+        ),
+        ai_visibility=AIVisibilityOptions(
+            include_followers=True,
+            include_friends=True,
+        ),
+    )
+    request = app_module.ExportRequest(
+        uid=archive.profile.id,
+        fetch_range=FetchRange.recent(37),
+        output_dir=Path("C:/fixture/output"),
+        export_selections=selections,
+        fallback_dir=Path("C:/fixture/fallback"),
+    )
+    try:
+        request.auth_retry_count = 9
+    except FrozenInstanceError:
+        pass
+    else:
+        raise AssertionError("ExportRequest is mutable")
+
+    class FakeWorker:
+        def __init__(self):
+            self.events = []
+            self.logs = []
+
+        def _emit(self, generation, kind, payload=None):
+            self.events.append((generation, kind, payload))
+
+        def _worker_log(self, generation, text):
+            self.logs.append((generation, text))
+
+    class ExpiredClient:
+        instances = 0
+
+        def __init__(self, **_kwargs):
+            type(self).instances += 1
+
+        def fetch(self, uid, fetch_range):
+            assert uid == request.uid
+            assert fetch_range == request.fetch_range
+            raise AuthenticationExpired("fixture expired")
+
+    originals = (
+        app_module.load_cookie_header,
+        app_module.WeiboClient,
+        app_module.save_normalized_archive,
+        app_module.export_markdown,
+    )
+    try:
+        app_module.load_cookie_header = lambda: "SUB=offline-fixture"
+        app_module.WeiboClient = ExpiredClient
+        app_module.save_normalized_archive = lambda _archive: (_ for _ in ()).throw(
+            AssertionError("expired fetch wrote normalized archive")
+        )
+        app_module.export_markdown = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("expired fetch wrote Markdown")
+        )
+
+        first = FakeWorker()
+        app_module.App._export_worker(first, 1, threading.Event(), request)
+        assert [(kind, payload) for _, kind, payload in first.events] == [
+            ("auth_expired", request)
+        ]
+
+        retried = replace(request, auth_retry_count=1)
+        second = FakeWorker()
+        app_module.App._export_worker(second, 2, threading.Event(), retried)
+        assert [(kind, payload) for _, kind, payload in second.events] == [
+            ("auth_retry_failed", None)
+        ]
+        assert ExpiredClient.instances == 2
+
+        class SuccessfulClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def fetch(self, uid, fetch_range):
+                assert uid == request.uid
+                assert fetch_range == request.fetch_range
+                return archive
+
+        saved = []
+        app_module.WeiboClient = SuccessfulClient
+        app_module.save_normalized_archive = saved.append
+        with tempfile.TemporaryDirectory(prefix="weibo_auth_resume_") as td:
+            output_dir = Path(td)
+            successful_request = replace(
+                request,
+                output_dir=output_dir,
+                export_selections=(
+                    next(
+                        selection
+                        for selection in selections
+                        if selection.preset is ExportPreset.FULL_ARCHIVE
+                    ),
+                ),
+                fallback_dir=None,
+                auth_retry_count=1,
+            )
+
+            def successful_export(
+                _archive,
+                requested_dir,
+                _options,
+                filename_suffix,
+                **_kwargs,
+            ):
+                assert requested_dir == output_dir
+                return requested_dir / f"{filename_suffix}.md", {
+                    "count": len(archive.posts),
+                    "output_bytes": 1,
+                    "output_chars": 1,
+                    "layout": "full",
+                }
+
+            app_module.export_markdown = successful_export
+            third = FakeWorker()
+            app_module.App._export_worker(
+                third,
+                3,
+                threading.Event(),
+                successful_request,
+            )
+            done = [event for event in third.events if event[1] == "done"]
+            assert len(done) == 1
+            assert len(done[0][2]["outputs"]) == 1
+            assert done[0][2]["outputs"][0]["path"].parent == output_dir
+            assert saved == [archive]
+    finally:
+        (
+            app_module.load_cookie_header,
+            app_module.WeiboClient,
+            app_module.save_normalized_archive,
+            app_module.export_markdown,
+        ) = originals
+
+    assert request.export_selections == selections
+    assert request.export_selections[0].visibility_states == frozenset(
+        {VisibilityState.PUBLIC, VisibilityState.FOLLOWERS, VisibilityState.FRIENDS}
+    )
+    assert request.export_selections[2].custom_filter.keywords == ("frozen",)
+    assert request.export_selections[2].custom_filter.visibilities == frozenset(
+        {VisibilityState.PRIVATE}
+    )
+
+
+def test_expired_login_ui_generation_resume_and_cancellation():
+    import weibo_archive.app as app_module
+
+    originals = (
+        app_module.has_saved_login,
+        app_module.messagebox.showinfo,
+        app_module.messagebox.showerror,
+    )
+    app = None
+    notices = []
+    try:
+        app_module.has_saved_login = lambda: True
+        app_module.messagebox.showinfo = lambda title, text: notices.append(
+            ("info", title, text)
+        )
+        app_module.messagebox.showerror = lambda title, text: notices.append(
+            ("error", title, text)
+        )
+        app = app_module.App()
+        app.withdraw()
+        request = app_module.ExportRequest(
+            uid="123456",
+            fetch_range=FetchRange.since_date(date(2024, 1, 2)),
+            output_dir=Path("C:/frozen/output"),
+            export_selections=build_export_selections(
+                include_full=True,
+                include_ai=True,
+                include_custom=False,
+                custom_options=ExportOptions(),
+                custom_filter=CustomFilterOptions(),
+                ai_visibility=AIVisibilityOptions(include_private=True),
+            ),
+            fallback_dir=Path("C:/frozen/fallback"),
+        )
+
+        auth_generations = []
+
+        def fake_start_login(*, recovery=False):
+            assert recovery is True
+            generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+            auth_generations.append(generation)
+
+        resumed = []
+        fetch_generations = []
+
+        def fake_launch(resumed_request):
+            resumed.append(resumed_request)
+            generation, _ = app.tasks.start(TaskState.FETCHING)
+            fetch_generations.append(generation)
+
+        app.start_login = fake_start_login
+        app._launch_export_request = fake_launch
+
+        old_generation, _ = app.tasks.start(TaskState.FETCHING)
+        app.events.put((old_generation, "auth_expired", request))
+        app.events.put((old_generation, "status", "stale old worker event"))
+        app._poll_events()
+        assert len(auth_generations) == 1
+        assert auth_generations[0] != old_generation
+        assert app.tasks.state is TaskState.AUTHENTICATING
+        assert app._pending_export_request is request
+        assert app.status_var.get() != "stale old worker event"
+
+        app.uid_var.set("999999")
+        app.range_mode_var.set(RangeMode.ALL.value)
+        app.ai_private_var.set(False)
+        app.events.put((auth_generations[0], "ready", {"recovery": True}))
+        app._poll_events()
+        assert len(resumed) == 1
+        assert resumed[0].uid == "123456"
+        assert resumed[0].fetch_range == FetchRange.since_date(date(2024, 1, 2))
+        assert resumed[0].output_dir == Path("C:/frozen/output")
+        assert resumed[0].fallback_dir == Path("C:/frozen/fallback")
+        assert resumed[0].export_selections == request.export_selections
+        assert resumed[0].auth_retry_count == 1
+        assert fetch_generations[0] not in (old_generation, auth_generations[0])
+        assert app._pending_export_request is None
+
+        app.tasks.cancel()
+        app.tasks.transition(TaskState.READY)
+        app._pending_export_request = request
+        cancelled_auth_generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+        app.stop_current()
+        assert app._pending_export_request is None
+        assert not app.tasks.accepts(cancelled_auth_generation)
+        resumed_before = len(resumed)
+
+        app.tasks.transition(TaskState.READY)
+        manual_generation, _ = app.tasks.start(TaskState.AUTHENTICATING)
+        app.events.put((manual_generation, "ready", {"recovery": False}))
+        app._poll_events()
+        assert len(resumed) == resumed_before
+        assert app._pending_export_request is None
+    finally:
+        if app is not None:
+            app.destroy()
+        (
+            app_module.has_saved_login,
+            app_module.messagebox.showinfo,
+            app_module.messagebox.showerror,
+        ) = originals
+
+def test_dpapi_credential_store_and_legacy_migration():
+    synthetic_sub = "synthetic-test-secret"
+    synthetic_xsrf = "synthetic-xsrf"
+    cookies = {
+        "SUB": synthetic_sub,
+        "XSRF-TOKEN": synthetic_xsrf,
+    }
+    expected_header = (
+        f"SUB={synthetic_sub}; XSRF-TOKEN={synthetic_xsrf}"
+    )
+
+    def protect(data):
+        return bytes(value ^ 0xA5 for value in data)
+
+    def unprotect(data):
+        return bytes(value ^ 0xA5 for value in data)
+
+    def store_for(root, **overrides):
+        options = {
+            "protected_file": Path(root) / "credential.dat",
+            "legacy_file": Path(root) / "cookie.txt",
+            "use_dpapi": True,
+            "protect": protect,
+            "unprotect": unprotect,
+        }
+        options.update(overrides)
+        return CredentialStore(**options)
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_store_") as td:
+        root = Path(td)
+        store = store_for(root)
+        store.save_cookies(cookies)
+        protected = root / "credential.dat"
+        legacy = root / "cookie.txt"
+        payload = protected.read_bytes()
+        assert synthetic_sub.encode("utf-8") not in payload
+        assert synthetic_xsrf.encode("utf-8") not in payload
+        assert not legacy.exists()
+        assert store.has_saved_login()
+        assert store.load_cookie_header() == expected_header
+
+        try:
+            store.save_cookies({"XSRF-TOKEN": synthetic_xsrf})
+        except CredentialError as exc:
+            assert synthetic_xsrf not in str(exc)
+        else:
+            raise AssertionError("credential without SUB was saved")
+
+        old_payload = protected.read_bytes()
+
+        def failing_write(_path, _data):
+            raise OSError("synthetic write failure")
+
+        failing_store = store_for(root, atomic_write=failing_write)
+        try:
+            failing_store.save_cookies({"SUB": "replacement-secret"})
+        except CredentialError as exc:
+            assert "replacement-secret" not in str(exc)
+        else:
+            raise AssertionError("failed atomic replacement was accepted")
+        assert protected.read_bytes() == old_payload
+        assert store.load_cookie_header() == expected_header
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_migration_") as td:
+        root = Path(td)
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+        store = store_for(root)
+        assert store.load_cookie_header() == expected_header
+        assert (root / "credential.dat").is_file()
+        assert not legacy.exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_failed_migration_") as td:
+        root = Path(td)
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+
+        def failed_unprotect(_data):
+            raise RuntimeError(f"backend failure {synthetic_sub}")
+
+        store = store_for(root, unprotect=failed_unprotect)
+        try:
+            store.load_cookie_header()
+        except CredentialError as exc:
+            rendered = str(exc) + repr(exc)
+            assert synthetic_sub not in rendered
+            assert synthetic_xsrf not in rendered
+        else:
+            raise AssertionError("failed migration was accepted")
+        assert legacy.read_text(encoding="utf-8") == expected_header
+        assert not (root / "credential.dat").exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_prefer_protected_") as td:
+        root = Path(td)
+        store = store_for(root)
+        store.save_cookies(cookies)
+        legacy = root / "cookie.txt"
+        legacy.write_text("SUB=legacy-fallback", encoding="utf-8")
+        assert store.load_cookie_header() == expected_header
+        assert not legacy.exists()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_corrupt_") as td:
+        root = Path(td)
+        protected = root / "credential.dat"
+        protected.write_bytes(b"corrupt-protected-fixture")
+        store = store_for(root)
+        assert not store.has_saved_login()
+        try:
+            store.load_cookie_header()
+        except CredentialError as exc:
+            assert "corrupt-protected-fixture" not in str(exc)
+        else:
+            raise AssertionError("corrupt protected credential was accepted")
+
+        legacy = root / "cookie.txt"
+        legacy.write_text(expected_header, encoding="utf-8")
+        assert store.load_cookie_header() == expected_header
+        assert not legacy.exists()
+        assert store.has_saved_login()
+
+        legacy.write_text("SUB=legacy-to-clear", encoding="utf-8")
+        store.clear_saved_login()
+        assert not protected.exists()
+        assert not legacy.exists()
+        assert not store.has_saved_login()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_plaintext_compat_") as td:
+        root = Path(td)
+        store = CredentialStore(
+            protected_file=root / "credential.dat",
+            legacy_file=root / "cookie.txt",
+            use_dpapi=False,
+            protect=protect,
+            unprotect=unprotect,
+        )
+        store.save_cookies(cookies)
+        assert not (root / "credential.dat").exists()
+        assert (root / "cookie.txt").read_text(encoding="utf-8") == expected_header
+        assert store.load_cookie_header() == expected_header
+
+
+def test_redaction():
+    secret = "very_secret_value"
+    with tempfile.TemporaryDirectory(prefix="weibo_v7_secret_") as td:
+        cookie = Path(td) / "cookie.txt"
+        cookie.write_text(
+            f"SUB={secret}; SUBP=another_secret; SSOLoginState=12345",
+            encoding="utf-8",
+        )
+        text = (
+            f"SUB={secret}; SUBP=another_secret "
+            "https://example.invalid/?alt=one_time_token&x=1 "
+            "SSOLoginState=12345"
+        )
+        safe = redact_text(text, cookie)
+        for value in (secret, "another_secret", "one_time_token", "12345"):
+            assert value not in safe
+
+
+def test_dependency_audit():
+    forbidden_imports = {"PIL", "requests", "playwright", "selenium", "subprocess"}
+    bad_imports = []
+
+    for path in (ROOT / "weibo_archive").glob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        assert "verify=False" not in source
+        assert "ssl._create_unverified_context" not in source
+        assert "master.zip" not in source
+        assert "pip install" not in source
+        assert "github.com/dataabc" not in source
+
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                names = {(node.module or "").split(".")[0]}
+            else:
+                continue
+            for name in names & forbidden_imports:
+                bad_imports.append((path.name, name))
+
+    if bad_imports:
+        raise AssertionError(f"forbidden runtime imports: {bad_imports}")
+
+
+def test_alpha4_recovery_and_diagnostic_layer_guards():
+    runtime_files = list((ROOT / "weibo_archive").glob("*.py"))
+    for path in runtime_files:
+        source = path.read_text(encoding="utf-8")
+        assert "except IncompleteContent" not in source
+        if path.name == "client.py":
+            assert source.count("except ContentUnavailable") == 2
+        else:
+            assert "except ContentUnavailable" not in source
+
+    product_layers = (
+        "models.py",
+        "parser.py",
+        "storage.py",
+        "exporter.py",
+        "markdown_v5.py",
+        "app.py",
+    )
+    diagnostic_words = (
+        "no_view_permission_html",
+        "challenge_html",
+        "login_html",
+        "timeout",
+    )
+    for name in product_layers:
+        source = (ROOT / "weibo_archive" / name).read_text(encoding="utf-8")
+        for word in diagnostic_words:
+            assert word not in source, f"{word} leaked into {name}"
+
+
+
+def test_range_semantics():
+    from datetime import date
+    from weibo_archive.app import TEST_EXPORT_LIMIT
+
+    all_range = FetchRange.all()
+    assert all_range.mode is RangeMode.ALL
+
+    recent = FetchRange.recent(1000)
+    assert recent.mode is RangeMode.RECENT
+    assert recent.limit == 1000
+    assert recent.label() == "最近1000条"
+
+    trial = FetchRange.trial(TEST_EXPORT_LIMIT)
+    assert trial.mode is RangeMode.TRIAL
+    assert trial.limit == 20
+    assert trial.label() == "测试导出20条"
+    assert FetchRange.trial() == trial
+
+    since = FetchRange.since_date(date(2024, 1, 1))
+    assert since.mode is RangeMode.SINCE
+    assert since.since.isoformat() == "2024-01-01"
+    assert since.label() == "2024-01-01起"
+
+
+def test_no_raw_api_escape_hatch():
+    from dataclasses import fields
+    from weibo_archive.models import UserProfile, MediaInfo, Engagement
+
+    for model in (Post, UserProfile, MediaInfo, Engagement, VisibilityInfo):
+        names = {f.name for f in fields(model)}
+        assert "raw" not in names
+        assert "payload" not in names
+        assert "json" not in names
+
+
+
+def _fake_mblog(post_id: int, created: str, *, pinned: bool = False):
+    raw = {
+        "id": str(post_id),
+        "bid": f"B{post_id}",
+        "created_at": created,
+        "text": f"post-{post_id}",
+        "source": "fixture",
+        "reposts_count": 0,
+        "comments_count": 0,
+        "attitudes_count": 0,
+        "user": {"id": 1234567890, "screen_name": "测试用户"},
+    }
+    if pinned:
+        raw["mblogtype"] = 2
+    return raw
+
+
+def test_incomplete_posts_continue_current_and_next_page():
+    import threading
+
+    class FakeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.progress = lambda *args, **kwargs: None
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+            self.pages = []
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=3)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            if raw["id"] == "1":
+                return HydrationOutcome(
+                    raw,
+                    retweet_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+                )
+            if raw["id"] == "2":
+                return HydrationOutcome(
+                    raw,
+                    top_incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+                )
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            self.pages.append(page)
+            if page == 1:
+                first = _fake_mblog(1, "2026-08-13 10:00:00")
+                first["retweeted_status"] = {
+                    "id": "901",
+                    "text": "转发列表预览……全文",
+                    "user": {"screen_name": "原作者"},
+                }
+                return [first, _fake_mblog(2, "2026-08-13 09:00:00")], False
+            if page == 2:
+                return [_fake_mblog(3, "2026-08-13 08:00:00")], False
+            return [], True
+
+    client = FakeClient()
+    archive = client.fetch("1234567890", FetchRange.all())
+    assert client.pages == [1, 2, 3]
+    assert len(archive.posts) == 3
+    by_id = {post.id: post for post in archive.posts}
+    assert by_id["1"].content_state is ContentState.COMPLETE
+    assert by_id["1"].text == "post-1"
+    assert by_id["1"].retweet.content_state is ContentState.INCOMPLETE
+    assert by_id["2"].content_state is ContentState.INCOMPLETE
+    assert by_id["3"].content_state is ContentState.COMPLETE
+    assert archive.integrity == ArchiveIntegrity(3, 1, 2, 1, 1)
+
+
+def test_client_recent_range_excludes_pinned_old():
+    import threading
+    from datetime import datetime, timedelta
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.models import UserProfile
+
+    class FakeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.progress = lambda *args, **kwargs: None
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _wait_random(self, low, high):
+            pass
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            base = datetime(2026, 8, 13, 12, 0)
+            if page == 1:
+                # One deliberately old pinned-looking item mixed into the first page.
+                rows = [_fake_mblog(999999, "2018-01-01 00:00:00", pinned=True)]
+                rows += [
+                    _fake_mblog(200000-i, (base - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M:%S"))
+                    for i in range(19)
+                ]
+                return rows, False
+            if page == 2:
+                rows = [
+                    _fake_mblog(199981-i, (base - timedelta(minutes=19+i)).strftime("%Y-%m-%d %H:%M:%S"))
+                    for i in range(20)
+                ]
+                return rows, False
+            return [], True
+
+    archive = FakeClient().fetch("1234567890", FetchRange.recent(5))
+    assert len(archive.posts) == 5
+    assert all(p.created_at.year == 2026 for p in archive.posts)
+    assert "999999" not in {p.id for p in archive.posts}
+
+
+def test_trial_stops_on_50_timeline_candidates_and_ignores_pinned_frontier():
+    import threading
+    from datetime import datetime, timedelta
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.models import UserProfile
+
+    class FakeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.events = []
+            self.progress = lambda message, data=None: self.events.append((message, data or {}))
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+            self.pages = []
+            self.hydrated_ids = []
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            self.hydrated_ids.append(str(raw["id"]))
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            self.pages.append(page)
+            base = datetime(2026, 8, 11, 12, 0)
+            if page == 1:
+                return [
+                    _fake_mblog(900001, "2025-11-08 02:32:08", pinned=True),
+                    _fake_mblog(900002, "2025-03-11 22:04:29", pinned=True),
+                    *[
+                        _fake_mblog(
+                            300000 - i,
+                            (base - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                        for i in range(20)
+                    ],
+                ], False
+            if page == 2:
+                return [
+                    _fake_mblog(
+                        299980 - i,
+                        (base - timedelta(minutes=20 + i)).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    for i in range(20)
+                ], False
+            if page == 3:
+                return [
+                    _fake_mblog(
+                        299960 - i,
+                        (base - timedelta(minutes=40 + i)).strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    for i in range(20)
+                ], False
+            raise AssertionError("trial fetch requested an unnecessary fourth page")
+
+    client = FakeClient()
+    archive = client.fetch("1234567890", FetchRange.trial(50))
+
+    assert client.pages == [1, 2, 3]
+    assert len(client.hydrated_ids) == 52  # two pinned records plus 50 timeline candidates
+    assert len(archive.posts) == 50
+    assert archive.report.pages_fetched == 3
+    assert archive.report.termination is Termination.TARGET_COUNT
+    assert {"900001", "900002"}.isdisjoint({post.id for post in archive.posts})
+
+    page_one = next(
+        (message, data)
+        for message, data in client.events
+        if message.startswith("已获得 20 条时间线候选")
+    )
+    assert "2025-03-11" not in page_one[0]
+    assert page_one[1]["posts"] == 20
+    assert page_one[1]["count_label"] == "条候选"
+    assert page_one[1]["frontier"].startswith("2026-08-11")
+
+    final_progress = next(
+        (message, data)
+        for message, data in reversed(client.events)
+        if message.startswith("已获得")
+    )
+    assert final_progress[0].startswith("已获得 50 条时间线候选")
+    assert final_progress[1]["posts"] == 50
+
+
+def test_log_expansion_height_is_clamped_to_work_area():
+    from weibo_archive.app import (
+        _compact_window_height,
+        _fit_expanded_height,
+        _geometry_spec,
+    )
+
+    assert _compact_window_height(760, 771) == 771
+    assert _compact_window_height(760, 740) == 760
+
+    height, y = _fit_expanded_height(760, 1000, 100, 0, 1040)
+    assert (height, y) == (1000, 40)
+
+    height, y = _fit_expanded_height(760, 1300, 100, 0, 1040)
+    assert (height, y) == (1040, 0)
+    assert _geometry_spec(860, height, -1920, y) == "860x1040-1920+0"
+
+
+def test_child_window_centering_and_work_area_clamp():
+    from weibo_archive.app import _centered_child_geometry, _geometry_spec
+
+    geometry = _centered_child_geometry(
+        100, 100, 860, 760,
+        400, 300,
+        0, 0, 1920, 1040,
+    )
+    assert geometry == (400, 300, 330, 330)
+
+    geometry = _centered_child_geometry(
+        -1700, 100, 860, 760,
+        400, 300,
+        -1920, 0, 0, 1040,
+    )
+    assert geometry == (400, 300, -1470, 330)
+    assert _geometry_spec(*geometry) == "400x300-1470+330"
+
+    geometry = _centered_child_geometry(
+        1700, 900, 300, 200,
+        500, 300,
+        0, 0, 1920, 1040,
+    )
+    assert geometry == (500, 300, 1420, 740)
+
+    geometry = _centered_child_geometry(
+        100, 100, 860, 760,
+        2200, 1200,
+        0, 0, 1920, 1040,
+    )
+    assert geometry == (1920, 1040, 0, 0)
+
+
+def test_client_since_range_requires_two_old_pages():
+    import threading
+    from datetime import datetime
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.models import UserProfile
+
+    class FakeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.progress = lambda *args, **kwargs: None
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _wait_random(self, low, high):
+            pass
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page == 1:
+                # Mixed page: one old pinned item must not stop the crawl.
+                return [
+                    _fake_mblog(1, "2018-01-01 00:00:00"),
+                    _fake_mblog(2, "2025-06-01 00:00:00"),
+                    _fake_mblog(3, "2024-02-01 00:00:00"),
+                ], False
+            if page == 2:
+                return [
+                    _fake_mblog(4, "2023-12-20 00:00:00"),
+                    _fake_mblog(5, "2023-11-20 00:00:00"),
+                ], False
+            if page == 3:
+                return [
+                    _fake_mblog(6, "2023-10-20 00:00:00"),
+                    _fake_mblog(7, "2023-09-20 00:00:00"),
+                ], False
+            return [], True
+
+    from datetime import date
+    archive = FakeClient().fetch(
+        "1234567890",
+        FetchRange.since_date(date(2024, 1, 1)),
+    )
+    ids = {p.id for p in archive.posts}
+    assert ids == {"2", "3"}
+    assert archive.report.termination is Termination.SINCE_REACHED
+    assert archive.report.pages_fetched == 3
+
+
+def test_ambiguous_empty_page_fails_closed():
+    import threading
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.network import InvalidResponse
+
+    client = WeiboClient(
+        cookie_header="SUB=fake",
+        cancel_event=threading.Event(),
+        progress=lambda *args, **kwargs: None,
+    )
+    client._wait_random = lambda *args: None
+    client.http.json = lambda *args, **kwargs: {
+        "ok": 1,
+        "data": {
+            "cards": [
+                {"card_type": 8, "title": "unexpected layout"}
+            ]
+        },
+    }
+
+    try:
+        client._timeline_page("1234567890", 99)
+    except InvalidResponse:
+        pass
+    else:
+        raise AssertionError("ambiguous non-empty cards were treated as natural end")
+
+
+
+def test_unknown_ok0_is_not_natural_end():
+    import threading
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.network import RateLimited
+
+    client = WeiboClient(
+        cookie_header="SUB=fake",
+        cancel_event=threading.Event(),
+        progress=lambda *args, **kwargs: None,
+    )
+    client._wait_random = lambda *args: None
+    client.http.json = lambda *args, **kwargs: {
+        "ok": 0,
+        "msg": "访问频繁，请稍后再试",
+    }
+
+    try:
+        client._timeline_page("1234567890", 99)
+    except RateLimited:
+        pass
+    else:
+        raise AssertionError("limited ok=0 response was treated as natural end")
+
+
+def test_since_unknown_date_cannot_trigger_early_stop():
+    import threading
+    from datetime import date
+    from weibo_archive.client import WeiboClient
+    from weibo_archive.models import UserProfile
+
+    class FakeClient(WeiboClient):
+        def __init__(self):
+            self.cancel_event = threading.Event()
+            self.progress = lambda *args, **kwargs: None
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _wait_random(self, low, high):
+            pass
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page == 1:
+                unknown = _fake_mblog(88, "2023-12-20 00:00:00")
+                unknown["created_at"] = "UNRECOGNIZED-DATE-FORMAT"
+                return [
+                    _fake_mblog(87, "2023-12-21 00:00:00"),
+                    unknown,
+                ], False
+            if page == 2:
+                return [_fake_mblog(89, "2023-11-20 00:00:00")], False
+            if page == 3:
+                # If page 1 had incorrectly counted as "wholly old", the crawler
+                # would stop before reaching this newer post.
+                return [_fake_mblog(90, "2024-02-20 00:00:00")], False
+            return [], True
+
+    archive = FakeClient().fetch(
+        "1234567890",
+        FetchRange.since_date(date(2024, 1, 1)),
+    )
+    ids = {p.id for p in archive.posts}
+    assert "90" in ids
+    assert "88" in ids   # Unknown date is retained rather than silently discarded.
+    assert "87" not in ids
+    assert "89" not in ids
+    assert archive.report.termination is Termination.NATURAL
+
+
+def test_relative_timestamp_cannot_prove_since_or_frontier():
+    import threading
+
+    boundary = date.today()
+    old = (boundary - timedelta(days=1)).strftime("%Y-%m-%d 12:00:00")
+    current = boundary.strftime("%Y-%m-%d 12:00:00")
+
+    class FakeClient(WeiboClient):
+        def __init__(self, pages):
+            self.cancel_event = threading.Event()
+            self.events = []
+            self.progress = lambda message, data=None: self.events.append((message, data))
+            self.posts_since_batch_rest = 0
+            self.posts_since_session_rest = 0
+            self.http = type("H", (), {"request_count": 0})()
+            self.pages = pages
+
+        def preheat(self):
+            pass
+
+        def fetch_profile(self, uid):
+            return UserProfile(id=uid, screen_name="测试用户", statuses_count=100)
+
+        def _rest_if_needed(self):
+            pass
+
+        def _hydrate_long_texts(self, raw):
+            return HydrationOutcome(raw)
+
+        def _timeline_page(self, uid, page):
+            if page <= len(self.pages):
+                return self.pages[page - 1], False
+            return [], True
+
+    since_client = FakeClient(
+        [
+            [_fake_mblog(301, old)],
+            [_fake_mblog(302, "昨天 00:00")],
+            [_fake_mblog(303, old)],
+            [_fake_mblog(304, current)],
+        ]
+    )
+    archive = since_client.fetch(
+        "1234567890",
+        FetchRange.since_date(boundary),
+    )
+    assert {post.id for post in archive.posts} == {"302", "304"}
+    assert archive.report.termination is Termination.NATURAL
+
+    relative_only = FakeClient([[_fake_mblog(401, "5分钟前")]])
+    relative_only.fetch("1234567890", FetchRange.all())
+    progress_payloads = [
+        data
+        for message, data in relative_only.events
+        if message.startswith("已获得") and data is not None
+    ]
+    assert progress_payloads and progress_payloads[-1]["frontier"] is None
+
+
+def main():
+    suite = [
+        ("startup import", test_startup_import),
+        ("Alpha4 version and no-console GUI launcher", test_alpha4_version_and_gui_launcher),
+        ("Windows preview packaging contract", test_windows_preview_packaging_contract),
+        ("portable Archives path and initial output defaults", test_portable_archives_path_and_initial_output_defaults),
+        ("activity indicator lifecycle", test_activity_indicator_lifecycle),
+        ("final polish activity status and localized UI", test_final_polish_activity_status_and_localized_ui),
+        ("raw parser contract", test_parser_contract),
+        ("0.5.2 visibility parser and model contract", test_visibility_parser_and_model_contract),
+        ("frozen model boundary", test_model_boundary),
+        ("Alpha4 Post invariants and integrity", test_alpha4_post_invariants_and_integrity_combinations),
+        ("Alpha4 parser explicit incomplete reasons", test_alpha4_parser_explicit_reasons_and_raw_immutability),
+        ("nested platform tombstone semantics", test_nested_platform_tombstone_semantics),
+        ("long-text detail decoder", test_longtext_detail_decoder),
+        ("non-JSON diagnostics contain no body/query", test_network_non_json_diagnostic_has_no_body_or_query),
+        ("0.5.3 adaptive network backoff", test_performance_constants_and_adaptive_network_backoff),
+        ("non-JSON classifier safety priority", test_non_json_classifier_prioritizes_challenge_and_login),
+        ("0.5.5 authentication-expiry classification", test_authentication_expiry_classification_and_propagation),
+        ("long-text permission failure diagnostics", test_longtext_permission_failure_preserves_two_safe_attempts),
+        ("long-text mixed outcomes remain fatal", test_longtext_mixed_or_challenge_outcomes_remain_fatal),
+        ("long-text cancellation remains cancellation", test_longtext_cancelled_is_not_converted_to_incomplete),
+        ("long-text unavailable negative cache", test_unavailable_negative_cache_is_deterministic),
+        ("top and retweet hydration independence", test_top_and_retweet_hydration_states_are_independent),
+        ("post-parse hydration safety validation", test_runtime_post_parse_validation_fails_closed),
+        ("long-text global safety fuse", test_longtext_global_safety_fuse_thresholds_and_unique_ids),
+        ("long-text detail fallback", test_longtext_detail_fallback_success_after_extend_schema_failure),
+        ("long-text extend response shapes", test_longtext_extend_supported_shapes_do_not_call_detail),
+        ("long-text detail ID mismatch", test_longtext_detail_id_mismatch_fails_closed),
+        ("long-text unknown detail schema", test_longtext_unknown_detail_schema_fails_closed),
+        ("legacy exporter goldens", test_exporter_golden),
+        ("Alpha3 exporter goldens and single output", test_alpha3_exporter_goldens_and_single_output),
+        ("Alpha4 incomplete exporter goldens", test_alpha4_incomplete_full_and_ai_goldens),
+        ("Alpha4 AI incomplete retweet dedup", test_alpha4_ai_incomplete_retweet_dedup_and_empty_preview),
+        ("0.4.2 AI Compact attribution schema", test_ai_compact_attribution_and_field_schema),
+        ("0.5 semantic time provenance", test_semantic_time_provenance_and_presentation_contract),
+        ("0.5 semantic engagement, empty RT, and SELF", test_semantic_engagement_empty_rt_and_self_identity),
+        ("0.5 lossless RT references and empty top-level W", test_ai_retweet_reference_is_lossless_per_occurrence),
+        ("0.5 invalid author UID contract", test_invalid_author_uid_contract),
+        ("Alpha3 options resolver and frozen snapshot", test_export_options_resolution_and_snapshot),
+        ("visibility scope/filter and current cache schema", test_visibility_scope_filter_and_schema3_contract),
+        ("0.5.2 Full and AI visibility rendering", test_visibility_full_and_ai_rendering_contract),
+        ("0.5 custom filter contract", test_custom_filter_contract),
+        ("0.5 multi-output fetch-once contract", test_multi_output_fetch_once_and_isolation),
+        ("Alpha3 document-wide field policy", test_alpha3_field_policy_applies_to_main_and_repost),
+        ("Alpha3 normalized archive independence", test_export_does_not_mutate_normalized_archive),
+        ("Alpha4 normalized cache semantics", test_alpha4_normalized_cache_contains_only_stable_semantics),
+        ("Alpha4 completion integrity warning", test_completion_integrity_warning_text),
+        ("Alpha3 atomic cancellation safety", test_atomic_export_preserves_existing_final_on_cancel_or_failure),
+        ("Day-0 collision-safe Markdown output", test_collision_safe_export_preserves_every_snapshot),
+        ("Day-0 UID guard and user wording", test_day0_uid_guard_and_user_facing_wording),
+        ("bounded GitHub update check", test_bounded_github_update_check),
+        ("Alpha3 Windows launcher helper", test_safe_system_launcher),
+        ("generation guard", test_generation_guard),
+        ("0.5.5 frozen request and retry limit", test_expired_login_worker_retry_limit_and_frozen_request),
+        ("0.5.5 recovery generation and cancellation", test_expired_login_ui_generation_resume_and_cancellation),
+        ("range semantics", test_range_semantics),
+        ("no raw API escape hatch", test_no_raw_api_escape_hatch),
+        ("Alpha4 recovery layer guards", test_alpha4_recovery_and_diagnostic_layer_guards),
+        ("incomplete posts continue pagination", test_incomplete_posts_continue_current_and_next_page),
+        ("recent range pinned-post guard", test_client_recent_range_excludes_pinned_old),
+        ("trial target and pinned frontier", test_trial_stops_on_50_timeline_candidates_and_ignores_pinned_frontier),
+        ("log expansion work-area clamp", test_log_expansion_height_is_clamped_to_work_area),
+        ("child window centering and work-area clamp", test_child_window_centering_and_work_area_clamp),
+        ("since-date two-page guard", test_client_since_range_requires_two_old_pages),
+        ("ambiguous empty page fails closed", test_ambiguous_empty_page_fails_closed),
+        ("unknown ok=0 fails closed", test_unknown_ok0_is_not_natural_end),
+        ("since-date unknown timestamp guard", test_since_unknown_date_cannot_trigger_early_stop),
+        ("relative timestamp boundary guard", test_relative_timestamp_cannot_prove_since_or_frontier),
+        ("Windows DPAPI credential storage", test_dpapi_credential_store_and_legacy_migration),
+        ("security redaction", test_redaction),
+        ("zero-runtime-dependency audit", test_dependency_audit),
+    ]
+    for name, fn in suite:
+        fn()
+        print(f"[PASS] {name}")
+    print("\nALL TESTS PASSED")
+
+
+if __name__ == "__main__":
+    main()

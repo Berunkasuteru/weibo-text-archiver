@@ -1,0 +1,8 @@
+{
+  "ok": 1,
+  "data": {
+    "longText": {
+      "longTextContent": "<p>嵌套结构中的完整长微博正文</p>"
+    }
+  }
+}

@@ -1,0 +1,2133 @@
+from __future__ import annotations
+
+import os
+import queue
+import re
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass, replace
+from datetime import date, datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from . import VERSION_DISPLAY
+from .auth import begin_qr_login, poll_qr_login, qr_matrix
+from .client import WeiboClient
+from .credentials import (
+    clear_saved_login,
+    has_saved_login,
+    load_cookie_header,
+    save_cookies,
+)
+from .export_options import (
+    AIVisibilityOptions,
+    CustomFilterOptions,
+    CustomFilterReport,
+    DateFormat,
+    ExportLayout,
+    ExportOptions,
+    ExportPreset,
+    ExportSelection,
+    build_export_selections,
+    filter_archive,
+    filter_archive_visibility,
+    filter_report_notice,
+    filter_summary,
+    options_summary,
+    parse_filter_terms,
+    visibility_scope_text,
+)
+from .exporter import export_markdown
+from .models import (
+    ArchiveIntegrity,
+    FetchRange,
+    RangeMode,
+    Termination,
+    VisibilityState,
+)
+from .network import AuthenticationExpired, Cancelled, NetworkError, RateLimited
+from .paths import (
+    APP_ICON_PNG,
+    default_output_dir,
+    fallback_output_dir,
+    prepare_output_dir,
+)
+from .security import redact_text, save_detailed_error
+from .storage import save_normalized_archive
+from .tasking import TaskManager, TaskState
+from .update_check import find_newer_github_version, launch_official_release_page
+from .image_ui import image_task_active, open_image_window
+
+
+APP_TITLE = "Weibo Text Archiver"
+APP_SUBTITLE = "把微博历史整理成便于长期保存与 AI 分析的本地归档"
+TEST_EXPORT_LIMIT = 20
+DEFAULT_WINDOW_WIDTH = 860
+DEFAULT_COMPACT_HEIGHT = 760
+
+
+@dataclass(frozen=True)
+class ExportRequest:
+    uid: str
+    fetch_range: FetchRange
+    output_dir: Path
+    export_selections: tuple[ExportSelection, ...]
+    fallback_dir: Path | None = None
+    auth_retry_count: int = 0
+
+
+def format_elapsed_time(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02}:{seconds:02}"
+    return f"{minutes:02}:{seconds:02}"
+
+
+def activity_status_text(read_count: int, elapsed_seconds: float) -> str:
+    return f"已读取 {max(0, int(read_count)):,} 条 · 用时 {format_elapsed_time(elapsed_seconds)}"
+
+
+def _compact_window_height(configured_height: int, requested_height: int) -> int:
+    """Honor real Tk font/DPI requirements without arbitrary extra height."""
+    return max(configured_height, requested_height)
+
+
+def _fit_expanded_height(
+    current_height: int,
+    requested_height: int,
+    current_y: int,
+    work_top: int,
+    work_bottom: int,
+) -> tuple[int, int]:
+    """Fit an expanded window into the current monitor's usable vertical area."""
+    work_height = max(1, work_bottom - work_top)
+    height = min(max(current_height, requested_height), work_height)
+    y = min(max(current_y, work_top), work_bottom - height)
+    return height, y
+
+
+def _geometry_spec(width: int, height: int, x: int, y: int) -> str:
+    x_part = f"+{x}" if x >= 0 else str(x)
+    y_part = f"+{y}" if y >= 0 else str(y)
+    return f"{width}x{height}{x_part}{y_part}"
+
+
+def _centered_child_geometry(
+    parent_x: int,
+    parent_y: int,
+    parent_width: int,
+    parent_height: int,
+    child_width: int,
+    child_height: int,
+    work_left: int,
+    work_top: int,
+    work_right: int,
+    work_bottom: int,
+) -> tuple[int, int, int, int]:
+    """Center a child on its parent, then clamp it to the parent's work area."""
+    work_width = max(1, work_right - work_left)
+    work_height = max(1, work_bottom - work_top)
+    width = min(max(1, child_width), work_width)
+    height = min(max(1, child_height), work_height)
+
+    x = parent_x + (parent_width - width) // 2
+    y = parent_y + (parent_height - height) // 2
+    x = min(max(x, work_left), work_right - width)
+    y = min(max(y, work_top), work_bottom - height)
+    return width, height, x, y
+
+
+def _load_app_icon(window, icon_path: Path = APP_ICON_PNG):
+    """Set the tracked icon when available; retain Tk's default on failure."""
+    try:
+        icon = tk.PhotoImage(master=window, file=str(icon_path))
+        window.iconphoto(True, icon)
+        return icon
+    except (OSError, tk.TclError):
+        return None
+
+
+def extract_uid(value: str) -> str:
+    m = re.search(r"(?<!\d)(\d{5,})(?!\d)", (value or "").strip())
+    return m.group(1) if m else ""
+
+
+def is_obvious_single_post_url(value: str) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    candidate = raw
+    if "://" not in candidate and re.match(
+        r"^(?:[A-Za-z0-9-]+\.)*weibo\.(?:com|cn)(?:/|$)",
+        candidate,
+        re.IGNORECASE,
+    ):
+        candidate = "https://" + candidate
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    if host != "weibo.com" and not host.endswith(".weibo.com"):
+        if host != "weibo.cn" and not host.endswith(".weibo.cn"):
+            return False
+    segments = {
+        urllib.parse.unquote(segment).casefold()
+        for segment in parsed.path.split("/")
+        if segment
+    }
+    return bool(segments & {"detail", "status"})
+
+
+def launch_with_system(
+    path: Path,
+    launcher=None,
+) -> tuple[bool, str]:
+    """Open an existing output path without shell commands or import-time OS assumptions."""
+    target = Path(path)
+    if not target.exists():
+        return False, "目标已经不存在，可能已被移动或删除。"
+
+    selected_launcher = launcher if launcher is not None else getattr(os, "startfile", None)
+    if selected_launcher is None:
+        return False, "当前系统不支持此打开方式。"
+
+    try:
+        selected_launcher(str(target))
+    except OSError:
+        return False, "Windows 无法打开该目标；请检查文件关联或访问权限。"
+    return True, ""
+
+
+def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
+    if not integrity.incomplete_records:
+        return []
+    return [
+        f"完整记录：{integrity.complete_records:,}",
+        f"不完整记录：{integrity.incomplete_records:,}",
+        (
+            f"其中：顶层正文 {integrity.incomplete_top_level:,} · "
+            f"转发原文 {integrity.incomplete_retweets:,}"
+        ),
+        "无法验证的内容已在 Markdown 中明确标记。",
+    ]
+
+
+class ActivityIndicator(tk.Canvas):
+    """Small indeterminate data-eater indicator driven only by Tk's event loop."""
+
+    _INTERVAL_MS = 45
+    _PASS_FRAMES = 56
+    _LAST_FRAME = _PASS_FRAMES * 2
+    _DOT_X = (46, 72, 98, 124, 150, 176, 202)
+
+    def __init__(self, master):
+        background = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
+        super().__init__(
+            master,
+            width=240,
+            height=16,
+            background=background,
+            borderwidth=0,
+            highlightthickness=0,
+        )
+        self._after_id: str | None = None
+        self._frame = 0
+        self._running = False
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def start(self) -> None:
+        if self._running:
+            return
+        try:
+            if not self.winfo_exists():
+                return
+            self._running = True
+            self._frame = 0
+            self._draw_frame()
+            self._schedule()
+        except tk.TclError:
+            self._running = False
+            self._after_id = None
+
+    def stop(self) -> None:
+        self._running = False
+        after_id, self._after_id = self._after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        try:
+            self.delete("activity_item")
+        except tk.TclError:
+            pass
+
+    def _schedule(self) -> None:
+        if self._running and self._after_id is None:
+            self._after_id = self.after(self._INTERVAL_MS, self._tick)
+
+    def _tick(self) -> None:
+        self._after_id = None
+        if not self._running:
+            return
+        try:
+            self._frame = (self._frame + 1) % self._LAST_FRAME
+            self._draw_frame()
+            self._schedule()
+        except tk.TclError:
+            self._running = False
+            self._after_id = None
+
+    def _draw_frame(self) -> None:
+        pass_frame = self._frame % self._PASS_FRAMES
+        moving_right = self._frame < self._PASS_FRAMES
+        progress = pass_frame / (self._PASS_FRAMES - 1)
+        character_x = round(12 + 216 * progress) if moving_right else round(228 - 216 * progress)
+        center_y = 8
+        radius = 5
+        background = self.cget("background")
+
+        self.delete("activity_item")
+        visible_dots = (
+            (x for x in self._DOT_X if x > character_x + radius)
+            if moving_right
+            else (x for x in self._DOT_X if x < character_x - radius)
+        )
+        for x in visible_dots:
+            self.create_oval(
+                x - 2,
+                center_y - 2,
+                x + 2,
+                center_y + 2,
+                fill="#888888",
+                outline="",
+                tags="activity_item",
+            )
+
+        self.create_oval(
+            character_x - radius,
+            center_y - radius,
+            character_x + radius,
+            center_y + radius,
+            fill="#444444",
+            outline="",
+            tags="activity_item",
+        )
+        mouth_direction = 1 if moving_right else -1
+        if (self._frame // 3) % 2 == 0:
+            mouth_edge = character_x + mouth_direction * (radius + 1)
+            self.create_polygon(
+                character_x,
+                center_y,
+                mouth_edge,
+                center_y - 4,
+                mouth_edge,
+                center_y + 4,
+                fill=background,
+                outline=background,
+                tags="activity_item",
+            )
+        else:
+            self.create_line(
+                character_x,
+                center_y,
+                character_x + mouth_direction * (radius + 1),
+                center_y,
+                fill=background,
+                width=1,
+                tags="activity_item",
+            )
+
+    def _on_destroy(self, event) -> None:
+        if event.widget is self:
+            self.stop()
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self._app_icon_image = _load_app_icon(self)
+        self.title(f"{APP_TITLE} · {VERSION_DISPLAY}")
+        self.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_COMPACT_HEIGHT}")
+        self.minsize(780, 650)
+
+        self.events: queue.Queue = queue.Queue()
+        self.tasks = TaskManager()
+        self.worker: threading.Thread | None = None
+
+        self.qr_window: tk.Toplevel | None = None
+        self.qr_canvas: tk.Canvas | None = None
+        self.qr_status_var = tk.StringVar(value="正在获取二维码…")
+
+        self.uid_var = tk.StringVar()
+        self.default_output_dir = default_output_dir()
+        self.fallback_output_dir = fallback_output_dir()
+        self.output_var = tk.StringVar(value=str(self.default_output_dir))
+        self.range_mode_var = tk.StringVar(value=RangeMode.ALL.value)
+        self.recent_count_var = tk.StringVar(value="1000")
+        self.since_date_var = tk.StringVar(value="")
+        self.full_output_var = tk.BooleanVar(value=True)
+        self.ai_output_var = tk.BooleanVar(value=True)
+        self.custom_output_var = tk.BooleanVar(value=False)
+        self.custom_options = ExportOptions()
+        self.custom_filter = CustomFilterOptions()
+        self.ai_followers_var = tk.BooleanVar(value=False)
+        self.ai_friends_var = tk.BooleanVar(value=False)
+        self.ai_private_var = tk.BooleanVar(value=False)
+        self.content_summary_var = tk.StringVar()
+        self.login_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="就绪")
+        self.progress_detail_var = tk.StringVar(value="等待任务")
+        self.activity_status_var = tk.StringVar(value="")
+        self.range_hint_var = tk.StringVar(value="默认：抓取当前接口能访问到的全部微博。")
+        self.logs_visible = False
+        self._compact_geometry: tuple[int, int, int, int] | None = None
+        self._poll_after_id: str | None = None
+        self._update_after_id: str | None = None
+        self._activity_after_id: str | None = None
+        self._activity_started_at: float | None = None
+        self._activity_read_count = 0
+        self._activity_timer_running = False
+        self._pending_export_request: ExportRequest | None = None
+        self._update_check_started = False
+
+        self._configure_style()
+        self._build_ui()
+        self.update_idletasks()
+        compact_height = _compact_window_height(
+            DEFAULT_COMPACT_HEIGHT,
+            self.winfo_reqheight(),
+        )
+        self.geometry(f"{DEFAULT_WINDOW_WIDTH}x{compact_height}")
+        self._refresh_login_status()
+        self._update_range_controls()
+        self._update_content_controls()
+        self._poll_after_id = self.after(100, self._poll_events)
+        self._update_after_id = self.after(500, self._start_update_check)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # -------------------- UI --------------------
+
+    def _configure_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("vista" if os.name == "nt" else "clam")
+        except tk.TclError:
+            pass
+
+        style.configure("Hero.TLabel", font=("Segoe UI", 21, "bold"))
+        style.configure("Sub.TLabel", font=("Microsoft YaHei UI", 10))
+        style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("Status.TLabel", font=("Consolas", 9))
+        style.configure("Primary.TButton", padding=(16, 8))
+        style.configure("Quiet.TButton", padding=(10, 6))
+        style.configure("CompletionAction.TButton", padding=(16, 8))
+        style.configure("Card.TFrame", relief="solid", borderwidth=1)
+        style.configure("Muted.TLabel", foreground="#666666")
+
+    def _build_ui(self):
+        self.root_frame = ttk.Frame(self, padding=(24, 20, 24, 18))
+        self.root_frame.pack(fill="both", expand=True)
+
+        # Hero
+        hero = ttk.Frame(self.root_frame)
+        hero.pack(fill="x")
+        ttk.Label(hero, text=APP_TITLE, style="Hero.TLabel").pack(side="left")
+        version_panel = ttk.Frame(hero)
+        version_panel.pack(side="right", anchor="n")
+        ttk.Label(
+            version_panel,
+            text=VERSION_DISPLAY,
+            style="Muted.TLabel",
+        ).pack(anchor="e", pady=(8, 0))
+        self.update_notice_label = ttk.Label(
+            version_panel,
+            text="",
+            style="Muted.TLabel",
+            cursor="hand2",
+        )
+        self.update_notice_label.bind(
+            "<Button-1>",
+            lambda _event: launch_official_release_page(),
+        )
+        ttk.Label(
+            self.root_frame,
+            text=APP_SUBTITLE,
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(0, 18))
+
+        # Account
+        self._section_label("登录账号")
+        account = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        account.pack(fill="x", pady=(4, 14))
+
+        ttk.Label(account, textvariable=self.login_var).pack(side="left")
+        self.clear_login_btn = ttk.Button(
+            account,
+            text="清除登录信息",
+            style="Quiet.TButton",
+            command=self.clear_login,
+        )
+        self.clear_login_btn.pack(side="right")
+        self.login_btn = ttk.Button(
+            account,
+            text="扫码登录 / 更新",
+            style="Quiet.TButton",
+            command=self.start_login,
+        )
+        self.login_btn.pack(side="right", padx=(0, 8))
+
+        # Target
+        self._section_label("目标账号")
+        target = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        target.pack(fill="x", pady=(4, 14))
+
+        ttk.Label(
+            target,
+            text="数字 UID 或包含数字 UID 的微博主页链接",
+            style="Muted.TLabel",
+        ).pack(anchor="w")
+        self.uid_entry = ttk.Entry(target, textvariable=self.uid_var)
+        self.uid_entry.pack(fill="x", pady=(7, 0))
+
+        # Range
+        self._section_label("导出范围")
+        range_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        range_card.pack(fill="x", pady=(4, 14))
+
+        all_row = ttk.Frame(range_card)
+        all_row.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            all_row,
+            text="全量快照",
+            variable=self.range_mode_var,
+            value=RangeMode.ALL.value,
+            command=self._update_range_controls,
+        ).pack(side="left")
+
+        recent_row = ttk.Frame(range_card)
+        recent_row.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            recent_row,
+            text="最近",
+            variable=self.range_mode_var,
+            value=RangeMode.RECENT.value,
+            command=self._update_range_controls,
+        ).pack(side="left")
+        self.recent_entry = ttk.Entry(
+            recent_row,
+            width=8,
+            textvariable=self.recent_count_var,
+        )
+        self.recent_entry.pack(side="left", padx=(8, 6))
+        self.recent_suffix_label = ttk.Label(recent_row, text="条")
+        self.recent_suffix_label.pack(side="left")
+
+        since_row = ttk.Frame(range_card)
+        since_row.pack(fill="x", pady=2)
+        ttk.Radiobutton(
+            since_row,
+            text="从",
+            variable=self.range_mode_var,
+            value=RangeMode.SINCE.value,
+            command=self._update_range_controls,
+        ).pack(side="left")
+        self.since_entry = ttk.Entry(
+            since_row,
+            width=14,
+            textvariable=self.since_date_var,
+        )
+        self.since_entry.pack(side="left", padx=(8, 6))
+        self.since_suffix_label = ttk.Label(since_row, text="起（YYYY-MM-DD）")
+        self.since_suffix_label.pack(side="left")
+
+        ttk.Label(
+            range_card,
+            textvariable=self.range_hint_var,
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(7, 0))
+
+        # Output selection
+        self._section_label("导出内容")
+        content_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        content_card.pack(fill="x", pady=(4, 14))
+
+        preset_row = ttk.Frame(content_card)
+        preset_row.pack(fill="x")
+        self.output_buttons = []
+        for text, variable in (
+            ("AI 分析版", self.ai_output_var),
+            ("完整归档", self.full_output_var),
+            ("自定义导出", self.custom_output_var),
+        ):
+            button = ttk.Checkbutton(
+                preset_row,
+                text=text,
+                variable=variable,
+                command=self._update_content_controls,
+            )
+            button.pack(side="left", padx=(0, 18))
+            self.output_buttons.append(button)
+
+        ai_scope_row = ttk.Frame(content_card)
+        ai_scope_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(ai_scope_row, text="AI 分析范围：公开（默认）").pack(side="left")
+        ttk.Label(ai_scope_row, text="另含：", style="Muted.TLabel").pack(
+            side="left", padx=(16, 4)
+        )
+        self.ai_visibility_buttons = []
+        for text, variable in (
+            ("粉丝可见", self.ai_followers_var),
+            ("好友圈", self.ai_friends_var),
+            ("仅自己可见", self.ai_private_var),
+        ):
+            button = ttk.Checkbutton(
+                ai_scope_row,
+                text=text,
+                variable=variable,
+                command=self._update_content_controls,
+            )
+            button.pack(side="left", padx=(0, 12))
+            self.ai_visibility_buttons.append(button)
+
+        ttk.Label(
+            content_card,
+            text=(
+                "限制可见内容可能属于不同受众语境。AI 分析版默认仅包含公开微博；"
+                "完整归档仍保存本次登录会话返回的全部记录。"
+            ),
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+
+        content_detail = ttk.Frame(content_card)
+        content_detail.pack(fill="x", pady=(8, 0))
+        ttk.Label(
+            content_detail,
+            textvariable=self.content_summary_var,
+            style="Muted.TLabel",
+        ).pack(side="left", fill="x", expand=True)
+        self.custom_settings_btn = ttk.Button(
+            content_detail,
+            text="设置…",
+            style="Quiet.TButton",
+            command=self._open_custom_settings,
+        )
+        self.custom_settings_btn.pack(side="right", padx=(8, 0))
+
+        # Save location
+        self._section_label("保存位置")
+        output_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        output_card.pack(fill="x", pady=(4, 14))
+        output_row = ttk.Frame(output_card)
+        output_row.pack(fill="x")
+        self.output_entry = ttk.Entry(output_row, textvariable=self.output_var)
+        self.output_entry.pack(side="left", fill="x", expand=True)
+        self.output_choose_btn = ttk.Button(
+            output_row,
+            text="选择文件夹",
+            style="Quiet.TButton",
+            command=self.choose_output,
+        )
+        self.output_choose_btn.pack(side="left", padx=(8, 0))
+
+        # Actions
+        actions = ttk.Frame(self.root_frame)
+        actions.pack(fill="x", pady=(2, 10))
+        self.trial_btn = ttk.Button(
+            actions,
+            text="测试导出",
+            style="Quiet.TButton",
+            command=lambda: self.start_export(trial=True),
+        )
+        self.trial_btn.pack(side="left")
+        self.trial_hint_label = ttk.Label(
+            actions,
+            text=f"快速验证 · 最近 {TEST_EXPORT_LIMIT} 条",
+            style="Muted.TLabel",
+        )
+        self.trial_hint_label.pack(side="left", padx=(10, 0))
+
+        self.stop_btn = ttk.Button(
+            actions,
+            text="停止",
+            style="Quiet.TButton",
+            command=self.stop_current,
+            state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=(8, 0))
+
+        self.export_btn = ttk.Button(
+            actions,
+            text="开始导出 →",
+            style="Primary.TButton",
+            command=lambda: self.start_export(trial=False),
+        )
+        self.export_btn.pack(side="right")
+        self.image_backup_btn = ttk.Button(
+            actions, text="图片备份…", style="Quiet.TButton",
+            command=lambda: open_image_window(self),
+        )
+        self.image_backup_btn.pack(side="right", padx=(0, 8))
+
+        # Status
+        status_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        status_card.pack(fill="x")
+        status_top = ttk.Frame(status_card)
+        status_top.pack(fill="x")
+        ttk.Label(status_top, textvariable=self.status_var, style="Status.TLabel").pack(side="left")
+        self.details_btn = ttk.Button(
+            status_top,
+            text="运行详情 ›",
+            style="Quiet.TButton",
+            command=self.toggle_logs,
+        )
+        self.details_btn.pack(side="right")
+
+        activity_row = ttk.Frame(status_card)
+        activity_row.pack(fill="x", pady=(9, 6))
+        self.activity = ActivityIndicator(activity_row)
+        self.activity.pack(side="left")
+        self.activity_status_label = ttk.Label(
+            activity_row,
+            textvariable=self.activity_status_var,
+            style="Muted.TLabel",
+        )
+        self.activity_status_label.pack(side="left", padx=(10, 0))
+        ttk.Label(
+            status_card,
+            textvariable=self.progress_detail_var,
+            style="Muted.TLabel",
+        ).pack(anchor="w")
+
+        self.log_frame = ttk.Frame(self.root_frame)
+        self.log_text = tk.Text(
+            self.log_frame,
+            height=12,
+            wrap="word",
+            font=("Consolas", 9),
+            state="disabled",
+            relief="flat",
+        )
+        scroll = ttk.Scrollbar(
+            self.log_frame,
+            orient="vertical",
+            command=self.log_text.yview,
+        )
+        self.log_text.configure(yscrollcommand=scroll.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+    def _section_label(self, text: str):
+        ttk.Label(self.root_frame, text=text, style="Section.TLabel").pack(anchor="w")
+
+    def toggle_logs(self, force: bool | None = None):
+        target = (not self.logs_visible) if force is None else force
+        if target == self.logs_visible:
+            return
+        self.logs_visible = target
+        if target:
+            self.update_idletasks()
+            self._compact_geometry = (
+                self.winfo_width(),
+                self.winfo_height(),
+                self.winfo_x(),
+                self.winfo_y(),
+            )
+            self.log_frame.pack(fill="both", expand=True, pady=(10, 0))
+            self.details_btn.configure(text="运行详情 ⌄")
+            self.update_idletasks()
+
+            width, compact_height, x, y = self._compact_geometry
+            requested_height = max(
+                self.winfo_reqheight(),
+                compact_height + self.log_frame.winfo_reqheight() + 10,
+            )
+            _, work_top, _, work_bottom = self._current_monitor_work_area()
+            height, y = _fit_expanded_height(
+                compact_height,
+                requested_height,
+                y,
+                work_top,
+                work_bottom,
+            )
+            self.geometry(_geometry_spec(width, height, x, y))
+        else:
+            self.log_frame.pack_forget()
+            self.details_btn.configure(text="运行详情 ›")
+            if self._compact_geometry is not None:
+                width, height, x, y = self._compact_geometry
+                self.geometry(_geometry_spec(width, height, x, y))
+                self._compact_geometry = None
+
+    def _current_monitor_work_area(self) -> tuple[int, int, int, int]:
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class MonitorInfo(ctypes.Structure):
+                    _fields_ = (
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                    )
+
+                user32 = ctypes.windll.user32
+                user32.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+                user32.MonitorFromWindow.restype = wintypes.HANDLE
+                user32.GetMonitorInfoW.argtypes = (
+                    wintypes.HANDLE,
+                    ctypes.POINTER(MonitorInfo),
+                )
+                user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+                monitor = user32.MonitorFromWindow(self.winfo_id(), 2)
+                info = MonitorInfo()
+                info.cbSize = ctypes.sizeof(info)
+                if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                    work = info.rcWork
+                    return work.left, work.top, work.right, work.bottom
+            except (AttributeError, OSError, TypeError, tk.TclError):
+                pass
+
+        left = self.winfo_vrootx()
+        top = self.winfo_vrooty()
+        return (
+            left,
+            top,
+            left + self.winfo_vrootwidth(),
+            top + self.winfo_vrootheight(),
+        )
+
+    def _center_child_window(
+        self,
+        child: tk.Toplevel,
+        *,
+        minimum_width: int = 0,
+        minimum_height: int = 0,
+    ) -> None:
+        self.update_idletasks()
+        child.update_idletasks()
+        work_left, work_top, work_right, work_bottom = self._current_monitor_work_area()
+        width, height, x, y = _centered_child_geometry(
+            self.winfo_rootx(),
+            self.winfo_rooty(),
+            self.winfo_width(),
+            self.winfo_height(),
+            max(minimum_width, child.winfo_reqwidth()),
+            max(minimum_height, child.winfo_reqheight()),
+            work_left,
+            work_top,
+            work_right,
+            work_bottom,
+        )
+        child.geometry(_geometry_spec(width, height, x, y))
+        child.deiconify()
+
+    def _update_range_controls(self):
+        mode = self.range_mode_var.get()
+        self.recent_entry.configure(
+            state="normal" if mode == RangeMode.RECENT.value else "disabled"
+        )
+        self.since_entry.configure(
+            state="normal" if mode == RangeMode.SINCE.value else "disabled"
+        )
+        if mode == RangeMode.ALL.value:
+            self.range_hint_var.set("默认：抓取当前接口能访问到的全部微博。")
+        elif mode == RangeMode.RECENT.value:
+            self.range_hint_var.set("按新→旧抓取，达到指定条数后立即停止。")
+        else:
+            self.range_hint_var.set("按新→旧抓取，确认进入起始日期以前后停止；置顶旧微博不会触发提前结束。")
+
+    def _update_content_controls(self):
+        selected = []
+        if self.ai_output_var.get():
+            extra_visibility = []
+            if self.ai_followers_var.get():
+                extra_visibility.append("粉丝可见")
+            if self.ai_friends_var.get():
+                extra_visibility.append("好友圈")
+            if self.ai_private_var.get():
+                extra_visibility.append("仅自己可见")
+            ai_scope = "公开"
+            if extra_visibility:
+                ai_scope += "+" + "+".join(extra_visibility)
+            selected.append(f"AI 分析版（{ai_scope}）")
+        if self.full_output_var.get():
+            selected.append("完整归档")
+        if self.custom_output_var.get():
+            selected.append(
+                "自定义："
+                + options_summary(self.custom_options)
+                + " · "
+                + filter_summary(self.custom_filter)
+            )
+        self.content_summary_var.set(
+            "；".join(selected) if selected else "请至少选择一种输出。"
+        )
+
+        running = self.tasks.state in (
+            TaskState.AUTHENTICATING,
+            TaskState.FETCHING,
+            TaskState.EXPORTING,
+        )
+        state = "normal" if self.custom_output_var.get() and not running else "disabled"
+        self.custom_settings_btn.configure(state=state)
+        ai_state = "normal" if self.ai_output_var.get() and not running else "disabled"
+        for button in self.ai_visibility_buttons:
+            button.configure(state=ai_state)
+
+    def _open_custom_settings(self):
+        current = self.custom_options
+        current_filter = self.custom_filter
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.title("自定义导出内容")
+        win.transient(self)
+        win.resizable(False, False)
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+
+        layout_var = tk.StringVar(value=current.layout.value)
+        source_var = tk.BooleanVar(value=current.include_source)
+        location_var = tk.BooleanVar(value=current.include_location)
+        engagement_var = tk.BooleanVar(value=current.include_engagement)
+        date_var = tk.StringVar(value=current.date_format.value)
+        original_var = tk.BooleanVar(value=current_filter.include_original)
+        repost_var = tk.BooleanVar(value=current_filter.include_reposts)
+        visibility_enabled_var = tk.BooleanVar(
+            value=current_filter.visibility_filter_enabled
+        )
+        visibility_vars = {
+            state: tk.BooleanVar(value=state in current_filter.visibilities)
+            for state in (
+                VisibilityState.PUBLIC,
+                VisibilityState.FOLLOWERS,
+                VisibilityState.FRIENDS,
+                VisibilityState.PRIVATE,
+                VisibilityState.UNKNOWN,
+            )
+        }
+        filter_start_var = tk.StringVar(
+            value=current_filter.start_date.isoformat() if current_filter.start_date else ""
+        )
+        filter_end_var = tk.StringVar(
+            value=current_filter.end_date.isoformat() if current_filter.end_date else ""
+        )
+
+        ttk.Label(body, text="排版", style="Section.TLabel").pack(anchor="w")
+        layout_row = ttk.Frame(body)
+        layout_row.pack(fill="x", pady=(4, 12))
+        ttk.Radiobutton(
+            layout_row,
+            text="完整",
+            variable=layout_var,
+            value=ExportLayout.FULL.value,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            layout_row,
+            text="AI 分析版",
+            variable=layout_var,
+            value=ExportLayout.AI.value,
+        ).pack(side="left", padx=(18, 0))
+
+        ttk.Label(body, text="内容类型", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        type_row = ttk.Frame(body)
+        type_row.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(type_row, text="原创", variable=original_var).pack(side="left")
+        ttk.Checkbutton(type_row, text="转发", variable=repost_var).pack(
+            side="left", padx=(18, 0)
+        )
+
+        ttk.Label(body, text="可见范围（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        visibility_enable = ttk.Checkbutton(
+            body,
+            text="按可见范围筛选",
+            variable=visibility_enabled_var,
+        )
+        visibility_enable.pack(anchor="w", pady=(4, 0))
+        visibility_row = ttk.Frame(body)
+        visibility_row.pack(fill="x", pady=(4, 0))
+        visibility_buttons = []
+        for state, text in (
+            (VisibilityState.PUBLIC, "公开"),
+            (VisibilityState.FOLLOWERS, "粉丝可见"),
+            (VisibilityState.FRIENDS, "好友圈"),
+            (VisibilityState.PRIVATE, "仅自己可见"),
+            (VisibilityState.UNKNOWN, "未知"),
+        ):
+            button = ttk.Checkbutton(
+                visibility_row,
+                text=text,
+                variable=visibility_vars[state],
+            )
+            button.pack(side="left", padx=(0, 12))
+            visibility_buttons.append(button)
+
+        def update_visibility_controls():
+            state = "normal" if visibility_enabled_var.get() else "disabled"
+            for button in visibility_buttons:
+                button.configure(state=state)
+
+        visibility_enable.configure(command=update_visibility_controls)
+        update_visibility_controls()
+
+        ttk.Label(body, text="关键词（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        keyword_text = tk.Text(body, height=3, width=52, wrap="word")
+        keyword_text.pack(fill="x", pady=(4, 0))
+        keyword_text.insert("1.0", "，".join(current_filter.keywords))
+        ttk.Label(
+            body,
+            text="多个关键词可用英文逗号、中文逗号或换行分隔；可直接输入 #话题#。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(body, text="二次日期筛选（可选）", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        filter_date_row = ttk.Frame(body)
+        filter_date_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(filter_date_row, text="开始").pack(side="left")
+        ttk.Entry(
+            filter_date_row,
+            width=12,
+            textvariable=filter_start_var,
+        ).pack(side="left", padx=(6, 14))
+        ttk.Label(filter_date_row, text="结束").pack(side="left")
+        ttk.Entry(
+            filter_date_row,
+            width=12,
+            textvariable=filter_end_var,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Label(
+            body,
+            text="格式 YYYY-MM-DD；只筛选本次已抓取记录，不会再次联网。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(body, text="可选元数据", style="Section.TLabel").pack(anchor="w")
+        ttk.Checkbutton(body, text="来源 / 设备", variable=source_var).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(body, text="发布位置", variable=location_var).pack(anchor="w")
+        ttk.Checkbutton(body, text="转发 / 评论 / 点赞数量", variable=engagement_var).pack(anchor="w")
+
+        ttk.Label(body, text="日期", style="Section.TLabel").pack(anchor="w", pady=(12, 0))
+        date_row = ttk.Frame(body)
+        date_row.pack(fill="x", pady=(4, 0))
+        ttk.Radiobutton(
+            date_row,
+            text="YYYY-MM-DD HH:mm",
+            variable=date_var,
+            value=DateFormat.DATE_TIME_MINUTE.value,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            date_row,
+            text="YYYY-MM-DD",
+            variable=date_var,
+            value=DateFormat.DATE_ONLY.value,
+        ).pack(side="left", padx=(18, 0))
+
+        ttk.Label(
+            body,
+            text="正文与日期属于核心归档信息，始终保留。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(12, 0))
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(18, 0))
+        for column in range(2):
+            actions.columnconfigure(column, weight=1, uniform="custom_actions")
+
+        def save():
+            def optional_date(raw: str, label: str) -> date | None:
+                value = raw.strip()
+                if not value:
+                    return None
+                try:
+                    return date.fromisoformat(value)
+                except ValueError as exc:
+                    raise ValueError(f"{label}请按 YYYY-MM-DD 填写。") from exc
+
+            try:
+                custom_options = ExportOptions(
+                    layout=ExportLayout(layout_var.get()),
+                    include_source=source_var.get(),
+                    include_location=location_var.get(),
+                    include_engagement=engagement_var.get(),
+                    date_format=DateFormat(date_var.get()),
+                )
+                custom_filter = CustomFilterOptions(
+                    include_original=original_var.get(),
+                    include_reposts=repost_var.get(),
+                    keywords=parse_filter_terms(keyword_text.get("1.0", "end")),
+                    start_date=optional_date(filter_start_var.get(), "开始日期"),
+                    end_date=optional_date(filter_end_var.get(), "结束日期"),
+                    visibility_filter_enabled=visibility_enabled_var.get(),
+                    visibilities=frozenset(
+                        state
+                        for state, variable in visibility_vars.items()
+                        if variable.get()
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                messagebox.showwarning("自定义设置有误", str(exc), parent=win)
+                return
+
+            self.custom_options = custom_options
+            self.custom_filter = custom_filter
+            self.custom_output_var.set(True)
+            self._update_content_controls()
+            win.destroy()
+
+        ttk.Button(
+            actions,
+            text="保存设置",
+            style="Primary.TButton",
+            command=save,
+        ).grid(row=0, column=0, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="取消",
+            style="Primary.TButton",
+            command=win.destroy,
+        ).grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=4,
+        )
+        self._center_child_window(win)
+        win.grab_set()
+
+    def _set_running(self, running: bool):
+        for widget in (
+            self.uid_entry,
+            self.output_entry,
+            self.output_choose_btn,
+            self.recent_entry,
+            self.since_entry,
+            self.trial_btn,
+            self.export_btn,
+            self.login_btn,
+            self.clear_login_btn,
+            *self.output_buttons,
+            *self.ai_visibility_buttons,
+        ):
+            try:
+                widget.configure(state="disabled" if running else "normal")
+            except tk.TclError:
+                pass
+
+        if not running:
+            self._update_range_controls()
+        self._update_content_controls()
+
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        if running:
+            self.activity.start()
+        else:
+            self.activity.stop()
+            self._stop_activity_timer()
+
+    def _start_activity_timer(self) -> None:
+        if self._activity_timer_running:
+            return
+        self._activity_started_at = time.monotonic()
+        self._activity_read_count = 0
+        self._activity_timer_running = True
+        self._render_activity_status()
+        self._schedule_activity_timer()
+
+    def _schedule_activity_timer(self) -> None:
+        if self._activity_timer_running and self._activity_after_id is None:
+            self._activity_after_id = self.after(500, self._activity_timer_tick)
+
+    def _activity_timer_tick(self) -> None:
+        self._activity_after_id = None
+        if not self._activity_timer_running:
+            return
+        try:
+            self._render_activity_status()
+            self._schedule_activity_timer()
+        except tk.TclError:
+            self._activity_timer_running = False
+            self._activity_after_id = None
+
+    def _render_activity_status(self) -> None:
+        if self._activity_started_at is None:
+            return
+        elapsed = time.monotonic() - self._activity_started_at
+        self.activity_status_var.set(
+            activity_status_text(self._activity_read_count, elapsed)
+        )
+
+    def _set_activity_read_count(self, count: object) -> None:
+        if self._activity_started_at is None:
+            return
+        try:
+            value = max(0, int(count))
+        except (TypeError, ValueError):
+            return
+        self._activity_read_count = max(self._activity_read_count, value)
+        self._render_activity_status()
+
+    def _stop_activity_timer(self) -> None:
+        if self._activity_started_at is not None:
+            self._render_activity_status()
+        self._activity_timer_running = False
+        after_id, self._activity_after_id = self._activity_after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+
+    # -------------------- Event channel --------------------
+
+    def _start_update_check(self) -> None:
+        self._update_after_id = None
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        threading.Thread(
+            target=self._update_check_worker,
+            daemon=True,
+        ).start()
+
+    def _update_check_worker(self) -> None:
+        latest = find_newer_github_version(VERSION_DISPLAY)
+        if latest is not None:
+            self.events.put((None, "update_available", latest))
+
+    def _emit(self, generation: int, kind: str, payload=None):
+        self.events.put((generation, kind, payload))
+
+    def _worker_log(self, generation: int, text: object):
+        self._emit(generation, "log", redact_text(text))
+
+    def _append_log(self, text: str):
+        if text and not text.endswith("\n"):
+            text += "\n"
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", text)
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _poll_events(self):
+        self._poll_after_id = None
+        try:
+            while True:
+                generation, kind, payload = self.events.get_nowait()
+
+                if kind == "update_available":
+                    self.update_notice_label.configure(text=f"发现新版本 {payload}")
+                    self.update_notice_label.pack(anchor="e", pady=(2, 0))
+                    continue
+
+                # The central invariant: stale worker generations cannot mutate UI.
+                if not self.tasks.accepts(generation):
+                    continue
+
+                if kind == "log":
+                    self._append_log(payload)
+
+                elif kind == "status":
+                    self.status_var.set(payload)
+
+                elif kind == "progress":
+                    message, data = payload
+                    self.progress_detail_var.set(message)
+                    if data and data.get("posts") is not None:
+                        self._set_activity_read_count(data["posts"])
+                        count_label = data.get("count_label") or "条"
+                        bits = [f"{data['posts']:,} {count_label}"]
+                        if data.get("page"):
+                            bits.append(f"{data['page']} 页")
+                        if data.get("frontier"):
+                            try:
+                                d = datetime.fromisoformat(data["frontier"])
+                                bits.append(f"推进至 {d:%Y-%m-%d}")
+                            except Exception:
+                                pass
+                        self.status_var.set("正在读取 · " + " · ".join(bits))
+
+                elif kind == "qr_matrix":
+                    self._draw_qr(payload)
+
+                elif kind == "qr_status":
+                    self.qr_status_var.set(payload)
+
+                elif kind == "phase_export":
+                    self.tasks.transition(TaskState.EXPORTING)
+                    self.status_var.set("正在生成归档")
+                    self.progress_detail_var.set("正在生成 Markdown 并验证输出…")
+
+                elif kind == "ready":
+                    self.tasks.terminal(generation, TaskState.READY)
+                    self._close_qr_window()
+                    self._set_running(False)
+                    self._refresh_login_status()
+                    self.activity_status_var.set("")
+                    recovery = bool(payload and payload.get("recovery"))
+                    pending = self._pending_export_request if recovery else None
+                    if pending is not None:
+                        self._pending_export_request = None
+                        resumed = replace(
+                            pending,
+                            auth_retry_count=pending.auth_retry_count + 1,
+                        )
+                        self.status_var.set("正在重新开始")
+                        self.progress_detail_var.set(
+                            "登录已更新，正在重新开始刚才的导出…"
+                        )
+                        self._launch_export_request(resumed)
+                    else:
+                        self.status_var.set("就绪")
+                        self.progress_detail_var.set("登录成功，可以开始导出。")
+                        messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
+
+                elif kind == "auth_expired":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._stop_activity_timer()
+                    self._set_running(False)
+                    self._pending_export_request = payload
+                    self.login_var.set("○ 登录已过期，请重新扫码")
+                    self.status_var.set("登录已过期")
+                    self.progress_detail_var.set("需要重新扫码；完成后将从头重新导出。")
+                    messagebox.showinfo(
+                        "登录已过期",
+                        "微博登录已过期，需要重新扫码。\n\n"
+                        "完成登录后，将自动重新开始刚才的导出。\n"
+                        "已读取但尚未完成的内容不会被当作成功结果。",
+                    )
+                    self.tasks.transition(TaskState.READY)
+                    self.start_login(recovery=True)
+
+                elif kind == "auth_retry_failed":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._pending_export_request = None
+                    self._set_running(False)
+                    self.status_var.set("登录更新失败")
+                    self.progress_detail_var.set("重新登录后会话仍未被接受；本次导出已停止。")
+                    messagebox.showerror(
+                        "导出已停止",
+                        "重新登录后微博仍未接受当前会话，本次导出已停止。\n"
+                        "请稍后再试。",
+                    )
+                    self.tasks.transition(
+                        TaskState.READY if has_saved_login() else TaskState.IDLE
+                    )
+
+                elif kind == "done":
+                    self.tasks.terminal(generation, TaskState.DONE)
+                    self._set_running(False)
+                    if payload.get("output_dir"):
+                        self.output_var.set(str(payload["output_dir"]))
+                    integrity = payload["integrity"]
+                    if payload["failures"]:
+                        self.status_var.set("导出完成 · 输出提醒")
+                        self.progress_detail_var.set(
+                            f"已生成 {len(payload['outputs'])} 个文件；"
+                            f"{len(payload['failures'])} 个本地输出失败。"
+                        )
+                    elif integrity.incomplete_records:
+                        self.status_var.set("导出完成 · 完整性提醒")
+                        self.progress_detail_var.set(
+                            "导出已完成；"
+                            f"其中 {integrity.incomplete_records:,} 条记录"
+                            "含无法验证的历史内容。"
+                        )
+                    else:
+                        self.status_var.set("导出完成")
+                        self.progress_detail_var.set("本次导出已完成并写入 Markdown。")
+                    self._show_completion(payload)
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
+
+                elif kind == "error":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._pending_export_request = None
+                    self._close_qr_window()
+                    self._set_running(False)
+                    self.status_var.set("失败")
+                    if self._activity_started_at is None:
+                        self.activity_status_var.set("")
+                    self.progress_detail_var.set(
+                        "本次导出未完成，没有生成不完整的成功结果。"
+                    )
+                    self.toggle_logs(True)
+                    friendly, detail_path = payload
+                    messagebox.showerror(
+                        "任务失败",
+                        friendly
+                        + "\n\n详细错误日志：\n"
+                        + detail_path
+                        + "\n\n请不要发送本机保存的登录凭据文件。",
+                    )
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
+
+                elif kind == "cancelled":
+                    self.tasks.terminal(generation, TaskState.CANCELLED)
+                    self._pending_export_request = None
+                    self._close_qr_window()
+                    self._set_running(False)
+                    self.status_var.set("已取消")
+                    if self._activity_started_at is None:
+                        self.activity_status_var.set("")
+                    self.progress_detail_var.set(
+                        "任务已取消；未完成内容不会保存为成功归档。"
+                    )
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
+
+        except queue.Empty:
+            pass
+
+        try:
+            self._poll_after_id = self.after(100, self._poll_events)
+        except tk.TclError:
+            self._poll_after_id = None
+
+    # -------------------- Login --------------------
+
+    def _refresh_login_status(self):
+        if has_saved_login():
+            self.login_var.set("● 已保存登录信息")
+            if self.tasks.state is TaskState.IDLE:
+                self.tasks.transition(TaskState.READY)
+        else:
+            self.login_var.set("○ 未登录")
+
+    def _open_qr_window(self):
+        self._close_qr_window()
+        win = tk.Toplevel(self)
+        win.withdraw()
+        self.qr_window = win
+        win.title("扫码登录微博")
+        win.resizable(False, False)
+        win.transient(self)
+        win.protocol("WM_DELETE_WINDOW", self.stop_current)
+
+        ttk.Label(
+            win,
+            text="请使用微博 App 扫码",
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).pack(pady=(18, 6))
+        ttk.Label(win, text="微博 App → 我的 → 扫一扫").pack()
+
+        frame = ttk.Frame(win, padding=10)
+        frame.pack(pady=(10, 4))
+        self.qr_canvas = tk.Canvas(
+            frame,
+            width=300,
+            height=300,
+            bg="white",
+            highlightthickness=1,
+            highlightbackground="#cccccc",
+        )
+        self.qr_canvas.pack()
+
+        self.qr_status_var.set("正在获取二维码…")
+        ttk.Label(
+            win,
+            textvariable=self.qr_status_var,
+            wraplength=340,
+            justify="center",
+        ).pack(pady=(4, 12))
+        ttk.Button(win, text="取消", command=self.stop_current).pack()
+        self._center_child_window(win, minimum_width=390, minimum_height=470)
+        win.grab_set()
+
+    def _draw_qr(self, matrix):
+        canvas = self.qr_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+
+        canvas.delete("all")
+        size = len(matrix)
+        if not size:
+            return
+
+        total = 284
+        cell = max(1, total // size)
+        qr_px = cell * size
+        offset = (300 - qr_px) // 2
+
+        for y, row in enumerate(matrix):
+            for x, dark in enumerate(row):
+                if dark:
+                    x1 = offset + x * cell
+                    y1 = offset + y * cell
+                    canvas.create_rectangle(
+                        x1, y1, x1 + cell, y1 + cell,
+                        fill="black", outline="black",
+                    )
+
+    def _close_qr_window(self):
+        win = self.qr_window
+        self.qr_window = None
+        self.qr_canvas = None
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    def start_login(self, *, recovery: bool = False):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再开始其他微博任务。")
+            return
+        if not recovery:
+            self._pending_export_request = None
+        try:
+            generation, cancel = self.tasks.start(TaskState.AUTHENTICATING)
+        except RuntimeError:
+            return
+
+        self._open_qr_window()
+        self._stop_activity_timer()
+        self._activity_started_at = None
+        self._activity_read_count = 0
+        self.activity_status_var.set("登录处理中")
+        self._set_running(True)
+        self.status_var.set("正在登录")
+        self.progress_detail_var.set("正在连接微博登录服务…")
+        self._append_log("\n=== WEIBO TEXT ARCHIVER QR AUTH ===\n")
+
+        self.worker = threading.Thread(
+            target=self._login_worker,
+            args=(generation, cancel, recovery),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _login_worker(
+        self,
+        generation: int,
+        cancel: threading.Event,
+        recovery: bool = False,
+    ):
+        terminal_sent = False
+        try:
+            self._worker_log(generation, "开始微博二维码登录。")
+            opener, jar, qrid, scan_url, csrf_headers = begin_qr_login()
+            if cancel.is_set():
+                raise Cancelled("任务已取消。")
+
+            self._emit(generation, "qr_matrix", qr_matrix(scan_url))
+            self._emit(generation, "qr_status", "等待扫码…")
+
+            cookies = poll_qr_login(
+                opener,
+                jar,
+                qrid,
+                csrf_headers,
+                cancel,
+                lambda s: self._emit(generation, "qr_status", s),
+            )
+            if cancel.is_set():
+                raise Cancelled("任务已取消。")
+
+            save_cookies(cookies)
+            self._worker_log(generation, "扫码登录成功；凭据已保存。")
+            self._emit(generation, "ready", {"recovery": recovery})
+            terminal_sent = True
+
+        except Cancelled:
+            self._emit(generation, "cancelled", None)
+            terminal_sent = True
+
+        except Exception as exc:
+            detail = save_detailed_error("扫码登录", exc)
+            friendly = "微博扫码登录没有完成。\n\n" + redact_text(exc)
+            self._emit(generation, "error", (friendly, detail))
+            terminal_sent = True
+
+        finally:
+            if not terminal_sent and self.tasks.accepts(generation):
+                exc = RuntimeError("登录任务异常结束，未产生终态。")
+                detail = save_detailed_error("登录终态保护", exc)
+                self._emit(generation, "error", (str(exc), detail))
+
+    def clear_login(self):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "请先完成或取消图片备份，再清除登录信息。")
+            return
+        if not messagebox.askyesno(
+            "清除登录信息",
+            "删除本工具保存的微博登录状态？\n\n不会影响手机微博或浏览器登录。",
+        ):
+            return
+        try:
+            clear_saved_login()
+            if self.tasks.state is TaskState.READY:
+                self.tasks.transition(TaskState.IDLE)
+            self._refresh_login_status()
+            messagebox.showinfo("完成", "登录状态已清除。")
+        except Exception as exc:
+            messagebox.showerror("清除失败", str(exc))
+
+    # -------------------- Export --------------------
+
+    def _selected_range(self, trial: bool) -> FetchRange:
+        if trial:
+            return FetchRange.trial(TEST_EXPORT_LIMIT)
+
+        mode = RangeMode(self.range_mode_var.get())
+        if mode is RangeMode.ALL:
+            return FetchRange.all()
+
+        if mode is RangeMode.RECENT:
+            try:
+                count = int(self.recent_count_var.get().strip())
+            except ValueError:
+                raise ValueError("“最近 N 条”必须填写整数。")
+            if not 1 <= count <= 50000:
+                raise ValueError("最近条数请输入 1～50000。")
+            return FetchRange.recent(count)
+
+        if mode is RangeMode.SINCE:
+            raw = self.since_date_var.get().strip()
+            try:
+                d = date.fromisoformat(raw)
+            except ValueError:
+                raise ValueError("起始日期请按 YYYY-MM-DD 填写，例如 2024-01-01。")
+            if d > date.today():
+                raise ValueError("起始日期不能晚于今天。")
+            return FetchRange.since_date(d)
+
+        raise ValueError("未知导出范围。")
+
+    def choose_output(self):
+        folder = filedialog.askdirectory(
+            title="选择 Markdown 保存位置",
+            initialdir=self.output_var.get() or str(self.default_output_dir),
+        )
+        if folder:
+            self.output_var.set(folder)
+
+    def _selected_export_selections(self) -> tuple[ExportSelection, ...]:
+        return build_export_selections(
+            include_full=self.full_output_var.get(),
+            include_ai=self.ai_output_var.get(),
+            include_custom=self.custom_output_var.get(),
+            custom_options=self.custom_options,
+            custom_filter=self.custom_filter,
+            ai_visibility=AIVisibilityOptions(
+                include_followers=self.ai_followers_var.get(),
+                include_friends=self.ai_friends_var.get(),
+                include_private=self.ai_private_var.get(),
+            ),
+        )
+
+    def start_export(self, *, trial: bool):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再开始其他微博任务。")
+            return
+        target_value = self.uid_var.get()
+        if is_obvious_single_post_url(target_value):
+            messagebox.showwarning(
+                "需要账号主页",
+                "这里需要微博账号的数字 UID 或账号主页链接，\n"
+                "不是单条微博链接。",
+            )
+            return
+        uid = extract_uid(target_value)
+        if not uid:
+            messagebox.showwarning("请输入 UID", "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。")
+            return
+
+        if not has_saved_login():
+            messagebox.showwarning("需要登录", "本工具不再匿名尝试抓取。请先扫码登录。")
+            return
+
+        try:
+            fetch_range = self._selected_range(trial)
+            export_selections = self._selected_export_selections()
+        except ValueError as exc:
+            messagebox.showwarning("导出设置有误", str(exc))
+            return
+
+        requested_output_dir = Path(
+            self.output_var.get().strip() or self.default_output_dir
+        ).expanduser()
+        is_default_output = requested_output_dir == self.default_output_dir
+        fallback_dir = self.fallback_output_dir if is_default_output else None
+        try:
+            output_dir = prepare_output_dir(
+                requested_output_dir,
+                fallback=fallback_dir,
+            )
+        except OSError as exc:
+            messagebox.showerror("保存位置不可用", str(exc))
+            return
+        if output_dir != requested_output_dir:
+            self.output_var.set(str(output_dir))
+            fallback_dir = None
+
+        request = ExportRequest(
+            uid=uid,
+            fetch_range=fetch_range,
+            output_dir=output_dir,
+            export_selections=export_selections,
+            fallback_dir=fallback_dir,
+        )
+        self._launch_export_request(request)
+
+    def _launch_export_request(self, request: ExportRequest) -> None:
+        if image_task_active(self):
+            return
+        try:
+            generation, cancel = self.tasks.start(TaskState.FETCHING)
+        except RuntimeError:
+            return
+
+        self.uid_var.set(request.uid)
+        self._start_activity_timer()
+        self._set_running(True)
+        if request.auth_retry_count:
+            self.status_var.set("正在重新开始")
+            self.progress_detail_var.set("登录已更新，正在重新开始刚才的导出…")
+        else:
+            self.status_var.set("正在读取")
+            self.progress_detail_var.set(
+                f"{request.fetch_range.label()} · 正在开始读取微博…"
+            )
+        self._append_log(
+            f"\n=== WEIBO TEXT ARCHIVER · UID {request.uid} · "
+            f"{request.fetch_range.label()} ===\n"
+        )
+
+        self.worker = threading.Thread(
+            target=self._export_worker,
+            args=(generation, cancel, request),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _export_worker(
+        self,
+        generation: int,
+        cancel: threading.Event,
+        request: ExportRequest,
+    ):
+        terminal_sent = False
+        output_dir = request.output_dir
+        fallback_dir = request.fallback_dir
+        try:
+            cookie = load_cookie_header()
+
+            def progress(message: str, data=None):
+                self._worker_log(generation, message)
+                self._emit(generation, "progress", (message, data or {}))
+
+            client = WeiboClient(
+                cookie_header=cookie,
+                cancel_event=cancel,
+                progress=progress,
+            )
+            archive = client.fetch(request.uid, request.fetch_range)
+
+            if cancel.is_set():
+                raise Cancelled("任务已取消。")
+
+            performance = getattr(client, "performance", None)
+            if performance is not None:
+                self._worker_log(generation, "\n" + performance.render())
+
+            self._emit(generation, "phase_export", None)
+            save_normalized_archive(archive)
+            if cancel.is_set():
+                raise Cancelled("任务已取消。")
+
+            def before_commit():
+                if cancel.is_set():
+                    raise Cancelled("任务已取消。")
+
+            outputs = []
+            failures = []
+            for selection in request.export_selections:
+                if cancel.is_set():
+                    raise Cancelled("任务已取消。")
+
+                render_archive = archive
+                filter_report: CustomFilterReport | None = None
+                visibility_report = None
+                selection_notice = None
+                if selection.preset is ExportPreset.AI_COMPACT:
+                    render_archive, visibility_report = filter_archive_visibility(
+                        archive,
+                        selection.visibility_states,
+                    )
+                elif selection.preset is ExportPreset.CUSTOM:
+                    render_archive, filter_report = filter_archive(
+                        archive,
+                        selection.custom_filter,
+                    )
+                    selection_notice = filter_report_notice(filter_report)
+
+                try:
+                    try:
+                        output_path, stats = export_markdown(
+                            render_archive,
+                            output_dir,
+                            selection.options,
+                            selection.filename_suffix,
+                            before_commit=before_commit,
+                            selection_notice=selection_notice,
+                            visibility_scope=visibility_scope_text(
+                                selection.visibility_states
+                            ),
+                            unknown_visibility_excluded_count=(
+                                visibility_report.unknown_excluded_count
+                                if visibility_report is not None
+                                else filter_report.unknown_visibility_count
+                                if filter_report is not None
+                                else 0
+                            ),
+                        )
+                    except PermissionError:
+                        if fallback_dir is None:
+                            raise
+                        output_dir = prepare_output_dir(fallback_dir)
+                        fallback_dir = None
+                        self._worker_log(
+                            generation,
+                            f"应用目录不可写，改用备用保存位置：{output_dir}",
+                        )
+                        output_path, stats = export_markdown(
+                            render_archive,
+                            output_dir,
+                            selection.options,
+                            selection.filename_suffix,
+                            before_commit=before_commit,
+                            selection_notice=selection_notice,
+                            visibility_scope=visibility_scope_text(
+                                selection.visibility_states
+                            ),
+                            unknown_visibility_excluded_count=(
+                                visibility_report.unknown_excluded_count
+                                if visibility_report is not None
+                                else filter_report.unknown_visibility_count
+                                if filter_report is not None
+                                else 0
+                            ),
+                        )
+                except Cancelled:
+                    raise
+                except Exception as exc:
+                    safe_error = redact_text(exc)
+                    failures.append(
+                        {
+                            "label": selection.label,
+                            "error": safe_error,
+                        }
+                    )
+                    self._worker_log(
+                        generation,
+                        f"{selection.label} 本地输出失败：{safe_error}",
+                    )
+                    continue
+
+                fallback_dir = None
+
+                outputs.append(
+                    {
+                        "label": selection.label,
+                        "path": output_path,
+                        "options": selection.options,
+                        "stats": stats,
+                        "filter_report": filter_report,
+                        "visibility_report": visibility_report,
+                    }
+                )
+                self._worker_log(
+                    generation,
+                    f"已生成 {selection.label}：{output_path.name}",
+                )
+
+            if not outputs:
+                failed_labels = "、".join(item["label"] for item in failures)
+                raise RuntimeError(f"所有本地输出均失败：{failed_labels}")
+
+            report = archive.report
+            summary = {
+                "profile": archive.profile,
+                "report": report,
+                "integrity": archive.integrity,
+                "count": len(archive.posts),
+                "outputs": outputs,
+                "failures": failures,
+                "output_dir": output_dir,
+            }
+            self._emit(generation, "done", summary)
+            terminal_sent = True
+
+        except AuthenticationExpired:
+            if request.auth_retry_count == 0:
+                self._emit(generation, "auth_expired", request)
+            else:
+                self._emit(generation, "auth_retry_failed", None)
+            terminal_sent = True
+
+        except Cancelled:
+            self._emit(generation, "cancelled", None)
+            terminal_sent = True
+
+        except RateLimited as exc:
+            detail = save_detailed_error("微博访问限制", exc)
+            safe_error = redact_text(exc)
+            self._emit(
+                generation,
+                "error",
+                (
+                    safe_error
+                    + "\n\n本工具不会在这种情况下生成“看起来完整”的导出文件。",
+                    detail,
+                ),
+            )
+            terminal_sent = True
+
+        except NetworkError as exc:
+            detail = save_detailed_error("网络请求", exc)
+            safe_error = redact_text(exc)
+            self._emit(
+                generation,
+                "error",
+                (safe_error + "\n\n请检查网络或稍后重试。", detail),
+            )
+            terminal_sent = True
+
+        except Exception as exc:
+            detail = save_detailed_error("导出", exc)
+            self._emit(
+                generation,
+                "error",
+                ("导出没有完成。\n\n" + redact_text(exc), detail),
+            )
+            terminal_sent = True
+
+        finally:
+            if not terminal_sent and self.tasks.accepts(generation):
+                exc = RuntimeError("导出任务异常结束，未产生终态。")
+                detail = save_detailed_error("导出终态保护", exc)
+                self._emit(generation, "error", (str(exc), detail))
+
+    def stop_current(self):
+        if self.tasks.state not in (
+            TaskState.AUTHENTICATING,
+            TaskState.FETCHING,
+            TaskState.EXPORTING,
+        ):
+            return
+
+        # Invalidate the current generation immediately. Any later HTTP/worker
+        # event is structurally incapable of touching the new UI state.
+        draining = [w for w in getattr(self, "_image_text_draining", ()) if w.is_alive()]
+        if getattr(self, "worker", None) is not None:
+            draining.append(self.worker)
+        self._image_text_draining = draining
+        self.tasks.cancel()
+        self._pending_export_request = None
+        self._close_qr_window()
+        self._set_running(False)
+        self.status_var.set("已取消")
+        self.progress_detail_var.set(
+            "任务已取消；正在结束当前操作，未完成内容不会保存。"
+        )
+        self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
+
+    # -------------------- Completion / exit --------------------
+
+    def _show_completion(self, result: dict):
+        profile = result["profile"]
+        report = result["report"]
+        integrity: ArchiveIntegrity = result["integrity"]
+        outputs = result["outputs"]
+        failures = result["failures"]
+
+        if report.termination is Termination.NATURAL:
+            termination = "自然结束"
+        elif report.termination is Termination.TARGET_COUNT:
+            termination = "达到指定条数"
+        else:
+            termination = "达到起始日期"
+
+        lines = [f"{profile.screen_name} · UID {profile.id}", f"{result['count']:,} 条微博"]
+        lines.extend(completion_integrity_lines(integrity))
+
+        if report.oldest_reached and report.newest_reached:
+            lines.append(
+                f"{report.oldest_reached:%Y-%m-%d} → {report.newest_reached:%Y-%m-%d}"
+            )
+
+        lines.extend(
+            [
+                f"抓取终止：{termination}",
+                f"页面：{report.pages_fetched} · HTTP 请求：{report.requests_made}",
+            ]
+        )
+
+        if (
+            report.termination is Termination.NATURAL
+            and report.profile_statuses_count is not None
+        ):
+            lines.append(
+                f"账号资料显示微博：{report.profile_statuses_count:,}（仅供参考，不等于可访问总量）"
+            )
+
+        lines.append("")
+        lines.append("已生成：")
+        for output in outputs:
+            stats = output["stats"]
+            output_line = (
+                f"{output['label']}：{stats['count']:,} 条 · "
+                f"{stats['output_bytes'] / 1024:.1f} KB"
+            )
+            filter_report: CustomFilterReport | None = output.get("filter_report")
+            if filter_report is not None:
+                output_line += " · " + filter_report_notice(filter_report)
+            visibility_report = output.get("visibility_report")
+            if visibility_report is not None:
+                output_line += (
+                    f" · 可见范围匹配 {visibility_report.matched_count} / "
+                    f"本次抓取 {visibility_report.fetched_count}"
+                )
+                if visibility_report.unknown_excluded_count:
+                    output_line += (
+                        f"；{visibility_report.unknown_excluded_count} 条可见范围未知，未纳入"
+                    )
+            lines.append(output_line)
+            lines.append(f"  {output['path'].name}")
+
+        if failures:
+            lines.append("")
+            lines.append("未生成：")
+            for failure in failures:
+                lines.append(f"{failure['label']}：{failure['error']}")
+
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.title("导出完成")
+        win.transient(self)
+        win.resizable(False, False)
+
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=(
+                "✓ 导出完成（部分输出失败）"
+                if failures
+                else (
+                    "✓ 导出完成（含完整性提醒）"
+                    if integrity.incomplete_records
+                    else "✓ 导出完成"
+                )
+            ),
+            font=("Microsoft YaHei UI", 15, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="\n".join(lines),
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+        def launch(target: Path):
+            ok, error = launch_with_system(target)
+            if not ok:
+                messagebox.showerror("无法打开", error, parent=win)
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(18, 0))
+        action_count = len(outputs) + 2
+        for column in range(action_count):
+            actions.columnconfigure(column, weight=1, uniform="completion_actions")
+
+        for index, output in enumerate(outputs):
+            path = output["path"]
+            text = "打开文件" if len(outputs) == 1 else f"打开{output['label']}"
+            ttk.Button(
+                actions,
+                text=text,
+                style="CompletionAction.TButton",
+                command=lambda target=path: launch(target),
+            ).grid(row=0, column=index, sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="打开归档文件夹",
+            style="CompletionAction.TButton",
+            command=lambda: launch(outputs[0]["path"].parent),
+        ).grid(row=0, column=len(outputs), sticky="ew", padx=4)
+        ttk.Button(
+            actions,
+            text="关闭",
+            style="CompletionAction.TButton",
+            command=win.destroy,
+        ).grid(
+            row=0,
+            column=len(outputs) + 1,
+            sticky="ew",
+            padx=4,
+        )
+        self._center_child_window(win)
+
+    def _on_close(self):
+        if image_task_active(self):
+            self._image_window.request_close(close_app=True)
+            return
+        if self.tasks.state in (
+            TaskState.AUTHENTICATING,
+            TaskState.FETCHING,
+            TaskState.EXPORTING,
+        ):
+            if not messagebox.askyesno(
+                "退出",
+                "当前任务仍在运行。退出后本次任务将被取消，确定吗？",
+            ):
+                return
+            self.tasks.cancel()
+        self.destroy()
+
+    def destroy(self):
+        image_window = getattr(self, "_image_window", None)
+        if image_window is not None:
+            image_window.shutdown()
+        if hasattr(self, "activity"):
+            self.activity.stop()
+        self._stop_activity_timer()
+        after_id, self._poll_after_id = self._poll_after_id, None
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        update_after_id, self._update_after_id = self._update_after_id, None
+        if update_after_id is not None:
+            try:
+                self.after_cancel(update_after_id)
+            except tk.TclError:
+                pass
+        super().destroy()
+
+
+def main():
+    App().mainloop()
+
+
+if __name__ == "__main__":
+    main()

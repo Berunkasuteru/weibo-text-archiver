@@ -1,0 +1,16 @@
+{
+  "ok": 1,
+  "data": {
+    "userInfo": {
+      "id": 1234567890,
+      "screen_name": "测试用户",
+      "description": "V7 parser fixture",
+      "followers_count": 321,
+      "follow_count": 45,
+      "statuses_count": 3,
+      "verified": false,
+      "verified_reason": "",
+      "gender": "f"
+    }
+  }
+}

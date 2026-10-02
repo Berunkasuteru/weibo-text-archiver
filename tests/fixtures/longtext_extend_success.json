@@ -1,0 +1,9 @@
+{
+  "ok": 1,
+  "data": {
+    "longTextContent": "<p>完整长微博正文</p>",
+    "reposts_count": 1,
+    "comments_count": 2,
+    "attitudes_count": 3
+  }
+}

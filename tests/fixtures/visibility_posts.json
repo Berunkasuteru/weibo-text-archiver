@@ -1,0 +1,40 @@
+{
+  "top_level": [
+    {
+      "id": "visibility-public",
+      "text": "<p>synthetic visibility fixture</p>",
+      "user": {"id": "100", "screen_name": "fixture-user"},
+      "visible": {"type": 0, "list_id": 0}
+    },
+    {
+      "id": "visibility-followers",
+      "text": "<p>synthetic visibility fixture</p>",
+      "user": {"id": "100", "screen_name": "fixture-user"},
+      "visible": {"type": 10, "list_id": 0}
+    },
+    {
+      "id": "visibility-friends",
+      "text": "<p>synthetic visibility fixture</p>",
+      "user": {"id": "100", "screen_name": "fixture-user"},
+      "visible": {"type": 6, "list_id": 777, "list_idstr": "fixture-list"}
+    },
+    {
+      "id": "visibility-private",
+      "text": "<p>synthetic visibility fixture</p>",
+      "user": {"id": "100", "screen_name": "fixture-user"},
+      "visible": {"type": 1, "list_id": 0}
+    }
+  ],
+  "nested": {
+    "id": "visibility-wrapper",
+    "text": "<p>synthetic wrapper</p>",
+    "user": {"id": "100", "screen_name": "fixture-user"},
+    "visible": {"type": 0, "list_id": 0},
+    "retweeted_status": {
+      "id": "visibility-nested",
+      "text": "<p>synthetic nested record</p>",
+      "user": {"id": "200", "screen_name": "fixture-author"},
+      "visible": {"type": 10, "list_id": 42, "list_idstr": "nested-list"}
+    }
+  }
+}
