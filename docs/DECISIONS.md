@@ -1,6 +1,6 @@
 # DECISIONS
 
-Last updated: 2026-09-17
+Last updated: 2026-10-02
 
 This document records durable product and engineering decisions for Weibo Text Archiver.
 Do not reverse these decisions casually. If a decision changes, update this file with the reason.
@@ -316,3 +316,22 @@ The optional image tool has its own models, parser, traversal, local files, sche
 The product promise is “保存本次微博接口明确返回且可下载的图片。” Preserve and report declared media count, returned slot count and enumeration gaps; never hide gaps or promise all historical images or original-upload quality. v1 saves supported ordinary images, GIF and Live Photo still components, not videos, covers, avatars or article media.
 
 Use a separate verified-HTTPS CDN client with no Weibo Cookie or credentials, a fixed normal Weibo Referer and narrow image-host validation. Retain sequential request-start pacing; no concurrency or retry escalation. Atomic image/manifest writes and full local-file verification on rerun are preservation requirements. Text and image network tasks are mutually exclusive within the app.
+
+## D026 — AI analysis layout separates authorship and is verifiable by a reader
+
+`FORMAT=WEIBO_AI_2` (`weibo_archive/ai_format.py`) replaces `WEIBO_AI_1` for new exports. It is rendered from the frozen models, not from the legacy dictionary adapter.
+
+- A repost's top-level text is split at the first `//@`. Text before it is the account's own; each later segment is another account's text, labelled only by the name written in the text and never claimed as verified identity. The split is lossless: joining the parts with `//@` reproduces the text. Platform default repost text is reported as `NO_COMMENT`, not as authored content.
+- The layout must stay unambiguous. A reference reader in the tests recovers own text, chain segments and source bodies exactly; own-text lines that look like structure are escaped with a leading backslash.
+- Records are ordered oldest first and numbered `W1..Wn` per file. Numbering is dense within each file and must not be shared with another output, because gaps would reveal records removed by a visibility or custom filter.
+- Aggregates a reader would otherwise have to count are computed by the renderer and placed in the header. The file ends with an `END` line carrying the record count.
+- Device, location and engagement of other accounts' reposted posts are not emitted. Source bodies are never shortened by default.
+- A smaller copy is an explicit user action after export, made from the same in-memory snapshot without another fetch. It may limit or omit reposted source bodies, marking each shortened body with `CUT=kept/original`, and may split the archive into parts. The account's own text and the repost chain are never shortened. Each part is a complete file with its own numbering, aggregates and `END` line; body references never cross parts.
+- Everything structural in the file is English: the title, export/option/integrity lines, profile keys, reading guide, labels, aggregates and markers. Only data stays in its original language: post text, names, bio, source and location values. Do not translate the structure without measuring the effect on a model. `WEIBO_AI_1` keeps its original mixed-language header.
+- Size figures shown to the user are character counts plus a tokenizer-independent rough estimate, labelled as such.
+
+`WEIBO_AI_1` stays renderable (`export_markdown(..., ai_format=1)`) with its goldens for comparison until a later decision removes it.
+
+## D027 — The saved login cookie follows redirects only to Weibo/Sina HTTPS hosts
+
+The text client sends the saved cookie as an explicit header, which the standard redirect handler would resend to any redirect target. Redirects are followed only to HTTPS `weibo.cn`, `weibo.com` and `sina.com.cn` hosts on the default port; any other redirect fails the request without retry.

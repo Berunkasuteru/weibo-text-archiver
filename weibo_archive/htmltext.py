@@ -38,12 +38,6 @@ class _WeiboHTMLParser(HTMLParser):
             if alt:
                 self.parts.append(alt)
 
-        if tag == "a":
-            data_url = attrs_dict.get("data-url", "")
-            if data_url.startswith("http://t.cn") or data_url.startswith("https://t.cn"):
-                # Exact article semantics are confirmed after the visible text is parsed.
-                pass
-
     def handle_endtag(self, tag):
         tag = tag.lower()
         if tag in ("script", "style") and self._skip_depth:

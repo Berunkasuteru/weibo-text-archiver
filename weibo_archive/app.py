@@ -39,7 +39,7 @@ from .export_options import (
     parse_filter_terms,
     visibility_scope_text,
 )
-from .exporter import export_markdown
+from .exporter import export_ai_variant, export_markdown
 from .models import (
     ArchiveIntegrity,
     FetchRange,
@@ -66,6 +66,9 @@ APP_SUBTITLE = "把微博历史整理成便于长期保存与 AI 分析的本地
 TEST_EXPORT_LIMIT = 20
 DEFAULT_WINDOW_WIDTH = 860
 DEFAULT_COMPACT_HEIGHT = 760
+MIN_WINDOW_HEIGHT = 650
+# Tk geometry is the client area; leave room for the title bar and borders.
+WINDOW_FRAME_ALLOWANCE = 48
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,68 @@ def _centered_child_geometry(
     return width, height, x, y
 
 
+def _enable_system_dpi_awareness() -> None:
+    """Render at the display's real DPI instead of being bitmap-stretched by Windows."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, OSError):
+        pass
+
+
+def _ui_scale(widget) -> float:
+    """Real pixels per 96-DPI design pixel; 1.0 unless Tk runs DPI-aware on a scaled display."""
+    try:
+        return max(1.0, round(widget.winfo_fpixels("1i") / 96.0, 2))
+    except tk.TclError:
+        return 1.0
+
+
+def _scaled_distance(value, factor: float):
+    parts = value if isinstance(value, (tuple, list)) else str(value).split()
+    if not parts:
+        return value
+    scaled = tuple(round(float(str(part)) * factor) for part in parts)
+    return scaled[0] if len(scaled) == 1 else scaled
+
+
+def _scale_layout(root, factor: float) -> None:
+    """Scale the pixel paddings of a built widget tree; fonts already follow Tk's own scaling.
+
+    Child windows and canvases are left to their owners, and each tree must be scaled once.
+    """
+    if factor == 1.0:
+        return
+    pending = [root]
+    while pending:
+        widget = pending.pop()
+        pending.extend(
+            child
+            for child in widget.winfo_children()
+            if not isinstance(child, tk.Toplevel)
+        )
+        for option in ("padding", "wraplength"):
+            try:
+                value = widget.cget(option)
+                if str(value).strip() not in ("", "0"):
+                    widget.configure(**{option: _scaled_distance(value, factor)})
+            except (tk.TclError, ValueError):
+                pass
+        manager = widget.winfo_manager()
+        if manager not in ("pack", "grid"):
+            continue
+        info = widget.pack_info() if manager == "pack" else widget.grid_info()
+        pads = {
+            name: _scaled_distance(info[name], factor)
+            for name in ("padx", "pady", "ipadx", "ipady")
+            if name in info
+        }
+        (widget.pack_configure if manager == "pack" else widget.grid_configure)(**pads)
+
+
 def _load_app_icon(window, icon_path: Path = APP_ICON_PNG):
     """Set the tracked icon when available; retain Tk's default on failure."""
     try:
@@ -203,6 +268,34 @@ def launch_with_system(
     return True, ""
 
 
+def ai_size_text(stats: dict) -> str:
+    """Size of an AI output as a reader will meet it; the token figure is only a rough guide."""
+    chars = int(stats["output_chars"])
+    tokens = int(stats["estimated_tokens"])
+    if chars < 10000:
+        return f"约 {chars:,} 字符，粗估 {tokens:,} token"
+    return f"约 {chars / 10000:.1f} 万字符，粗估 {tokens / 10000:.1f} 万 token"
+
+
+def ai_variant_summary(results: list) -> str:
+    """Describe freshly written smaller AI files for the variant dialog."""
+    if len(results) <= 4:
+        return "\n".join(
+            f"{path.name}\n    {stats['count']:,} 条 · {ai_size_text(stats)}"
+            for path, stats in results
+        )
+    total = {
+        "output_chars": sum(stats["output_chars"] for _, stats in results),
+        "estimated_tokens": sum(stats["estimated_tokens"] for _, stats in results),
+    }
+    largest = max((stats for _, stats in results), key=lambda s: s["output_chars"])
+    return (
+        f"已生成 {len(results)} 个文件，合计 {ai_size_text(total)}。\n"
+        f"其中最大的一个：{ai_size_text(largest)}。\n"
+        f"第一个文件：{results[0][0].name}"
+    )
+
+
 def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
     if not integrity.incomplete_records:
         return []
@@ -227,10 +320,11 @@ class ActivityIndicator(tk.Canvas):
 
     def __init__(self, master):
         background = ttk.Style(master).lookup("TFrame", "background") or "#f0f0f0"
+        self._scale = _ui_scale(master)
         super().__init__(
             master,
-            width=240,
-            height=16,
+            width=round(240 * self._scale),
+            height=round(16 * self._scale),
             background=background,
             borderwidth=0,
             highlightthickness=0,
@@ -342,6 +436,8 @@ class ActivityIndicator(tk.Canvas):
                 width=1,
                 tags="activity_item",
             )
+        if self._scale != 1.0:
+            self.scale("activity_item", 0, 0, self._scale, self._scale)
 
     def _on_destroy(self, event) -> None:
         if event.widget is self:
@@ -351,10 +447,13 @@ class ActivityIndicator(tk.Canvas):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.ui_scale = _ui_scale(self)
         self._app_icon_image = _load_app_icon(self)
         self.title(f"{APP_TITLE} · {VERSION_DISPLAY}")
-        self.geometry(f"{DEFAULT_WINDOW_WIDTH}x{DEFAULT_COMPACT_HEIGHT}")
-        self.minsize(780, 650)
+        self.geometry(
+            f"{self._px(DEFAULT_WINDOW_WIDTH)}x{self._px(DEFAULT_COMPACT_HEIGHT)}"
+        )
+        self.minsize(self._px(780), self._px(MIN_WINDOW_HEIGHT))
 
         self.events: queue.Queue = queue.Queue()
         self.tasks = TaskManager()
@@ -395,15 +494,16 @@ class App(tk.Tk):
         self._activity_timer_running = False
         self._pending_export_request: ExportRequest | None = None
         self._update_check_started = False
+        self._reporting_callback_error = False
 
         self._configure_style()
         self._build_ui()
         self.update_idletasks()
         compact_height = _compact_window_height(
-            DEFAULT_COMPACT_HEIGHT,
+            self._px(DEFAULT_COMPACT_HEIGHT),
             self.winfo_reqheight(),
         )
-        self.geometry(f"{DEFAULT_WINDOW_WIDTH}x{compact_height}")
+        self._place_initial_window(compact_height)
         self._refresh_login_status()
         self._update_range_controls()
         self._update_content_controls()
@@ -412,6 +512,9 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # -------------------- UI --------------------
+
+    def _px(self, design_pixels: int) -> int:
+        return round(design_pixels * self.ui_scale)
 
     def _configure_style(self):
         style = ttk.Style(self)
@@ -424,9 +527,11 @@ class App(tk.Tk):
         style.configure("Sub.TLabel", font=("Microsoft YaHei UI", 10))
         style.configure("Section.TLabel", font=("Segoe UI", 9, "bold"))
         style.configure("Status.TLabel", font=("Consolas", 9))
-        style.configure("Primary.TButton", padding=(16, 8))
-        style.configure("Quiet.TButton", padding=(10, 6))
-        style.configure("CompletionAction.TButton", padding=(16, 8))
+        style.configure("Primary.TButton", padding=(self._px(16), self._px(8)))
+        style.configure("Quiet.TButton", padding=(self._px(10), self._px(6)))
+        style.configure(
+            "CompletionAction.TButton", padding=(self._px(16), self._px(8))
+        )
         style.configure("Card.TFrame", relief="solid", borderwidth=1)
         style.configure("Muted.TLabel", foreground="#666666")
 
@@ -461,9 +566,37 @@ class App(tk.Tk):
             style="Sub.TLabel",
         ).pack(anchor="w", pady=(0, 18))
 
+        # Packed before the settings so that a window shorter than its content
+        # keeps the actions and status visible and scrolls only the settings.
+        self.footer_frame = ttk.Frame(self.root_frame)
+        self.footer_frame.pack(side="bottom", fill="x")
+
+        self.settings_area = ttk.Frame(self.root_frame)
+        self.settings_area.pack(fill="both", expand=True)
+        self.settings_canvas = tk.Canvas(
+            self.settings_area,
+            background=ttk.Style(self).lookup("TFrame", "background") or "#f0f0f0",
+            borderwidth=0,
+            highlightthickness=0,
+            yscrollincrement=self._px(24),
+        )
+        self.settings_scroll = ttk.Scrollbar(
+            self.settings_area,
+            orient="vertical",
+            command=self.settings_canvas.yview,
+        )
+        self.settings_canvas.configure(yscrollcommand=self.settings_scroll.set)
+        self.settings_canvas.pack(side="left", fill="both", expand=True)
+        self.settings_frame = ttk.Frame(self.settings_canvas)
+        self._settings_window = self.settings_canvas.create_window(
+            0, 0, anchor="nw", window=self.settings_frame
+        )
+        self.settings_canvas.bind("<Configure>", self._on_settings_canvas_configure)
+        self.bind("<MouseWheel>", self._on_settings_mousewheel, add="+")
+
         # Account
         self._section_label("登录账号")
-        account = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        account = ttk.Frame(self.settings_frame, style="Card.TFrame", padding=12)
         account.pack(fill="x", pady=(4, 14))
 
         ttk.Label(account, textvariable=self.login_var).pack(side="left")
@@ -484,7 +617,7 @@ class App(tk.Tk):
 
         # Target
         self._section_label("目标账号")
-        target = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        target = ttk.Frame(self.settings_frame, style="Card.TFrame", padding=12)
         target.pack(fill="x", pady=(4, 14))
 
         ttk.Label(
@@ -497,7 +630,7 @@ class App(tk.Tk):
 
         # Range
         self._section_label("导出范围")
-        range_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        range_card = ttk.Frame(self.settings_frame, style="Card.TFrame", padding=12)
         range_card.pack(fill="x", pady=(4, 14))
 
         all_row = ttk.Frame(range_card)
@@ -554,7 +687,7 @@ class App(tk.Tk):
 
         # Output selection
         self._section_label("导出内容")
-        content_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        content_card = ttk.Frame(self.settings_frame, style="Card.TFrame", padding=12)
         content_card.pack(fill="x", pady=(4, 14))
 
         preset_row = ttk.Frame(content_card)
@@ -621,7 +754,7 @@ class App(tk.Tk):
 
         # Save location
         self._section_label("保存位置")
-        output_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        output_card = ttk.Frame(self.settings_frame, style="Card.TFrame", padding=12)
         output_card.pack(fill="x", pady=(4, 14))
         output_row = ttk.Frame(output_card)
         output_row.pack(fill="x")
@@ -636,7 +769,7 @@ class App(tk.Tk):
         self.output_choose_btn.pack(side="left", padx=(8, 0))
 
         # Actions
-        actions = ttk.Frame(self.root_frame)
+        actions = ttk.Frame(self.footer_frame)
         actions.pack(fill="x", pady=(2, 10))
         self.trial_btn = ttk.Button(
             actions,
@@ -675,7 +808,7 @@ class App(tk.Tk):
         self.image_backup_btn.pack(side="right", padx=(0, 8))
 
         # Status
-        status_card = ttk.Frame(self.root_frame, style="Card.TFrame", padding=12)
+        status_card = ttk.Frame(self.footer_frame, style="Card.TFrame", padding=12)
         status_card.pack(fill="x")
         status_top = ttk.Frame(status_card)
         status_top.pack(fill="x")
@@ -722,8 +855,54 @@ class App(tk.Tk):
         self.log_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
 
+        _scale_layout(self, self.ui_scale)
+        # The canvas asks for the full settings height, so a tall enough
+        # window looks exactly as it would without the scroll container.
+        self.settings_frame.update_idletasks()
+        self.settings_canvas.configure(
+            width=self.settings_frame.winfo_reqwidth(),
+            height=self.settings_frame.winfo_reqheight(),
+            scrollregion=(
+                0,
+                0,
+                self.settings_frame.winfo_reqwidth(),
+                self.settings_frame.winfo_reqheight(),
+            ),
+        )
+
     def _section_label(self, text: str):
-        ttk.Label(self.root_frame, text=text, style="Section.TLabel").pack(anchor="w")
+        ttk.Label(self.settings_frame, text=text, style="Section.TLabel").pack(anchor="w")
+
+    def _on_settings_canvas_configure(self, event) -> None:
+        self.settings_canvas.itemconfigure(self._settings_window, width=event.width)
+        needed = self.settings_frame.winfo_reqheight() > event.height
+        shown = bool(self.settings_scroll.winfo_manager())
+        if needed and not shown:
+            self.settings_scroll.pack(side="right", fill="y", padx=(self._px(6), 0))
+        elif shown and not needed:
+            self.settings_scroll.pack_forget()
+            self.settings_canvas.yview_moveto(0)
+
+    def _on_settings_mousewheel(self, event) -> None:
+        if not self.settings_scroll.winfo_manager():
+            return
+        if not str(event.widget).startswith(str(self.settings_frame)):
+            return
+        self.settings_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _place_initial_window(self, wanted_height: int) -> None:
+        """Fit the first window into the current monitor's usable area."""
+        left, top, right, bottom = self._current_monitor_work_area()
+        usable_height = max(1, bottom - top - self._px(WINDOW_FRAME_ALLOWANCE))
+        height = min(wanted_height, usable_height)
+        width = min(self._px(DEFAULT_WINDOW_WIDTH), max(1, right - left))
+        self.minsize(
+            min(self._px(780), width),
+            min(self._px(MIN_WINDOW_HEIGHT), height),
+        )
+        x = left + (right - left - width) // 2
+        y = top + (usable_height - height) // 2
+        self.geometry(_geometry_spec(width, height, x, y))
 
     def toggle_logs(self, force: bool | None = None):
         target = (not self.logs_visible) if force is None else force
@@ -738,14 +917,21 @@ class App(tk.Tk):
                 self.winfo_x(),
                 self.winfo_y(),
             )
-            self.log_frame.pack(fill="both", expand=True, pady=(10, 0))
+            self.settings_area.pack_configure(expand=False)
+            self.log_frame.pack(
+                side="bottom",
+                fill="both",
+                expand=True,
+                pady=(self._px(10), 0),
+                before=self.footer_frame,
+            )
             self.details_btn.configure(text="运行详情 ⌄")
             self.update_idletasks()
 
             width, compact_height, x, y = self._compact_geometry
             requested_height = max(
                 self.winfo_reqheight(),
-                compact_height + self.log_frame.winfo_reqheight() + 10,
+                compact_height + self.log_frame.winfo_reqheight() + self._px(10),
             )
             _, work_top, _, work_bottom = self._current_monitor_work_area()
             height, y = _fit_expanded_height(
@@ -753,11 +939,12 @@ class App(tk.Tk):
                 requested_height,
                 y,
                 work_top,
-                work_bottom,
+                work_bottom - self._px(WINDOW_FRAME_ALLOWANCE),
             )
             self.geometry(_geometry_spec(width, height, x, y))
         else:
             self.log_frame.pack_forget()
+            self.settings_area.pack_configure(expand=True)
             self.details_btn.configure(text="运行详情 ›")
             if self._compact_geometry is not None:
                 width, height, x, y = self._compact_geometry
@@ -813,6 +1000,9 @@ class App(tk.Tk):
         minimum_height: int = 0,
     ) -> None:
         self.update_idletasks()
+        if not getattr(child, "_layout_scaled", False):
+            child._layout_scaled = True
+            _scale_layout(child, self.ui_scale)
         child.update_idletasks()
         work_left, work_top, work_right, work_bottom = self._current_monitor_work_area()
         width, height, x, y = _centered_child_geometry(
@@ -820,8 +1010,8 @@ class App(tk.Tk):
             self.winfo_rooty(),
             self.winfo_width(),
             self.winfo_height(),
-            max(minimum_width, child.winfo_reqwidth()),
-            max(minimum_height, child.winfo_reqheight()),
+            max(self._px(minimum_width), child.winfo_reqwidth()),
+            max(self._px(minimum_height), child.winfo_reqheight()),
             work_left,
             work_top,
             work_right,
@@ -1233,7 +1423,7 @@ class App(tk.Tk):
 
                 if kind == "update_available":
                     self.update_notice_label.configure(text=f"发现新版本 {payload}")
-                    self.update_notice_label.pack(anchor="e", pady=(2, 0))
+                    self.update_notice_label.pack(anchor="e", pady=(self._px(2), 0))
                     continue
 
                 # The central invariant: stale worker generations cannot mutate UI.
@@ -1392,11 +1582,29 @@ class App(tk.Tk):
 
         except queue.Empty:
             pass
+        finally:
+            # A failing handler must not end polling: the window would look frozen.
+            try:
+                self._poll_after_id = self.after(100, self._poll_events)
+            except tk.TclError:
+                self._poll_after_id = None
 
+    def report_callback_exception(self, exc_type, exc, tb):
+        """A windowed build has no console: record callback failures and say so."""
+        detail = save_detailed_error("界面回调", exc)
+        if self._reporting_callback_error:
+            return
+        self._reporting_callback_error = True
         try:
-            self._poll_after_id = self.after(100, self._poll_events)
+            messagebox.showerror(
+                "程序内部错误",
+                "界面处理出现意外错误，当前任务状态可能不准确，建议重新启动程序。"
+                "\n\n详细错误日志：\n" + detail,
+            )
         except tk.TclError:
-            self._poll_after_id = None
+            pass
+        finally:
+            self._reporting_callback_error = False
 
     # -------------------- Login --------------------
 
@@ -1429,8 +1637,8 @@ class App(tk.Tk):
         frame.pack(pady=(10, 4))
         self.qr_canvas = tk.Canvas(
             frame,
-            width=300,
-            height=300,
+            width=self._px(300),
+            height=self._px(300),
             bg="white",
             highlightthickness=1,
             highlightbackground="#cccccc",
@@ -1458,10 +1666,10 @@ class App(tk.Tk):
         if not size:
             return
 
-        total = 284
+        total = self._px(284)
         cell = max(1, total // size)
         qr_px = cell * size
-        offset = (300 - qr_px) // 2
+        offset = (self._px(300) - qr_px) // 2
 
         for y, row in enumerate(matrix):
             for x, dark in enumerate(row):
@@ -1741,17 +1949,26 @@ class App(tk.Tk):
                 cancel_event=cancel,
                 progress=progress,
             )
-            archive = client.fetch(request.uid, request.fetch_range)
+            try:
+                archive = client.fetch(request.uid, request.fetch_range)
+            finally:
+                # Timing and restriction counters matter most when the fetch failed.
+                performance = getattr(client, "performance", None)
+                if performance is not None:
+                    self._worker_log(generation, "\n" + performance.render())
 
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
 
-            performance = getattr(client, "performance", None)
-            if performance is not None:
-                self._worker_log(generation, "\n" + performance.render())
-
             self._emit(generation, "phase_export", None)
-            save_normalized_archive(archive)
+            try:
+                save_normalized_archive(archive)
+            except OSError as exc:
+                # The cache is never read back; losing it must not cost the export.
+                self._worker_log(
+                    generation,
+                    f"本机规范化缓存未能保存，不影响 Markdown 导出：{exc}",
+                )
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
 
@@ -1779,28 +1996,34 @@ class App(tk.Tk):
                         archive,
                         selection.custom_filter,
                     )
-                    selection_notice = filter_report_notice(filter_report)
+                    selection_notice = filter_report_notice(
+                        filter_report,
+                        english=selection.options.layout is ExportLayout.AI,
+                    )
+
+                def write_selection(target_dir: Path):
+                    return export_markdown(
+                        render_archive,
+                        target_dir,
+                        selection.options,
+                        selection.filename_suffix,
+                        before_commit=before_commit,
+                        selection_notice=selection_notice,
+                        visibility_scope=visibility_scope_text(
+                            selection.visibility_states
+                        ),
+                        unknown_visibility_excluded_count=(
+                            visibility_report.unknown_excluded_count
+                            if visibility_report is not None
+                            else filter_report.unknown_visibility_count
+                            if filter_report is not None
+                            else 0
+                        ),
+                    )
 
                 try:
                     try:
-                        output_path, stats = export_markdown(
-                            render_archive,
-                            output_dir,
-                            selection.options,
-                            selection.filename_suffix,
-                            before_commit=before_commit,
-                            selection_notice=selection_notice,
-                            visibility_scope=visibility_scope_text(
-                                selection.visibility_states
-                            ),
-                            unknown_visibility_excluded_count=(
-                                visibility_report.unknown_excluded_count
-                                if visibility_report is not None
-                                else filter_report.unknown_visibility_count
-                                if filter_report is not None
-                                else 0
-                            ),
-                        )
+                        output_path, stats = write_selection(output_dir)
                     except PermissionError:
                         if fallback_dir is None:
                             raise
@@ -1810,24 +2033,7 @@ class App(tk.Tk):
                             generation,
                             f"应用目录不可写，改用备用保存位置：{output_dir}",
                         )
-                        output_path, stats = export_markdown(
-                            render_archive,
-                            output_dir,
-                            selection.options,
-                            selection.filename_suffix,
-                            before_commit=before_commit,
-                            selection_notice=selection_notice,
-                            visibility_scope=visibility_scope_text(
-                                selection.visibility_states
-                            ),
-                            unknown_visibility_excluded_count=(
-                                visibility_report.unknown_excluded_count
-                                if visibility_report is not None
-                                else filter_report.unknown_visibility_count
-                                if filter_report is not None
-                                else 0
-                            ),
-                        )
+                        output_path, stats = write_selection(output_dir)
                 except Cancelled:
                     raise
                 except Exception as exc:
@@ -1854,6 +2060,27 @@ class App(tk.Tk):
                         "stats": stats,
                         "filter_report": filter_report,
                         "visibility_report": visibility_report,
+                        # Lets the completion window write a smaller AI file
+                        # from this same snapshot without fetching again.
+                        "variant_source": (
+                            {
+                                "archive": render_archive,
+                                "filename_suffix": selection.filename_suffix,
+                                "selection_notice": selection_notice,
+                                "visibility_scope": visibility_scope_text(
+                                    selection.visibility_states
+                                ),
+                                "unknown_visibility_excluded_count": (
+                                    visibility_report.unknown_excluded_count
+                                    if visibility_report is not None
+                                    else filter_report.unknown_visibility_count
+                                    if filter_report is not None
+                                    else 0
+                                ),
+                            }
+                            if selection.options.layout is ExportLayout.AI
+                            else None
+                        ),
                     }
                 )
                 self._worker_log(
@@ -1999,6 +2226,8 @@ class App(tk.Tk):
                 f"{output['label']}：{stats['count']:,} 条 · "
                 f"{stats['output_bytes'] / 1024:.1f} KB"
             )
+            if "estimated_tokens" in stats:
+                output_line += " · " + ai_size_text(stats)
             filter_report: CustomFilterReport | None = output.get("filter_report")
             if filter_report is not None:
                 output_line += " · " + filter_report_notice(filter_report)
@@ -2052,6 +2281,26 @@ class App(tk.Tk):
             if not ok:
                 messagebox.showerror("无法打开", error, parent=win)
 
+        variant_outputs = [
+            output
+            for output in outputs
+            if output.get("variant_source") and "estimated_tokens" in output["stats"]
+        ]
+        if variant_outputs:
+            smaller = ttk.Frame(body)
+            smaller.pack(fill="x", pady=(14, 0))
+            ttk.Button(
+                smaller,
+                text="生成更小的 AI 版…",
+                style="Quiet.TButton",
+                command=lambda: self._open_ai_variant_dialog(win, variant_outputs[0]),
+            ).pack(side="left")
+            ttk.Label(
+                smaller,
+                text="文件太大、模型读不完时使用；不会重新联网。",
+                style="Muted.TLabel",
+            ).pack(side="left", padx=(10, 0))
+
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(18, 0))
         action_count = len(outputs) + 2
@@ -2084,6 +2333,128 @@ class App(tk.Tk):
             sticky="ew",
             padx=4,
         )
+        self._center_child_window(win)
+
+    def _open_ai_variant_dialog(self, parent, output: dict) -> None:
+        source = output["variant_source"]
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title("生成更小的 AI 版")
+        win.transient(parent)
+        win.resizable(False, False)
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"当前 {output['label']}：{ai_size_text(output['stats'])}",
+        ).pack(anchor="w")
+        ttk.Label(
+            body,
+            text="token 数只是粗略估计，不同模型的实际计数不同。",
+            style="Muted.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        limit_var = tk.StringVar(value="full")
+        ttk.Label(body, text="转发原文", style="Section.TLabel").pack(
+            anchor="w", pady=(14, 0)
+        )
+        for value, text in (
+            ("full", "完整保留"),
+            ("400", "每条最多保留前 400 字"),
+            ("150", "每条最多保留前 150 字"),
+            ("0", "不收录正文，只保留作者与时间"),
+        ):
+            ttk.Radiobutton(body, text=text, variable=limit_var, value=value).pack(
+                anchor="w", pady=(3, 0)
+            )
+
+        part_var = tk.StringVar(value="none")
+        ttk.Label(body, text="拆分成多个文件", style="Section.TLabel").pack(
+            anchor="w", pady=(14, 0)
+        )
+        for value, text in (
+            ("none", "不拆分"),
+            ("200000", "每个文件约 20 万字符"),
+            ("100000", "每个文件约 10 万字符"),
+            ("50000", "每个文件约 5 万字符"),
+        ):
+            ttk.Radiobutton(body, text=text, variable=part_var, value=value).pack(
+                anchor="w", pady=(3, 0)
+            )
+        ttk.Label(
+            body,
+            text=(
+                "本人文字和转发链始终完整保留；被截短的原文会逐条标注原文字数。"
+                "拆分在月份之间进行，每个文件自带说明、编号与统计，可以单独使用。"
+            ),
+            style="Muted.TLabel",
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(12, 0))
+
+        result_var = tk.StringVar(value="")
+        ttk.Label(
+            body,
+            textvariable=result_var,
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(12, 0))
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(14, 0))
+
+        def generate():
+            limit = None if limit_var.get() == "full" else int(limit_var.get())
+            part_chars = None if part_var.get() == "none" else int(part_var.get())
+            if limit is None and part_chars is None:
+                messagebox.showinfo(
+                    "无需生成",
+                    "当前选择与已经导出的文件相同。",
+                    parent=win,
+                )
+                return
+            try:
+                results = export_ai_variant(
+                    source["archive"],
+                    output["path"].parent,
+                    output["options"],
+                    source["filename_suffix"],
+                    source_body_limit=limit,
+                    max_part_chars=part_chars,
+                    selection_notice=source["selection_notice"],
+                    visibility_scope=source["visibility_scope"],
+                    unknown_visibility_excluded_count=source[
+                        "unknown_visibility_excluded_count"
+                    ],
+                )
+            except OSError as exc:
+                messagebox.showerror("生成失败", redact_text(exc), parent=win)
+                return
+            result_var.set("已生成：\n" + ai_variant_summary(results))
+            open_btn.configure(state="normal")
+            self._center_child_window(win)
+
+        ttk.Button(
+            actions,
+            text="生成",
+            style="Primary.TButton",
+            command=generate,
+        ).pack(side="right")
+        ttk.Button(
+            actions,
+            text="关闭",
+            style="Quiet.TButton",
+            command=win.destroy,
+        ).pack(side="right", padx=(0, 8))
+        open_btn = ttk.Button(
+            actions,
+            text="打开归档文件夹",
+            style="Quiet.TButton",
+            state="disabled",
+            command=lambda: launch_with_system(output["path"].parent),
+        )
+        open_btn.pack(side="left")
         self._center_child_window(win)
 
     def _on_close(self):
@@ -2126,6 +2497,7 @@ class App(tk.Tk):
 
 
 def main():
+    _enable_system_dpi_awareness()
     App().mainloop()
 
 

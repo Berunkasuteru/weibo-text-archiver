@@ -99,6 +99,8 @@ class Post:
     text_preview: Optional[str] = None
     incomplete_reason: Optional[IncompleteReason] = None
     visibility: VisibilityInfo = field(default_factory=VisibilityInfo)
+    # Place name the author attached to the post; `location` may hold the IP region instead.
+    checkin: str = ""
 
     def __post_init__(self) -> None:
         if self.author_id is not None and (

@@ -305,6 +305,8 @@ def parse_post(
         text=None if effective_incomplete_reason is not None else visible_text,
         source=source,
         location=location,
+        # Kept beside the IP region, which otherwise takes over `location`.
+        checkin=str(location_from_html or "").strip(),
         author=author,
         author_id=author_id,
         engagement=engagement,

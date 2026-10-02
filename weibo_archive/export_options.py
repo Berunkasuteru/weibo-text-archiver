@@ -367,7 +367,20 @@ def filter_summary(options: CustomFilterOptions) -> str:
     return " · ".join(parts)
 
 
-def filter_report_notice(report: CustomFilterReport) -> str:
+def filter_report_notice(report: CustomFilterReport, *, english: bool = False) -> str:
+    if english:
+        notice = f"matched {report.matched_count} of {report.fetched_count} fetched"
+        if report.unknown_timestamp_count:
+            notice += (
+                f"; {report.unknown_timestamp_count} records with unknown or unverified "
+                "time could not be used for the date filter"
+            )
+        if report.unknown_visibility_count:
+            notice += (
+                f"; {report.unknown_visibility_count} records with unknown visibility "
+                "were not included"
+            )
+        return notice
     notice = f"匹配 {report.matched_count} / 本次抓取 {report.fetched_count}"
     if report.unknown_timestamp_count:
         notice += (

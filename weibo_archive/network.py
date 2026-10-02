@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import random
@@ -97,6 +98,38 @@ def _safe_endpoint(url: str) -> tuple[str, str]:
     return parsed.hostname or "", parsed.path or "/"
 
 
+_REDIRECT_HOST_SUFFIXES = ("weibo.cn", "weibo.com", "sina.com.cn")
+
+
+def _redirect_allowed(url: str) -> bool:
+    """The saved login cookie may only follow a redirect to HTTPS Weibo/Sina hosts."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and any(
+            host == suffix or host.endswith("." + suffix)
+            for suffix in _REDIRECT_HOST_SUFFIXES
+        )
+    )
+
+
+class _WeiboOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Returning None makes urllib raise the 3xx as HTTPError instead of
+        # resending the explicit Cookie header to the new location.
+        if not _redirect_allowed(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _normalized_content_type(value: str | None) -> str:
     # Parameters are unnecessary for diagnostics and can contain arbitrary text.
     return str(value or "").split(";", 1)[0].strip().lower()
@@ -135,6 +168,7 @@ class HttpClient:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(context=context),
             urllib.request.HTTPCookieProcessor(self.jar),
+            _WeiboOnlyRedirectHandler(),
         )
         self.request_count = 0
 
@@ -226,8 +260,13 @@ class HttpClient:
                     self.performance.clock() - request_started,
                 )
                 host, path = _safe_endpoint(exc.geturl() or url)
+                refused_redirect = 300 <= exc.code < 400
                 diagnostic = SafeRequestDiagnostic(
-                    classification=f"http_{exc.code}",
+                    classification=(
+                        "unexpected_redirect"
+                        if refused_redirect
+                        else f"http_{exc.code}"
+                    ),
                     host=host,
                     path=path,
                     status=exc.code,
@@ -235,7 +274,13 @@ class HttpClient:
                         exc.headers.get("Content-Type") if exc.headers else ""
                     ),
                 )
-                if exc.code in (403, 414, 429, 432):
+                if refused_redirect:
+                    last_error = NetworkError(
+                        "微博返回了无法安全跟随的跳转；为保护登录凭据，本次请求已停止。",
+                        diagnostic=diagnostic,
+                    )
+                    stop_retrying = True
+                elif exc.code in (403, 414, 429, 432):
                     self.performance.increment_error(f"http_{exc.code}")
                     last_error = RateLimited(
                         f"微博限制了当前请求（HTTP {exc.code}）。请稍后再试。",
@@ -258,7 +303,13 @@ class HttpClient:
                     stop_retrying = (
                         restriction_retry_used or attempt + 1 >= max_attempts
                     )
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                # A body cut off mid-transfer (IncompleteRead) is as transient as a reset.
+                http.client.HTTPException,
+            ) as exc:
                 self.performance.record_request(
                     performance_category,
                     self.performance.clock() - request_started,

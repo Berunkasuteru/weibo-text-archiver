@@ -6,9 +6,23 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import markdown_v5 as md
-from .export_options import ExportLayout, ExportOptions, options_provenance
+from .ai_format import (
+    estimate_tokens,
+    part_period,
+    render_ai_markdown,
+    split_archive_for_parts,
+)
+from .export_options import (
+    DateFormat,
+    ExportLayout,
+    ExportOptions,
+    options_provenance,
+)
 from .models import Archive, ContentState, Post, RangeMode, Termination
 
+
+# WEIBO_AI_1 stays renderable for comparison; new exports use WEIBO_AI_2.
+AI_FORMAT_CURRENT = 2
 
 _ALLOWED_FILENAME_SUFFIXES = {
     "完整",
@@ -36,6 +50,7 @@ def _post_to_legacy(post: Post) -> dict:
         "visibility": post.visibility.state.value,
         "source": post.source,
         "location": post.location,
+        "checkin": post.checkin,
         "reposts_count": post.engagement.reposts,
         "comments_count": post.engagement.comments,
         "attitudes_count": post.engagement.likes,
@@ -144,17 +159,13 @@ def _inject_full_provenance(
     return "\n".join(lines[:1] + meta + lines[1:]).rstrip() + "\n"
 
 
-def _inject_ai_provenance(
-    text: str,
+def _ai_provenance_lines(
     archive: Archive,
     options: ExportOptions | None = None,
     selection_notice: str | None = None,
     visibility_scope: str = "UNFILTERED",
     unknown_visibility_excluded_count: int = 0,
-) -> str:
-    lines = text.splitlines()
-    if not lines:
-        return text
+) -> list[str]:
     meta = (
         f"导出：{archive.fetch_range.label()}｜终止={_termination_label(archive)}"
         "｜快照（导出机器本地）="
@@ -180,6 +191,78 @@ def _inject_ai_provenance(
             f"TOP_INCOMPLETE={integrity.incomplete_top_level}｜"
             f"RETWEET_INCOMPLETE={integrity.incomplete_retweets}"
         )
+    return inserted
+
+
+def _ai2_provenance_lines(
+    archive: Archive,
+    options: ExportOptions,
+    selection_notice: str | None = None,
+    visibility_scope: str = "UNFILTERED",
+    unknown_visibility_excluded_count: int = 0,
+) -> list[str]:
+    """Header facts for WEIBO_AI_2; keys are English, values are data."""
+    fetch_range = archive.fetch_range
+    if fetch_range.mode is RangeMode.SINCE and fetch_range.since:
+        range_text = f"SINCE {fetch_range.since:%Y-%m-%d}"
+    elif fetch_range.mode in (RangeMode.RECENT, RangeMode.TRIAL) and fetch_range.limit:
+        range_text = f"{fetch_range.mode.name} {fetch_range.limit}"
+    else:
+        range_text = fetch_range.mode.name
+    included = lambda flag: "included" if flag else "omitted"
+    lines = [
+        f"EXPORT: range={range_text}｜termination={archive.report.termination.name}"
+        "｜snapshot (exporting machine local time)="
+        + archive.fetched_at.isoformat(sep=" ", timespec="minutes"),
+        f"VISIBILITY_SCOPE={visibility_scope}",
+        f"OPTIONS: source={included(options.include_source)}"
+        f"｜location={included(options.include_location)}"
+        f"｜engagement={included(options.include_engagement)}"
+        "｜date="
+        + (
+            "YYYY-MM-DD HH:mm"
+            if options.date_format is DateFormat.DATE_TIME_MINUTE
+            else "YYYY-MM-DD"
+        ),
+    ]
+    if selection_notice:
+        lines.append("CUSTOM_FILTER: " + selection_notice)
+    if unknown_visibility_excluded_count:
+        lines.append(
+            f"VISIBILITY_UNKNOWN_EXCLUDED: {unknown_visibility_excluded_count} records "
+            "had unconfirmed visibility and are not included."
+        )
+    integrity = archive.integrity
+    if integrity.incomplete_records:
+        lines.append(
+            "INTEGRITY: "
+            f"TOTAL={integrity.total_posts}｜"
+            f"COMPLETE_RECORDS={integrity.complete_records}｜"
+            f"INCOMPLETE_RECORDS={integrity.incomplete_records}｜"
+            f"TOP_INCOMPLETE={integrity.incomplete_top_level}｜"
+            f"RETWEET_INCOMPLETE={integrity.incomplete_retweets}"
+        )
+    return lines
+
+
+def _inject_ai_provenance(
+    text: str,
+    archive: Archive,
+    options: ExportOptions | None = None,
+    selection_notice: str | None = None,
+    visibility_scope: str = "UNFILTERED",
+    unknown_visibility_excluded_count: int = 0,
+) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return text
+    inserted = _ai_provenance_lines(
+        archive,
+        options,
+        selection_notice,
+        visibility_scope,
+        unknown_visibility_excluded_count,
+    )
     return "\n".join(lines[:2] + inserted + lines[2:]).rstrip() + "\n"
 
 
@@ -251,6 +334,7 @@ def export_markdown(
     selection_notice: str | None = None,
     visibility_scope: str | None = None,
     unknown_visibility_excluded_count: int = 0,
+    ai_format: int = AI_FORMAT_CURRENT,
 ) -> tuple[Path, dict]:
     if filename_suffix not in _ALLOWED_FILENAME_SUFFIXES:
         raise ValueError("未知 Markdown 文件名类型。")
@@ -259,14 +343,33 @@ def export_markdown(
     if options.layout is ExportLayout.AI and "AI" not in filename_suffix:
         raise ValueError("AI 排版与 Markdown 文件名类型不一致。")
 
-    data = archive_to_legacy_data(archive)
+    if ai_format not in (1, AI_FORMAT_CURRENT):
+        raise ValueError("未知 AI 分析版格式版本。")
     uid = archive.profile.id
+    legacy_ai = options.layout is ExportLayout.AI and ai_format == 1
 
     if options.layout is ExportLayout.FULL:
-        text, username, count = md.build_markdown(data, uid, options)
+        text, username, count = md.build_markdown(
+            archive_to_legacy_data(archive), uid, options
+        )
         renderer_stats: dict = {}
+    elif legacy_ai:
+        text, username, renderer_stats = md.build_ai_markdown(
+            archive_to_legacy_data(archive), uid, options
+        )
+        count = renderer_stats["count"]
     else:
-        text, username, renderer_stats = md.build_ai_markdown(data, uid, options)
+        text, username, renderer_stats = render_ai_markdown(
+            archive,
+            options,
+            provenance_lines=_ai2_provenance_lines(
+                archive,
+                options,
+                selection_notice,
+                visibility_scope or "UNFILTERED",
+                unknown_visibility_excluded_count,
+            ),
+        )
         count = renderer_stats["count"]
 
     if count != len(archive.posts):
@@ -282,7 +385,7 @@ def export_markdown(
             selection_notice,
             visibility_scope,
         )
-    else:
+    elif legacy_ai:
         text = _inject_ai_provenance(
             text,
             archive,
@@ -308,4 +411,90 @@ def export_markdown(
             "layout": options.layout.value,
         }
     )
+    if options.layout is ExportLayout.AI:
+        stats["estimated_tokens"] = estimate_tokens(text)
     return output_path, stats
+
+
+def export_ai_variant(
+    archive: Archive,
+    output_dir: Path,
+    options: ExportOptions,
+    filename_suffix: str,
+    *,
+    source_body_limit: int | None = None,
+    max_part_chars: int | None = None,
+    selection_notice: str | None = None,
+    visibility_scope: str | None = None,
+    unknown_visibility_excluded_count: int = 0,
+) -> list[tuple[Path, dict]]:
+    """Write a smaller AI rendering of an already fetched archive.
+
+    The reposted source bodies can be limited and the archive can be cut into
+    parts; each part is a complete WEIBO_AI_2 file with its own numbering.
+    """
+    if options.layout is not ExportLayout.AI or "AI" not in filename_suffix:
+        raise ValueError("AI 精简输出需要 AI 排版。")
+    if filename_suffix not in _ALLOWED_FILENAME_SUFFIXES:
+        raise ValueError("未知 Markdown 文件名类型。")
+
+    parts = (
+        split_archive_for_parts(archive, max_part_chars, source_body_limit)
+        if max_part_chars is not None
+        else [archive]
+    )
+    if source_body_limit is None:
+        variant = ""
+    elif source_body_limit == 0:
+        variant = "_不含原文正文"
+    else:
+        variant = f"_原文前{source_body_limit}字"
+    part_list = "; ".join(
+        f"{index}) {part_period(part)} ({len(part.posts)} records)"
+        for index, part in enumerate(parts, 1)
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = md.safe_filename(md.normalize_text(archive.profile.screen_name) or archive.profile.id)
+    range_label = _range_filename_label(archive)
+    results = []
+    for index, part in enumerate(parts, 1):
+        provenance = _ai2_provenance_lines(
+            part,
+            options,
+            selection_notice,
+            visibility_scope or "UNFILTERED",
+            unknown_visibility_excluded_count,
+        )
+        part_label = ""
+        if len(parts) > 1:
+            part_label = f"_第{index}卷共{len(parts)}卷"
+            provenance.append(
+                f"PART {index}/{len(parts)}: {len(part.posts)} records in this part, "
+                f"{len(archive.posts)} across all parts; W numbers and statistics cover "
+                "this part only."
+            )
+            provenance.append("PARTS: " + part_list)
+        text, _, stats = render_ai_markdown(
+            part,
+            options,
+            provenance_lines=provenance,
+            source_body_limit=source_body_limit,
+        )
+        if stats["count"] != len(part.posts):
+            raise RuntimeError("导出前后条数不一致。")
+        desired = output_dir / (
+            f"{safe_name}_{archive.profile.id}_{range_label}_"
+            f"{filename_suffix}{variant}{part_label}.md"
+        )
+        path = _atomic_write_text(desired, text)
+        stats.update(
+            {
+                "output_bytes": path.stat().st_size,
+                "output_chars": len(text),
+                "estimated_tokens": estimate_tokens(text),
+                "layout": options.layout.value,
+            }
+        )
+        results.append((path, stats))
+    return results

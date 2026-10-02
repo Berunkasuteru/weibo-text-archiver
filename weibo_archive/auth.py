@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import http.cookiejar
 import json
 import threading
@@ -168,7 +169,7 @@ def poll_qr_login(
                 headers=csrf_headers,
                 timeout=15,
             )
-        except (TimeoutError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, http.client.HTTPException, json.JSONDecodeError):
             status_callback("网络波动，继续等待扫码结果…")
             if cancel_event.wait(2):
                 raise Cancelled("用户取消了扫码登录。")
@@ -196,6 +197,8 @@ def poll_qr_login(
             if cross_url:
                 if cross_url.startswith("//"):
                     cross_url = "https:" + cross_url
+                if urllib.parse.urlsplit(cross_url).scheme != "https":
+                    raise RuntimeError("微博登录返回了非 HTTPS 的跳转地址，登录已停止。")
                 try:
                     with _request(opener, cross_url, headers={"User-Agent": USER_AGENT}) as resp:
                         resp.read(1024)

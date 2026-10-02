@@ -86,6 +86,9 @@ class ManifestStore:
         self.path = self.root / "manifest.json"
         self.data = None
         self._lock = None
+        # Entries already validated under this lock, so a checkpoint only pays for what changed.
+        self._checked_assets = {}
+        self._checked_records = (None, 0)
 
     def __enter__(self):
         reason = None
@@ -153,8 +156,10 @@ class ManifestStore:
             raise ImageError("target_mismatch")
         return data
 
-    def _validate(self, data):
+    def _validate(self, data, *, full=True):
         # Strict shape, not a raw JSON passthrough: unknown fields never round-trip.
+        # full=False skips records and asset entries unchanged since they last passed;
+        # records are append-only within a run, and every file operation re-checks its own path.
         if not isinstance(data, dict) or set(data) != TOP_KEYS or type(data["schema_version"]) is not int or data["schema_version"] != 1:
             raise ValueError()
         if not valid_identity(data["target_identity"]):
@@ -187,7 +192,10 @@ class ManifestStore:
             raise ValueError()
         if any(type(v) is not int or v < 0 for v in data["summary"].values()):
             raise ValueError()
-        for rec in data["records"]:
+        records = data["records"]
+        known_records, known_count = self._checked_records
+        done = known_count if not full and known_records is records and known_count <= len(records) else 0
+        for rec in records[done:]:
             if set(rec) != RECORD_KEYS or not valid_identity(rec["containing_post_id"]) or not valid_identity(rec["source_post_id"]):
                 raise ValueError()
             ImageRelation(rec["relation"])
@@ -203,9 +211,18 @@ class ManifestStore:
                 if issue["slot_index"] is not None and (type(issue["slot_index"]) is not int or issue["slot_index"] < 1):
                     raise ValueError()
         paths = set()
+        checked = {} if full else self._checked_assets
+        fresh = {}
         for key, entry in data["assets"].items():
+            if checked.get(key) == entry:
+                if entry["relative_path"] is not None:
+                    if entry["relative_path"] in paths:
+                        raise ValueError()
+                    paths.add(entry["relative_path"])
+                continue
             if set(entry) != ASSET_KEYS or key != asset_key(entry):
                 raise ValueError()
+            fresh[key] = dict(entry)
             if not valid_identity(entry["source_post_id"]) or not valid_identity(entry["containing_post_id"]):
                 raise ValueError()
             ImageRelation(entry["relation"])
@@ -238,6 +255,11 @@ class ManifestStore:
         keys = data["current_asset_keys"]
         if not isinstance(keys, list) or len(keys) != len(set(keys)) or any(k not in data["assets"] for k in keys):
             raise ValueError()
+        if full:
+            self._checked_assets = fresh
+        else:
+            self._checked_assets.update(fresh)
+        self._checked_records = (records, len(records))
 
     def begin(self, fetch_range, report):
         self.data.update(requested_range=range_payload(fetch_range), started_at=now_iso(), finished_at=None,
@@ -341,7 +363,7 @@ class ManifestStore:
         self.write()
 
     def write(self):
-        self._validate(self.data)
+        self._validate(self.data, full=False)
         _no_links(self.path)
         fd, name = tempfile.mkstemp(prefix=".manifest-", suffix=".tmp", dir=self.root)
         temp = Path(name)

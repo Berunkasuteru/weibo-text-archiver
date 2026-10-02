@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from pathlib import Path
 
 from .export_options import DateFormat, ExportLayout, ExportOptions
 from .models import normalize_optional_uid
@@ -188,6 +187,9 @@ def post_meta_line(item: dict, options: ExportOptions | None = None) -> str:
         parts.append(f"来源：{source}")
     if location and (options is None or options.include_location):
         parts.append(f"位置：{location}")
+    checkin = normalize_text(item.get("checkin"))
+    if options is not None and options.include_location and checkin and checkin != location:
+        parts.append(f"签到：{checkin}")
     return " · ".join(parts)
 
 
@@ -416,6 +418,17 @@ def is_verified_self_retweet(retweet: dict, target_uid: str) -> bool:
         and normalized_target is not None
         and author_id == normalized_target
     )
+
+
+def post_link(item: dict, owner_uid: str = "") -> str:
+    """Address of the post on weibo.com, built only from identifiers already archived."""
+    owner = normalize_optional_uid(item.get("author_id")) or normalize_optional_uid(
+        owner_uid
+    )
+    bid = normalize_text(item.get("bid"))
+    if owner and bid:
+        return f"https://weibo.com/{owner}/{bid}"
+    return ""
 
 
 def get_date_range(
@@ -721,20 +734,6 @@ def build_ai_markdown(
     return "\n".join(out).rstrip() + "\n", username, stats
 
 
-def file_metrics(path: Path) -> tuple[int, int]:
-    """返回 UTF-8 文件字节数、字符数。"""
-    content = path.read_text(encoding="utf-8")
-    return path.stat().st_size, len(content)
-
-
-def human_size(size: int) -> str:
-    if size < 1024:
-        return f"{size} B"
-    if size < 1024 * 1024:
-        return f"{size / 1024:.1f} KB"
-    return f"{size / (1024 * 1024):.2f} MB"
-
-
 def build_markdown(
     data: dict,
     uid: str,
@@ -798,6 +797,12 @@ def build_markdown(
             out.append(f"媒体：{media}")
         if options is None or options.include_engagement:
             out.append(engagement_line(item))
+        if options is not None:
+            link = post_link(item, uid)
+            post_id = normalize_text(item.get("id"))
+            if link:
+                # The numeric ID is what image-backup file names start with.
+                out.append(f"链接：{link}" + (f" · ID {post_id}" if post_id else ""))
         out.append("")
 
         if item_incomplete:
@@ -841,6 +846,10 @@ def build_markdown(
             elif not rt_text:
                 label_parts.append("【已验证正文为空】")
             out.append("**" + " · ".join(label_parts) + "**")
+            if options is not None and not rt_incomplete:
+                rt_link = post_link(retweet)
+                if rt_link:
+                    out.append(f"原文链接：{rt_link}")
             out.append("")
             if rt_incomplete:
                 preview = incomplete_preview(retweet)

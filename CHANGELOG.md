@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Introduce `FORMAT=WEIBO_AI_2` as the AI 分析版 layout. The account's own words, repost-chain (`//@`) text by other accounts and the reposted source are rendered on separate line types; the platform default “转发微博” is reported as `NO_COMMENT` instead of body text.
+- Order AI records oldest first with file-local `W` numbers, year sections with counts and a closing `END` line, so a reader can cite records and notice a truncated file. Numbers are dense per file and never reveal records excluded by a visibility or custom filter.
+- Put exact aggregates in the AI header: per-year and per-month counts by record kind, amount of the account's own text, most-reposted authors and publication-location summary.
+- Stop repeating file-wide constants on every AI record and stop emitting the device, location and engagement of other accounts' reposted posts. Repeated sources and verified self-reposts refer to the earlier record by `=W` number.
+- Show the character count and a rough token estimate of AI outputs in the completion window, and offer “生成更小的 AI 版…”: from the snapshot already fetched, write a copy with reposted source bodies limited or omitted and/or split into self-contained parts cut between months. Shortened bodies are marked per record with `CUT=kept/original`; the default export is never shortened.
+- Keep a post's check-in place when Weibo also reports an IP region. Previously the IP region took over the location field and the place name was dropped from both the text and the metadata. The Full archive shows it as “签到”, the AI layout as `AT=`; normalized cache writes advance to schema version 5 for the new field.
+- Add the original post link and numeric ID to every Full archive record, and the source link to reposted originals. Image-backup file names start with the same numeric ID.
+- Keep the `WEIBO_AI_1` renderer and its goldens available for comparison; new exports no longer use it.
+- Render at the display's real DPI on scaled Windows displays, and keep the main window usable on short screens by scrolling only the settings.
+- Follow redirects in the text client only to HTTPS Weibo/Sina hosts, so the saved login cookie is never sent elsewhere.
+- Retry responses cut off mid-transfer, keep exporting Markdown when the local normalized cache cannot be written, and report interface callback failures instead of freezing.
+- Make image-backup progress checkpoints validate only changed entries, removing a slowdown that grew with the number of images.
+
 ## 0.6.0
 
 - Add a separate “图片备份…” tool for local backup of images explicitly returned by the current Weibo timeline response and successfully downloadable, independent of text export.

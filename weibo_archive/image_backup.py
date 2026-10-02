@@ -88,8 +88,7 @@ class ImageBackup:
                                 self.downloader.check_cancelled()
                                 if store.verified(key, self.downloader.check_cancelled):
                                     continue
-                                store.data["assets"][key]["status"] = "pending"
-                                store.write()
+                                # discover() already checkpointed this asset as pending.
                                 failure = None
                                 try:
                                     self.downloader.download(asset.selected_url,
