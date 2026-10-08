@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 Unreleased
+## 0.7.0
 
 - Introduce `FORMAT=WEIBO_AI_2` as the AI 分析版 layout. Top-level text/comments, repost-chain (`//@`) text with unverified attribution and the reposted source are rendered on separate line types; the platform default “转发微博” is reported as `NO_COMMENT` instead of body text. Quotes or reposts are not automatically treated as the account's own views.
 - Order AI records oldest first with file-local `W` numbers, year sections with counts and a closing `END` line, so a reader can cite records and notice a truncated file. Numbers are dense per file and never reveal records excluded by a visibility or custom filter.
