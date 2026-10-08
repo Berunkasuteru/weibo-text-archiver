@@ -2356,18 +2356,19 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(2, 0))
 
         limit_var = tk.StringVar(value="full")
-        ttk.Label(body, text="转发原文", style="Section.TLabel").pack(
+        choices = []
+        ttk.Label(body, text="转发原文（已确认的本人原文除外）", style="Section.TLabel").pack(
             anchor="w", pady=(14, 0)
         )
         for value, text in (
             ("full", "完整保留"),
             ("400", "每条最多保留前 400 字"),
             ("150", "每条最多保留前 150 字"),
-            ("0", "不收录正文，只保留作者与时间"),
+            ("0", "不收录完整正文（未验证预览保留）"),
         ):
-            ttk.Radiobutton(body, text=text, variable=limit_var, value=value).pack(
-                anchor="w", pady=(3, 0)
-            )
+            button = ttk.Radiobutton(body, text=text, variable=limit_var, value=value)
+            button.pack(anchor="w", pady=(3, 0))
+            choices.append(button)
 
         part_var = tk.StringVar(value="none")
         ttk.Label(body, text="拆分成多个文件", style="Section.TLabel").pack(
@@ -2379,14 +2380,14 @@ class App(tk.Tk):
             ("100000", "每个文件约 10 万字符"),
             ("50000", "每个文件约 5 万字符"),
         ):
-            ttk.Radiobutton(body, text=text, variable=part_var, value=value).pack(
-                anchor="w", pady=(3, 0)
-            )
+            button = ttk.Radiobutton(body, text=text, variable=part_var, value=value)
+            button.pack(anchor="w", pady=(3, 0))
+            choices.append(button)
         ttk.Label(
             body,
             text=(
-                "本人文字和转发链始终完整保留；被截短的原文会逐条标注原文字数。"
-                "拆分在月份之间进行，每个文件自带说明、编号与统计，可以单独使用。"
+                "顶层文字、转发链和经 UID 确认的本人原文完整保留；未知身份原文仍按设置处理。"
+                "优先按月份拆分，单月过大时按记录拆分；单条过大时完整保留并标注。"
             ),
             style="Muted.TLabel",
             wraplength=440,
@@ -2403,8 +2404,49 @@ class App(tk.Tk):
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(14, 0))
+        results_queue = queue.Queue()
+        cancel = threading.Event()
+        running = False
+        poll_id = None
+
+        def check_cancelled():
+            if cancel.is_set():
+                raise Cancelled("窗口已关闭，后续生成已取消。")
+
+        def destroyed(event):
+            nonlocal poll_id
+            if event.widget is not win:
+                return
+            cancel.set()
+            if poll_id is not None:
+                win.after_cancel(poll_id)
+                poll_id = None
+
+        win.bind("<Destroy>", destroyed, add="+")
+
+        def poll_result():
+            nonlocal running, poll_id
+            poll_id = None
+            try:
+                kind, payload = results_queue.get_nowait()
+            except queue.Empty:
+                poll_id = win.after(100, poll_result)
+                return
+            running = False
+            for button in [generate_btn, *choices]:
+                button.configure(state="normal")
+            if kind == "error":
+                result_var.set("生成失败；如已有部分文件生成，将保留在归档文件夹。")
+                messagebox.showerror("生成失败", payload, parent=win)
+            else:
+                result_var.set("已生成：\n" + ai_variant_summary(payload))
+            open_btn.configure(state="normal")
+            self._center_child_window(win)
 
         def generate():
+            nonlocal running, poll_id
+            if running:
+                return
             limit = None if limit_var.get() == "full" else int(limit_var.get())
             part_chars = None if part_var.get() == "none" else int(part_var.get())
             if limit is None and part_chars is None:
@@ -2414,33 +2456,46 @@ class App(tk.Tk):
                     parent=win,
                 )
                 return
-            try:
-                results = export_ai_variant(
-                    source["archive"],
-                    output["path"].parent,
-                    output["options"],
-                    source["filename_suffix"],
-                    source_body_limit=limit,
-                    max_part_chars=part_chars,
-                    selection_notice=source["selection_notice"],
-                    visibility_scope=source["visibility_scope"],
-                    unknown_visibility_excluded_count=source[
-                        "unknown_visibility_excluded_count"
-                    ],
-                )
-            except OSError as exc:
-                messagebox.showerror("生成失败", redact_text(exc), parent=win)
-                return
-            result_var.set("已生成：\n" + ai_variant_summary(results))
-            open_btn.configure(state="normal")
-            self._center_child_window(win)
+            running = True
+            for button in [generate_btn, open_btn, *choices]:
+                button.configure(state="disabled")
+            result_var.set("正在生成…关闭此窗口可停止后续生成，已生成文件会保留。")
 
-        ttk.Button(
+            def worker():
+                try:
+                    results = export_ai_variant(
+                        source["archive"], output["path"].parent, output["options"],
+                        source["filename_suffix"], source_body_limit=limit,
+                        max_part_chars=part_chars, selection_notice=source["selection_notice"],
+                        visibility_scope=source["visibility_scope"],
+                        unknown_visibility_excluded_count=source["unknown_visibility_excluded_count"],
+                        before_commit=check_cancelled,
+                    )
+                except Cancelled:
+                    return
+                except Exception as exc:
+                    detail = redact_text(exc)
+                    if not isinstance(exc, OSError):
+                        detail += "\n详细错误日志：\n" + save_detailed_error("AI 精简导出", exc)
+                    results_queue.put(("error", detail))
+                else:
+                    results_queue.put(("done", results))
+
+            # No Tk calls from this thread. On window/app destruction, cancellation
+            # stops future commits; a non-daemon worker can clean up its temporary file.
+            try:
+                threading.Thread(target=worker, daemon=False).start()
+            except Exception as exc:
+                results_queue.put(("error", redact_text(exc)))
+            poll_id = win.after(100, poll_result)
+
+        generate_btn = ttk.Button(
             actions,
             text="生成",
             style="Primary.TButton",
             command=generate,
-        ).pack(side="right")
+        )
+        generate_btn.pack(side="right")
         ttk.Button(
             actions,
             text="关闭",
