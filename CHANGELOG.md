@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 Unreleased
 
-- Introduce `FORMAT=WEIBO_AI_2` as the AI 分析版 layout. The account's own words, repost-chain (`//@`) text by other accounts and the reposted source are rendered on separate line types; the platform default “转发微博” is reported as `NO_COMMENT` instead of body text.
+- Introduce `FORMAT=WEIBO_AI_2` as the AI 分析版 layout. Top-level text/comments, repost-chain (`//@`) text with unverified attribution and the reposted source are rendered on separate line types; the platform default “转发微博” is reported as `NO_COMMENT` instead of body text. Quotes or reposts are not automatically treated as the account's own views.
 - Order AI records oldest first with file-local `W` numbers, year sections with counts and a closing `END` line, so a reader can cite records and notice a truncated file. Numbers are dense per file and never reveal records excluded by a visibility or custom filter.
-- Put exact aggregates in the AI header: per-year and per-month counts by record kind, amount of the account's own text, most-reposted authors and publication-location summary.
-- Stop repeating file-wide constants on every AI record and stop emitting the device, location and engagement of other accounts' reposted posts. Repeated sources and verified self-reposts refer to the earlier record by `=W` number.
-- Show the character count and a rough token estimate of AI outputs in the completion window, and offer “生成更小的 AI 版…”: from the snapshot already fetched, write a copy with reposted source bodies limited or omitted and/or split into self-contained parts cut between months. Shortened bodies are marked per record with `CUT=kept/original`; the default export is never shortened.
+- Put yearly composition, monthly record counts, top-level text volume, reposted-author counts and publication locations in the AI header. Authors are grouped by UID when available; name-only groups remain explicitly unverified.
+- Stop repeating file-wide constants on every AI record and stop emitting the device, location and engagement of other accounts' reposted posts. `REF=W<n>.OWN` and `REF=W<n>.RT` distinguish reference targets while retaining each occurrence's time, media and content state.
+- Show the character count and a rough token estimate of AI outputs in the completion window, and offer “生成更小的 AI 版…”. Generate copies in the background from the existing snapshot, limiting non-SELF complete source bodies and/or splitting by actual rendered size. Verified SELF bodies, top-level text, chains and unverified previews stay intact. Parts prefer month boundaries; indivisible oversized records are preserved and marked. Closing the dialog cancels future commits.
+- Sort known-offset times by instant. Offset-free times borrow the archive's default offset for ordering only and retain `TZ?`; all parts use the same sorting calendar while displayed timestamps preserve their source offsets.
+- Prefix Unicode-separated RT and repost-chain continuation lines consistently, preventing U+2028/U+2029 from exposing unprefixed source text to line-based readers. Write Markdown with consistent LF endings.
 - Keep a post's check-in place when Weibo also reports an IP region. Previously the IP region took over the location field and the place name was dropped from both the text and the metadata. The Full archive shows it as “签到”, the AI layout as `AT=`; normalized cache writes advance to schema version 5 for the new field.
 - Add the original post link and numeric ID to every Full archive record, and the source link to reposted originals. Image-backup file names start with the same numeric ID.
 - Keep the `WEIBO_AI_1` renderer and its goldens available for comparison; new exports no longer use it.
@@ -14,6 +16,7 @@
 - Follow redirects in the text client only to HTTPS Weibo/Sina hosts, so the saved login cookie is never sent elsewhere.
 - Retry responses cut off mid-transfer, keep exporting Markdown when the local normalized cache cannot be written, and report interface callback failures instead of freezing.
 - Make image-backup progress checkpoints validate only changed entries, removing a slowdown that grew with the number of images.
+- Normalize release ZIP timestamps, including nested runtime ZIPs, to `1980-01-01 00:00:00`; verify local and central headers and inspect compressed files for private path markers.
 
 ## 0.6.0
 

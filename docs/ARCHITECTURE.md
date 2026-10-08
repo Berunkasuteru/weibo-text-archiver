@@ -118,10 +118,10 @@ long-text 获取、计数或 safety fuse。
 normalized cache 在 0.5.2 写入 `schema_version: 3`，在版本 2 的 source
 timestamp provenance、已知 UTC offset 和 optional author UID 之外，增加抓取时
 visibility semantic state 与受控 raw provenance。版本 2 没有 visibility fact，
-不得静默当作 visibility-aware Archive。当前 schema 4 在 schema 3 基础上增加
+不得静默当作 visibility-aware Archive。schema 4 在 schema 3 基础上增加
 显式 `platform_tombstone` unavailable 语义；schema 3 即使已有
 `content_state` / `incomplete_reason` 字段，也不能被假定理解该新 reason。
-schema 5 增加 `Post.checkin`：作者附带的地点签到名单独保存，不再被
+当前 schema 5 增加 `Post.checkin`：作者附带的地点签到名单独保存，不再被
 IP 属地（`location`）覆盖；schema 4 及更早的 cache 没有该字段。
 当前应用只写 cache，不从 cache 恢复 Archive；本次不迁移、恢复或删除旧文件。
 schema 3 与更早 cache 继续作为历史本地快照存在。无版本旧缓存仍属于
@@ -152,7 +152,7 @@ timeline raw
 
 这是数据边界示意，不表示一次抓取会自动同时运行两个工具。图片工具拥有独立的时间线遍历、窗口、冻结请求、取消与结果状态；不执行文本长文补全。主窗口只增加“图片备份…”入口和必要的网络任务互斥。
 
-Image models are not Post/Archive. Image failures do not alter text Archive integrity. Image manifest schema 1 is not the normalized text cache (schema 4), and the image tool does not affect the AI layout.
+Image models are not Post/Archive. Image failures do not alter text Archive integrity. Image manifest schema 1 is not the normalized text cache (schema 5), and the image tool does not affect the AI layout.
 
 只有本次接口明确返回且可下载的图片在承诺范围内；声明数量、返回槽位和枚举缺口分别保留。图片 CDN 使用独立、无 Cookie 的顺序 HTTPS GET；视频不在 v1 范围内。远程 locator 只存在于运行时候选，不进入本地 manifest。图片与 manifest 均原子提交，恢复时先验证已有文件；COMPLETE / PARTIAL / CANCELLED / FAILED 与文本状态分离。
 

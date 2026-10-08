@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import markdown_v5 as md
 from .ai_format import (
+    _default_offset,
     estimate_tokens,
     part_period,
     render_ai_markdown,
@@ -302,7 +303,7 @@ def _atomic_write_text(
     os.close(fd)
     temp_path = Path(temp_name)
     try:
-        temp_path.write_text(text, encoding="utf-8")
+        temp_path.write_text(text, encoding="utf-8", newline="\n")
         if before_commit is not None:
             before_commit()
         candidate = final_path
@@ -427,6 +428,7 @@ def export_ai_variant(
     selection_notice: str | None = None,
     visibility_scope: str | None = None,
     unknown_visibility_excluded_count: int = 0,
+    before_commit: Callable[[], None] | None = None,
 ) -> list[tuple[Path, dict]]:
     """Write a smaller AI rendering of an already fetched archive.
 
@@ -438,56 +440,93 @@ def export_ai_variant(
     if filename_suffix not in _ALLOWED_FILENAME_SUFFIXES:
         raise ValueError("未知 Markdown 文件名类型。")
 
+    if source_body_limit is not None and source_body_limit < 0:
+        raise ValueError("source_body_limit must not be negative")
+    default_offset = _default_offset(archive.posts)
+
+    def render_part(part, extra=()):
+        if before_commit is not None:
+            before_commit()
+        provenance = _ai2_provenance_lines(
+            part, options, selection_notice, visibility_scope or "UNFILTERED",
+            unknown_visibility_excluded_count,
+        )
+        return render_ai_markdown(
+            part, options, provenance_lines=[*provenance, *extra],
+            source_body_limit=source_body_limit, default_offset=default_offset,
+        )
+
     parts = (
-        split_archive_for_parts(archive, max_part_chars, source_body_limit)
-        if max_part_chars is not None
-        else [archive]
+        split_archive_for_parts(
+            archive, max_part_chars, source_body_limit, default_offset=default_offset,
+            measure=lambda part: len(render_part(part)[0]),
+        )
+        if max_part_chars is not None else [archive]
     )
+
+    def part_headers():
+        if len(parts) == 1:
+            return [()]
+        part_list = "; ".join(
+            f"{index}) {part_period(part, default_offset)} ({len(part.posts)} records)"
+            for index, part in enumerate(parts, 1)
+        )
+        return [
+            (
+                f"PART {index}/{len(parts)}: {len(part.posts)} records in this part, "
+                f"{len(archive.posts)} across all parts; W numbers and statistics cover "
+                "this part only.",
+                "PARTS: " + part_list,
+            )
+            for index, part in enumerate(parts, 1)
+        ]
+
+    # Final part metadata also takes space. Refine until each rendered file fits,
+    # except an indivisible single record with its required header. Nothing is written yet.
+    while True:
+        headers = part_headers()
+        refined = []
+        for part, extra in zip(parts, headers):
+            if (max_part_chars is not None and len(part.posts) > 1
+                    and len(render_part(part, extra)[0]) > max_part_chars):
+                refined.extend(split_archive_for_parts(
+                    part, max_part_chars, source_body_limit, default_offset=default_offset,
+                    measure=lambda candidate: len(render_part(candidate, extra)[0]),
+                ))
+            else:
+                refined.append(part)
+        if len(refined) == len(parts):
+            break
+        parts = refined
     if source_body_limit is None:
         variant = ""
     elif source_body_limit == 0:
         variant = "_不含原文正文"
     else:
         variant = f"_原文前{source_body_limit}字"
-    part_list = "; ".join(
-        f"{index}) {part_period(part)} ({len(part.posts)} records)"
-        for index, part in enumerate(parts, 1)
-    )
-
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_name = md.safe_filename(md.normalize_text(archive.profile.screen_name) or archive.profile.id)
     range_label = _range_filename_label(archive)
     results = []
-    for index, part in enumerate(parts, 1):
-        provenance = _ai2_provenance_lines(
-            part,
-            options,
-            selection_notice,
-            visibility_scope or "UNFILTERED",
-            unknown_visibility_excluded_count,
-        )
+    for index, (part, extra) in enumerate(zip(parts, headers), 1):
         part_label = ""
         if len(parts) > 1:
             part_label = f"_第{index}卷共{len(parts)}卷"
-            provenance.append(
-                f"PART {index}/{len(parts)}: {len(part.posts)} records in this part, "
-                f"{len(archive.posts)} across all parts; W numbers and statistics cover "
-                "this part only."
-            )
-            provenance.append("PARTS: " + part_list)
-        text, _, stats = render_ai_markdown(
-            part,
-            options,
-            provenance_lines=provenance,
-            source_body_limit=source_body_limit,
-        )
+        text, _, stats = render_part(part, extra)
+        if max_part_chars is not None and len(text) > max_part_chars:
+            if len(part.posts) > 1:
+                raise RuntimeError("分卷大小校验失败。")
+            # Do not silently truncate an oversized post to meet the requested size.
+            text, _, stats = render_part(part, (*extra,
+                f"SIZE_TARGET: {max_part_chars} characters; exceeded by the required header or an indivisible record.",
+            ))
         if stats["count"] != len(part.posts):
             raise RuntimeError("导出前后条数不一致。")
         desired = output_dir / (
             f"{safe_name}_{archive.profile.id}_{range_label}_"
             f"{filename_suffix}{variant}{part_label}.md"
         )
-        path = _atomic_write_text(desired, text)
+        path = _atomic_write_text(desired, text, before_commit)
         stats.update(
             {
                 "output_bytes": path.stat().st_size,

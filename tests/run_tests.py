@@ -253,8 +253,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.6.0"
-    assert VERSION_DISPLAY == "0.6.0"
+    assert __version__ == "0.7.0"
+    assert VERSION_DISPLAY == "0.7.0"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -302,6 +302,65 @@ def test_alpha4_version_and_gui_launcher():
     ).read_text(encoding="utf-8-sig")
 
 
+def test_release_zip_metadata_and_nested_audit():
+    import io
+    import zipfile
+
+    namespace = runpy.run_path(str(ROOT / "tools/package_windows_release.py"))
+    normalize = namespace["_normalize_zip"]
+    verify = namespace["_verify_zip_metadata"]
+    epoch = namespace["ZIP_EPOCH"]
+
+    def make_zip(payload, *, name="module.pyc", when=epoch, extra=b""):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            entry = zipfile.ZipInfo(name, when)
+            entry.extra = extra
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, payload)
+        return stream.getvalue()
+
+    def rejected(data):
+        try:
+            verify(data, "synthetic.zip")
+        except RuntimeError:
+            return
+        raise AssertionError("non-normalized ZIP metadata was accepted")
+
+    dated = make_zip(b"synthetic bytecode", when=(2026, 10, 3, 1, 2, 4))
+    rejected(dated)
+    extra = struct.pack("<HHBI", 0x5455, 5, 1, 123456789)
+    rejected(make_zip(b"synthetic bytecode", extra=extra))
+    nested = make_zip(dated, name="base_library.zip")
+    rejected(nested)
+    normalized = normalize(nested)
+    verify(normalized, "normalized.zip")
+    assert normalize(normalized) == normalized
+    with zipfile.ZipFile(io.BytesIO(normalized)) as outer:
+        with zipfile.ZipFile(io.BytesIO(outer.read("base_library.zip"))) as inner:
+            assert inner.read("module.pyc") == b"synthetic bytecode"
+            assert inner.getinfo("module.pyc").date_time == epoch
+            assert inner.getinfo("module.pyc").extra == b""
+    # A valid central timestamp alone must not hide a different local-header date.
+    local_tamper = bytearray(make_zip(b"unchanged content"))
+    struct.pack_into("<H", local_tamper, 12, 0x22)
+    rejected(bytes(local_tamper))
+
+    audit = namespace["_audit_bundle"]
+    with tempfile.TemporaryDirectory(prefix="weibo_nested_audit_") as td:
+        root = Path(td)
+        exe = root / "WeiboTextArchiver.exe"
+        exe.write_bytes(b"MZ synthetic executable")
+        audit.__globals__.update(BUNDLE_DIR=root, EXE_PATH=exe)
+        (root / "base_library.zip").write_bytes(make_zip(b"C:/Users/synthetic/private.py"))
+        try:
+            audit()
+        except RuntimeError as exc:
+            assert "base_library.zip/module.pyc" in str(exc)
+        else:
+            raise AssertionError("compressed personal path entered the release bundle")
+
+
 def test_windows_preview_packaging_contract():
     from weibo_archive import VERSION_DISPLAY
     from weibo_archive.app import APP_TITLE, TEST_EXPORT_LIMIT, App
@@ -309,7 +368,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.6.0"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.7.0"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -697,7 +756,7 @@ def test_final_polish_activity_status_and_localized_ui():
         app.withdraw()
         app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.6.0"
+        assert VERSION_DISPLAY == "0.7.0"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -3938,6 +3997,7 @@ def test_collision_safe_export_preserves_every_snapshot():
         )
         assert first_path == output_dir / expected_name
         first_bytes = first_path.read_bytes()
+        assert first_bytes == first_path.read_text(encoding="utf-8").encode("utf-8")
 
         second_path, _ = export_markdown(
             archive,
@@ -5374,7 +5434,7 @@ def test_ai2_layers_references_and_round_trip():
     # The platform default is not a comment, and a repeated source is not repeated.
     assert records[2]["head"].endswith("｜NO_COMMENT]")
     assert records[2]["own"] == [] and records[2]["rt"] == []
-    assert records[2]["rt_head"] == ">[RT｜@原作者｜2023-04-30 10:00｜I2｜=W2]"
+    assert records[2]["rt_head"] == ">[RT｜@原作者｜2023-04-30 10:00｜I2｜REF=W2.RT]"
     assert "转发微博" not in text.split("## 2022", 1)[1]
 
     assert records[3]["head"] == "[W4｜2023-05-20 21:00｜VIS=PRIVATE｜S1｜IP=上海]"
@@ -5385,14 +5445,15 @@ def test_ai2_layers_references_and_round_trip():
     # A verified self-repost points at the account's own earlier record.
     assert records[5]["head"] == "[W6｜2024-02-03 23:41+09:00｜VIS=PUBLIC｜S1｜IP=日本｜C1 L8]"
     assert records[5]["own"] == ["两年后回看这条"]
-    assert records[5]["rt_head"] == ">[RT｜SELF｜=W1]"
+    assert records[5]["rt_head"] == ">[RT｜SELF｜@测试用户｜2022-11-02 08:30｜I3｜REF=W1.OWN]"
 
     assert "## 2022｜1 records" in text and "## 2023｜4 records" in text
     assert "## 2024｜1 records" in text
     assert "2023｜4｜1/1/2｜0 0 0 0 3 1 0 0 0 0 0 0" in text
-    assert "MOST_REPOSTED_AUTHORS (2 distinct authors): @原作者×2" in text
+    assert "MOST_REPOSTED_AUTHORS (2 known UIDs; 0 unverified name groups;" in text
+    assert "@原作者 (UID=77)×2" in text
     assert "IP=上海×5 (2022-11-02~2023-06-10); IP=日本×1 (2024-02-03~2024-02-03)" in text
-    assert "times without an explicit offset are +08:00" in text
+    assert "unmarked offsets are +08:00, except TZ?" in text
     assert "Android客户端" not in text and "广东" not in text and "L980" not in text
     assert text.rstrip("\n").splitlines()[-1] == "END｜W1–W6｜6 records"
     assert render_ai_markdown(archive, AI_COMPACT_OPTIONS)[0] == text
@@ -5419,7 +5480,7 @@ def test_ai2_numbering_does_not_reveal_filtered_records():
     assert "VIS=" not in rendered.split("## 2022", 1)[1]
     assert "VISIBILITY: every record is PUBLIC" in rendered
     assert "2023｜3｜0/1/2｜0 0 0 0 2 1 0 0 0 0 0 0" in rendered
-    assert records[4]["rt_head"] == ">[RT｜SELF｜=W1]"
+    assert records[4]["rt_head"] == ">[RT｜SELF｜@测试用户｜2022-11-02 08:30｜I3｜REF=W1.OWN]"
     assert rendered.rstrip("\n").splitlines()[-1] == "END｜W1–W5｜5 records"
 
 
@@ -5449,7 +5510,7 @@ def test_ai2_source_limits_and_parts():
     assert records[1]["rt"] == ["被转发的原…"]
     assert records[1]["own"] == ["说得对"]
     assert records[1]["chain"] == ["甲:补充一点背景", "乙:这事我在场"]
-    assert records[2]["rt_head"].endswith("｜=W2]")
+    assert records[2]["rt_head"].endswith(f"｜CUT=5/{len(source_text)}｜REF=W2.RT]")
     assert "\n".join(records[0]["own"]) == archive.posts[-1].text
     assert "limited by export setting to the first 5 characters" in limited
     assert limited_stats["shortened_sources"] == 1
@@ -5458,14 +5519,13 @@ def test_ai2_source_limits_and_parts():
     omitted_records = _ai2_parse(omitted)
     assert omitted_records[1]["rt_head"].endswith(f"｜CUT=0/{len(source_text)}]")
     assert omitted_records[1]["rt"] == []
-    assert "SOURCE_BODIES: omitted by export setting" in omitted
+    assert "SOURCE_BODIES: non-SELF complete bodies omitted by export setting" in omitted
 
     # Parts are contiguous in time, cut between months, and lose no record.
-    parts = split_archive_for_parts(archive, 400)
+    parts = split_archive_for_parts(archive, 4000)
     assert [[post.id for post in part.posts] for part in parts] == [
-        ["1001"],
-        ["1002", "1003", "1004"],
-        ["1005", "1006"],
+        ["1001", "1002", "1003", "1004", "1005"],
+        ["1006"],
     ]
     assert len(split_archive_for_parts(archive, 10**9)) == 1
 
@@ -5476,7 +5536,7 @@ def test_ai2_source_limits_and_parts():
             AI_COMPACT_OPTIONS,
             "AI分析版",
             source_body_limit=5,
-            max_part_chars=350,
+            max_part_chars=4500,
         )
         assert [path.name.rsplit("_", 2)[-2:] for path, _ in results] == [
             ["原文前5字", "第1卷共3卷.md"],
@@ -5500,11 +5560,13 @@ def test_ai2_source_limits_and_parts():
                 f"END｜W1–W{stats['count']}｜"
             )
             assert stats["estimated_tokens"] > 0
-        assert counts == [1, 3, 2]
+            assert len(rendered) == stats["output_chars"] <= 4500
+        assert counts == [4, 1, 1]
         # The self-reposted original lives in another part, so its body is repeated here.
         last = _ai2_parse(results[-1][0].read_text(encoding="utf-8"))
-        assert last[1]["rt_head"].startswith(">[RT｜SELF｜@测试用户｜2022-11-02 08:30｜I3")
-        assert "=W" not in last[1]["rt_head"]
+        assert last[0]["rt_head"].startswith(">[RT｜SELF｜@测试用户｜2022-11-02 08:30｜I3")
+        assert "REF=" not in last[0]["rt_head"] and "CUT=" not in last[0]["rt_head"]
+        assert "\n".join(last[0]["rt"]) == archive.posts[-1].text
 
         single, single_stats = export_markdown(
             archive, Path(td), AI_COMPACT_OPTIONS, "AI分析版"
@@ -5512,6 +5574,300 @@ def test_ai2_source_limits_and_parts():
         assert single_stats["estimated_tokens"] == estimate_tokens(
             single.read_text(encoding="utf-8")
         )
+
+
+def test_ai2_reference_snapshots_and_author_identity():
+    from weibo_archive.ai_format import render_ai_markdown
+
+    archive = _ai2_archive()
+    original = replace(archive.posts[-1], text="本人旧原文。", media=MediaInfo(images=1))
+    first = replace(archive.posts[-2], text="第一次回顾。", retweet=replace(original, media=MediaInfo(images=3)))
+    second = replace(archive.posts[-3], text="第二次回顾。", retweet=first.retweet)
+
+    def render(posts, limit=0):
+        return render_ai_markdown(replace(archive, posts=tuple(posts)), AI_COMPACT_OPTIONS,
+                                  source_body_limit=limit)[0]
+
+    # Both reference targets are explicit, and this occurrence keeps its media snapshot.
+    with_original = _ai2_parse(render((original, first, second)))
+    assert with_original[1]["rt_head"].endswith("｜I3｜REF=W1.OWN]")
+    without_original = _ai2_parse(render((first, second)))
+    assert without_original[0]["rt"] == [original.text]
+    assert "CUT=" not in without_original[0]["rt_head"]
+    assert without_original[1]["rt_head"].endswith("｜I3｜REF=W1.RT]")
+
+    # Identical names do not establish SELF. A previously shortened body cannot
+    # supply a later UID-verified SELF occurrence, even when the post ID matches.
+    unknown = replace(first, retweet=replace(first.retweet, author_id=None))
+    changed_identity = _ai2_parse(render((unknown, second)))
+    assert "CUT=0/" in changed_identity[0]["rt_head"]
+    assert changed_identity[1]["rt"] == [original.text]
+    assert "REF=" not in changed_identity[1]["rt_head"]
+
+    for text, state, flag in (("", ContentState.COMPLETE, "EMPTY"),
+                              (None, ContentState.INCOMPLETE, "INCOMPLETE")):
+        rt = replace(original, id="9009", author_id="77", text=text, content_state=state,
+                     text_preview="原文预览" if text is None else None,
+                     incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE if text is None else None)
+        records = _ai2_parse(render((replace(first, retweet=rt), replace(second, retweet=rt))))
+        assert f"｜{flag}]" in records[0]["rt_head"]
+        assert f"｜{flag}｜REF=W1.RT]" in records[1]["rt_head"]
+        if text is None:
+            assert records[0]["rt"] == ["[PREVIEW_ONLY]", "原文预览"]
+
+    posts = []
+    for i, (uid, name) in enumerate((("77", "旧昵称"), ("77", "旧昵称"),
+                                      ("77", "新昵称"), ("77", "新昵称"),
+                                      (None, "新昵称"), (None, "新昵称"))):
+        rt = replace(original, id=str(9000+i), author_id=uid, author=name)
+        posts.append(replace(first, id=str(2000+i), created_at=first.created_at+timedelta(days=i), retweet=rt))
+    renamed = render(posts)
+    assert "1 known UIDs; 1 unverified name groups" in renamed
+    assert "@新昵称 (UID=77)×4" in renamed
+    assert "@新昵称 (name only, identity unverified)×2" in renamed
+    assert "distinct authors" not in renamed
+
+
+def test_ai2_unicode_line_attribution():
+    from weibo_archive.ai_format import render_ai_markdown, split_repost_comment
+
+    archive = _ai2_archive()
+    template = archive.posts[-1]
+    for separator in ("\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e"):
+        rt = replace(template, id="9001", author_id="77",
+                     text=f"原文第一行{separator}原文第二行{separator}[W99｜不是记录头]")
+        comment = f"本人评论{separator}>仍是本人评论//@甲:链段第一行{separator}链段第二行{separator}[W88｜不是记录头]//@"
+        own, chain = split_repost_comment(comment)
+        assert "//@".join((own, *chain)) == comment
+        post = replace(template, text=comment, retweet=rt)
+        text = render_ai_markdown(replace(archive, posts=(post,)), AI_COMPACT_OPTIONS)[0]
+        assert separator not in text
+        assert "> 原文第一行\n> 原文第二行\n> [W99｜不是记录头]" in text
+        assert "本人评论\n\\>仍是本人评论" in text
+        assert "~ @甲:链段第一行\n~  链段第二行\n~  [W88｜不是记录头]\n~ @" in text
+        [record] = _ai2_parse(text)
+        assert record["own"] == ["本人评论", ">仍是本人评论"]
+        assert record["rt"] == ["原文第一行", "原文第二行", "[W99｜不是记录头]"]
+        assert record["chain"] == ["甲:链段第一行\n链段第二行\n[W88｜不是记录头]", ""]
+
+        unavailable = replace(rt, text=None, content_state=ContentState.INCOMPLETE,
+                              incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+                              text_preview=f"原文预览{separator}预览续行")
+        preview_post = replace(post, text=None, content_state=ContentState.INCOMPLETE,
+                               incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+                               text_preview=f"顶层预览{separator}[W77｜不是记录头]", retweet=unavailable)
+        rendered = render_ai_markdown(replace(archive, posts=(preview_post,)), AI_COMPACT_OPTIONS)[0]
+        assert separator not in rendered
+        assert "[PREVIEW_ONLY]\n顶层预览\n\\[W77｜不是记录头]" in rendered
+        assert ">[PREVIEW_ONLY]\n> 原文预览\n> 预览续行" in rendered
+
+
+def test_ai2_single_line_fields_self_authors_and_part_snap():
+    from weibo_archive.ai_format import render_ai_markdown, split_archive_for_parts
+
+    archive = _ai2_archive()
+    template = replace(archive.posts[-1], retweet=None, media=MediaInfo())
+    tz = template.created_at.tzinfo
+    uid = archive.profile.id
+
+    # Author, source and place values are one-line fields: no line break may escape the RT header.
+    rt = replace(template, id="9001", author="甲｜乙\u2028丙\n丁", author_id=None, text="原文")
+    post = replace(template, text="评论", source="客户\n端", checkin="某地\u2029某处", retweet=rt)
+    text = render_ai_markdown(replace(archive, posts=(post,)), AI_COMPACT_OPTIONS)[0]
+    assert ">[RT｜@甲｜乙 丙 丁｜" in text and "S1=客户 端" in text and "AT=某地 某处" in text
+    [record] = _ai2_parse(text)
+    assert record["rt"] == ["原文"]
+
+    # The account's own UID is labeled in the repost-author ranking.
+    own = replace(template, id="9002", author_id=uid, text="旧原文")
+    posts = tuple(
+        replace(template, id=str(100 + i), text="回顾", retweet=own,
+                created_at=datetime(2026, 1, 1 + i, tzinfo=tz)) for i in range(2)
+    )
+    text = render_ai_markdown(replace(archive, posts=posts), AI_COMPACT_OPTIONS)[0]
+    assert f"(UID={uid}, SELF)×2" in text
+
+    # A month boundary is used only when it keeps the part reasonably full.
+    lone = replace(template, id="1", text="一月唯一一条", created_at=datetime(2026, 1, 15, tzinfo=tz))
+    february = tuple(
+        replace(template, id=str(1000 + i), text="二月日常" + "字" * 60,
+                created_at=datetime(2026, 2, 1, tzinfo=tz) + timedelta(minutes=i)) for i in range(300)
+    )
+    parts = split_archive_for_parts(replace(archive, posts=(lone, *february)), 8000)
+    assert len(parts[0].posts) > 5
+    assert sum(len(part.posts) for part in parts) == 301
+
+
+def test_ai2_time_order_and_rendered_part_budget():
+    from weibo_archive.ai_format import _chronological, render_ai_markdown
+    from weibo_archive.exporter import export_ai_variant
+
+    archive = _ai2_archive()
+    template = replace(archive.posts[-1], retweet=None, media=MediaInfo())
+    cst, jst = timezone(timedelta(hours=8)), timezone(timedelta(hours=9))
+    a = replace(template, id="1", text="UTC04:00", created_at=datetime(2026, 1, 1, 12, tzinfo=cst))
+    b = replace(template, id="2", text="UTC03:30", created_at=datetime(2026, 1, 1, 12, 30, tzinfo=jst))
+    wall = replace(template, id="3", text="wall", created_at=datetime(2026, 1, 1, 12, 15),
+                   created_at_provenance=TimestampProvenance.SOURCE_WALL)
+    relative = replace(wall, id="4", text="relative", created_at_provenance=TimestampProvenance.RELATIVE_UNVERIFIED)
+    unknown = replace(wall, id="5", text="unknown", created_at=None, created_at_provenance=TimestampProvenance.UNKNOWN)
+    mixed = replace(archive, posts=(a, b, wall, relative, unknown))
+    text = render_ai_markdown(mixed, AI_COMPACT_OPTIONS)[0]
+    records = _ai2_parse(text)
+    assert [r["own"] for r in records] == [["UTC03:30"], ["UTC04:00"], ["wall"], ["relative"], ["unknown"]]
+    assert "12:30+09:00" in records[0]["head"]
+    assert "TZ?" in records[2]["head"] and "TZ? RELATIVE" in records[3]["head"]
+    assert "TIME_UNKNOWN" in records[4]["head"]
+    assert wall.created_at.tzinfo is None and wall.created_at_provenance is TimestampProvenance.SOURCE_WALL
+    assert "ordering only, not as a verified time zone" in text
+    assert "TZ?" in render_ai_markdown(replace(archive, posts=(wall,)), AI_COMPACT_OPTIONS)[0]
+
+    # Use one calendar for sorting, sections and month boundaries; source clocks stay visible.
+    december = replace(b, created_at=datetime(2026, 1, 1, 0, 30, tzinfo=jst))
+    january = replace(a, created_at=datetime(2026, 1, 1, 0, 10, tzinfo=cst))
+    boundary = render_ai_markdown(replace(archive, posts=(january, december)), AI_COMPACT_OPTIONS)[0]
+    assert boundary.index("## 2025｜1 records") < boundary.index("## 2026｜1 records")
+    assert "[W1｜2026-01-01 00:30+09:00" in boundary
+    assert "2025｜1｜1/0/0｜0 0 0 0 0 0 0 0 0 0 0 1" in boundary
+
+    with tempfile.TemporaryDirectory(prefix="weibo_ai2_budget_") as td:
+        root = Path(td)
+        # Regression: 500 occurrences of a long source fit one 100K file after dedup.
+        source = replace(template, id="9000", author_id="77", text="原文说明内容。"*700)
+        repeated = replace(archive, posts=tuple(
+            replace(a, id=str(10000+i), created_at=a.created_at+timedelta(minutes=i),
+                    text=f"再补充一个看法。{i}", retweet=source) for i in range(500)))
+        results = export_ai_variant(repeated, root, AI_COMPACT_OPTIONS, "AI分析版", max_part_chars=100000)
+        assert len(results) == 1 and results[0][1]["count"] == 500
+        assert results[0][1]["output_chars"] <= 100000
+
+        # Parts retain the parent sorting assumption even where their local majority differs.
+        large = replace(mixed, posts=tuple(replace(p, text=p.text+"长文。"*1000) for p in mixed.posts))
+        results = export_ai_variant(large, root, AI_COMPACT_OPTIONS, "AI分析版", max_part_chars=10000)
+        assert len(results) > 1
+        own = []
+        for path, stats in results:
+            rendered = path.read_text(encoding="utf-8")
+            assert len(rendered) == stats["output_chars"] <= 10000
+            own.extend("\n".join(r["own"]) for r in _ai2_parse(rendered))
+            assert "year/month groups use +08:00" in rendered
+        assert own == [p.text for p in _chronological(large.posts)]
+
+        # An oversized individual record is preserved and the overrun is declared.
+        big_self = replace(source, author_id=archive.profile.id, text="本人不能被截掉的原文。"*1500)
+        oversized = replace(archive, posts=(replace(a, retweet=big_self),))
+        [(path, stats)] = export_ai_variant(oversized, root, AI_COMPACT_OPTIONS, "AI分析版",
+                                           source_body_limit=0, max_part_chars=5000)
+        rendered = path.read_text(encoding="utf-8")
+        assert stats["output_chars"] > 5000 and "SIZE_TARGET: 5000" in rendered
+        assert "\n".join(_ai2_parse(rendered)[0]["rt"]) == big_self.text
+        assert "CUT=" not in _ai2_parse(rendered)[0]["rt_head"]
+
+        # Cancellation at the atomic commit leaves neither a Markdown nor a temporary file.
+        cancelled = root / "cancelled"
+        def cancel_at_commit():
+            if cancelled.exists() and list(cancelled.glob(".weibo-export-*")):
+                raise Cancelled("cancelled before commit")
+        try:
+            export_ai_variant(mixed, cancelled, AI_COMPACT_OPTIONS, "AI分析版", before_commit=cancel_at_commit)
+        except Cancelled:
+            pass
+        else:
+            raise AssertionError("variant ignored cancellation")
+        assert list(cancelled.iterdir()) == []
+
+
+def test_ai_variant_background_dialog():
+    import threading
+    import time
+    import tkinter as tk
+    from unittest.mock import patch
+    from weibo_archive import app as app_module
+
+    with tempfile.TemporaryDirectory(prefix="weibo_ai_dialog_") as td, \
+            patch.object(app_module, "has_saved_login", return_value=False), \
+            patch.object(app_module.App, "_start_update_check"), \
+            patch.object(app_module.messagebox, "showerror") as errors:
+        app = app_module.App()
+        app.withdraw()
+        gate, started, stopped = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        fail = False
+        stats = {"count": 3, "output_chars": 100, "estimated_tokens": 70}
+
+        def exporter(*args, **kwargs):
+            calls.append((threading.get_ident(), kwargs["source_body_limit"]))
+            started.set()
+            try:
+                while not gate.wait(.01):
+                    kwargs["before_commit"]()
+                kwargs["before_commit"]()
+                if fail:
+                    raise OSError("synthetic storage failure")
+                return [(Path(td)/"result.md", stats)]
+            finally:
+                stopped.set()
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 3
+            while not predicate() and time.monotonic() < deadline:
+                app.update()
+                time.sleep(.01)
+            assert predicate(), "dialog did not settle"
+
+        def descendants(widget):
+            for child in widget.winfo_children():
+                yield child
+                yield from descendants(child)
+
+        try:
+            output = dict(label="AI 分析版", stats=stats, path=Path(td)/"original.md",
+                          options=AI_COMPACT_OPTIONS, variant_source=dict(
+                              archive=build_archive(), filename_suffix="AI分析版",
+                              selection_notice=None, visibility_scope="PUBLIC",
+                              unknown_visibility_excluded_count=0))
+            app._open_ai_variant_dialog(app, output)
+            win = next(w for w in app.winfo_children() if isinstance(w, tk.Toplevel))
+            widgets = list(descendants(win))
+            choice = next(w for w in widgets if w.winfo_class() == "TRadiobutton" and str(w.cget("value")) == "400")
+            generate = next(w for w in widgets if w.winfo_class() == "TButton" and str(w.cget("text")) == "生成")
+            choice.invoke()
+            with patch.object(app_module, "export_ai_variant", side_effect=exporter), \
+                    patch.object(app, "report_callback_exception") as callback_error:
+                generate.invoke()
+                assert started.wait(1)
+                assert calls == [(calls[0][0], 400)] and calls[0][0] != threading.get_ident()
+                assert str(generate.cget("state")) == "disabled"
+                assert str(choice.cget("state")) == "disabled"
+                generate.invoke()
+                heartbeat = []
+                app.after(10, lambda: heartbeat.append(True))
+                wait_for(lambda: bool(heartbeat))
+                assert len(calls) == 1 and not stopped.is_set()
+                gate.set()
+                wait_for(lambda: str(generate.cget("state")) == "normal")
+                assert str(choice.cget("state")) == "normal"
+                errors.assert_not_called()
+
+                # Failure returns control to the UI and permits another attempt.
+                fail = True
+                generate.invoke()
+                wait_for(lambda: str(generate.cget("state")) == "normal")
+                errors.assert_called_once()
+                assert "synthetic storage failure" in str(errors.call_args)
+
+                # Closing a running dialog cancels the worker and its polling callback.
+                fail = False
+                gate.clear(); started.clear(); stopped.clear()
+                generate.invoke()
+                assert started.wait(1)
+                win.destroy()
+                assert stopped.wait(1)
+                app.update()
+                callback_error.assert_not_called()
+        finally:
+            gate.set()
+            app.destroy()
 
 
 def test_checkin_is_kept_beside_ip_region():
@@ -5606,6 +5962,7 @@ def main():
         ("startup import", test_startup_import),
         ("Alpha4 version and no-console GUI launcher", test_alpha4_version_and_gui_launcher),
         ("Windows preview packaging contract", test_windows_preview_packaging_contract),
+        ("release ZIP timestamps and nested privacy audit", test_release_zip_metadata_and_nested_audit),
         ("portable Archives path and initial output defaults", test_portable_archives_path_and_initial_output_defaults),
         ("activity indicator lifecycle", test_activity_indicator_lifecycle),
         ("final polish activity status and localized UI", test_final_polish_activity_status_and_localized_ui),
@@ -5677,6 +6034,11 @@ def main():
         ("WEIBO_AI_2 authorship layers, references and round trip", test_ai2_layers_references_and_round_trip),
         ("WEIBO_AI_2 numbering hides filtered records", test_ai2_numbering_does_not_reveal_filtered_records),
         ("WEIBO_AI_2 source limits and multi-part export", test_ai2_source_limits_and_parts),
+        ("WEIBO_AI_2 reference snapshots and author identity", test_ai2_reference_snapshots_and_author_identity),
+        ("WEIBO_AI_2 Unicode line attribution", test_ai2_unicode_line_attribution),
+        ("WEIBO_AI_2 one-line fields, SELF ranking, part snap", test_ai2_single_line_fields_self_authors_and_part_snap),
+        ("WEIBO_AI_2 time order and rendered part budget", test_ai2_time_order_and_rendered_part_budget),
+        ("AI variant background generation, failure and close", test_ai_variant_background_dialog),
         ("check-in place kept beside IP region; Full permalinks", test_checkin_is_kept_beside_ip_region),
         ("zero-runtime-dependency audit", test_dependency_audit),
     ]
