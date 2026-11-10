@@ -64,12 +64,10 @@ def app_data_dir() -> Path:
 
 
 APP_DATA_DIR = app_data_dir()
-APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 COOKIE_FILE = APP_DATA_DIR / "cookie.txt"
 CREDENTIAL_FILE = APP_DATA_DIR / "credential.dat"
 ERROR_FILE = APP_DATA_DIR / "last_error.txt"
 CACHE_DIR = APP_DATA_DIR / "v7_cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 APP_ICON_PNG = resource_path("assets/app_icon.png")

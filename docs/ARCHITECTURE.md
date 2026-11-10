@@ -1,8 +1,8 @@
 # Weibo Text Archiver Architecture
 
-V7 的目标不是“把 V6 拆成很多文件”，而是建立几个可以长期守住的边界。
+The architecture establishes strict boundaries between upstream Weibo API payloads, normalized domain models, local persistence, and output renderers.
 
-## Data flow
+## Data Flow
 
 ```text
 Weibo HTTPS
@@ -19,189 +19,84 @@ parser.py
     ▼
 models.py                ← frozen dataclasses / stable product vocabulary
     │
-    ├──────────────► storage.py       normalized cache
+    ├──────────────► storage.py       normalized local cache (schema 5)
     │
     ▼
 exporter.py ◄──────── frozen ExportOptions snapshot ◄──────── GUI preset/custom
     │
     ▼
-markdown_v5.py           Full layout; legacy baseline and the retained WEIBO_AI_1
-ai_format.py             AI layout (WEIBO_AI_2), rendered directly from models
+markdown_v5.py           Full & Custom layouts (plus retained WEIBO_AI_1 baseline)
+ai_format.py             AI Analysis layout (WEIBO_AI_2), rendered from frozen models
     │
     └──────────────► selected Full / AI Analysis / Custom Markdown outputs
 ```
 
-登录单独走：
+Authentication uses a dedicated flow:
 
 ```text
-auth.py → Weibo Passport QR SSO → local credential
+auth.py → Weibo Passport QR SSO → local DPAPI-protected credential
 ```
 
-GUI 只负责：
+The GUI (`app.py`) is responsible only for:
 
 ```text
 input/preset → resolve immutable options → task orchestration → progress → result
 ```
 
-展示选项只进入 exporter/renderer。它们不进入 parser、network、models，
-也不裁剪 `storage.py` 保存的 normalized archive。
+Presentation options only enter `exporter.py` and the renderers. They never enter `parser.py`, `network.py`, or `models.py`, and never prune the normalized archive written by `storage.py`.
 
-## Four invariants
+## Core Invariants
 
-### 1. Exporter never knows Weibo's raw JSON
+### 1. Exporters never inspect raw Weibo JSON
 
-`Post` / `UserProfile` 是 API 与产品之间的防火墙。
+`Post` and `UserProfile` act as the firewall between upstream API payloads and Markdown outputs. Renderers consume frozen dataclasses only; if Weibo changes field names or nesting, changes stay inside `parser.py` and `client.py`.
 
-禁止：
+### 2. Missing data is distinct from zero
 
-```python
-post.raw["some_field"]
-Post.from_json(...)
-```
+In `models.py`:
 
-如果微博改字段，只改 `parser.py/client.py`。
+- `0` means the upstream response explicitly reported zero.
+- `None` means the field was omitted or could not be reliably parsed.
 
-### 2. Missing data is not zero
+### 3. Stale background tasks cannot mutate active UI state
 
-模型层：
+Every worker event carries a `generation` counter. The UI discards any event whose `generation` does not match the active generation. Cancelling a task immediately increments `generation`, preventing background threads from overwriting current UI state.
 
-```text
-0     = API 明确返回 0
-None  = API 没提供 / 无法可靠解析
-```
+### 4. Long text is either proven complete or explicitly marked incomplete
 
-渲染规则以后可以变化，但这个语义不允许丢。
+When a post is flagged `isLongText`, the client must hydrate its full text. Two evidence-bounded paths may produce an `INCOMPLETE` `Post` node:
 
-### 3. A stale task cannot mutate current UI
+1. **Confirmed Permission Boundary** — Both approved full-text endpoints (`extend` and `detail`) for the same post node independently classify as `no_view_permission_html`. The node records `text = None`, preserves the visible timeline snippet in `text_preview`, and sets `content_state = INCOMPLETE`.
+2. **Confirmed Platform Tombstone** — A nested repost matches both a controlled platform unavailability notice and the structural signature of a deleted/unavailable post (missing author identity, source, and engagement metadata). It records `text = None`, `text_preview = None`, `incomplete_reason = PLATFORM_TOMBSTONE`, and `content_state = INCOMPLETE`.
 
-所有 worker event 都携带 `generation`。
+Top-level posts and reposted originals maintain independent completeness states. All other network, authentication, challenge, schema, or ID-mismatch errors fail closed rather than falling back to truncated timeline previews.
 
-GUI 在消费事件前必须：
+## Visibility and Normalized Cache Schema
 
-```python
-if generation != current_generation:
-    ignore
-```
-
-取消任务会立即提升 generation，因此 Python 无法强制终止线程也不会导致旧任务踩坏新状态。
-
-### 4. Long text is either proven complete or explicitly incomplete
-
-如果微博标记 `isLongText`，V7 必须取得全文。
-
-显式不完整结果有两个受证据约束的来源。长微博路径要求同一 Post 节点的
-`extend` 和 `detail` 都被安全分类为当前无查看权限。此时：
+Visibility provenance flows in one direction:
 
 ```text
-text = None
-text_preview = timeline 中仍可见的预览
-content_state = INCOMPLETE
+timeline response → parser normalization → frozen Post.visibility → Archive → local Full / AI / Custom filtering
 ```
 
-顶层微博与转发原文分别拥有状态。其他网络、认证、schema、ID mismatch
-或混合失败仍然 fail closed，绝不能把列表页预览当完整正文。
+- Top-level posts map known visibility codes to `PUBLIC`, `FOLLOWERS`, `FRIENDS`, `PRIVATE`, or `UNKNOWN`.
+- Full Archive outputs all fetched records without visibility filtering; AI Analysis Edition (public-only by default) and Custom Export filter locally from the same frozen `Archive`.
+- `storage.py` currently writes normalized cache **schema version 5** (adding `Post.checkin` alongside IP `location`, `platform_tombstone` semantics from schema 4, visibility provenance from schema 3, and timestamp/UID provenance from schema 2).
 
-另一个来源是 nested RT 中高置信的平台 tombstone：只有精确受控的平台通知
-与缺失作者身份、来源和互动元数据的结构签名同时成立，才表示原作者正文当前
-不可取得。平台通知是关于可用性的系统证据，不是作者正文，也不是列表预览：
-
-```text
-text = None
-text_preview = None
-incomplete_reason = PLATFORM_TOMBSTONE
-content_state = INCOMPLETE
-```
-
-相同文字若具有正常作者身份或普通元数据，仍按作者正文处理。该分类不进入
-long-text 获取、计数或 safety fuse。
-
-normalized cache 在 0.5.2 写入 `schema_version: 3`，在版本 2 的 source
-timestamp provenance、已知 UTC offset 和 optional author UID 之外，增加抓取时
-visibility semantic state 与受控 raw provenance。版本 2 没有 visibility fact，
-不得静默当作 visibility-aware Archive。schema 4 在 schema 3 基础上增加
-显式 `platform_tombstone` unavailable 语义；schema 3 即使已有
-`content_state` / `incomplete_reason` 字段，也不能被假定理解该新 reason。
-当前 schema 5 增加 `Post.checkin`：作者附带的地点签到名单独保存，不再被
-IP 属地（`location`）覆盖；schema 4 及更早的 cache 没有该字段。
-当前应用只写 cache，不从 cache 恢复 Archive；本次不迁移、恢复或删除旧文件。
-schema 3 与更早 cache 继续作为历史本地快照存在。无版本旧缓存仍属于
-legacy/unversioned，未来不得静默当作可信 mother archive 读取。
-
-Visibility 的架构边界保持为：
-
-```text
-production list response
-→ parser normalization
-→ frozen Post.visibility
-→ one Archive
-→ local Full / AI Analysis / Custom policies
-```
-
-top-level W 使用当前受控证据映射；缺失、畸形或未来未知值保持 UNKNOWN。
-nested RT 只保留结构有效的独立 raw provenance，0.5.2 不解释其 semantic
-visibility，也不输出 per-RT semantic label。Full 不按 visibility 过滤；AI 与
-Custom 只按 top-level W 本地派生，不增加网络请求或不同快照。
-
-## Independent image backup (0.6.0)
+## Independent Image Backup
 
 ```text
 timeline raw
-├─ existing text client/parser → Post / Archive → Markdown
-└─ image client/parser → ImageRecord / ImageAsset → downloader / image manifest
+├─ text client/parser  → Post / Archive → Markdown
+└─ image client/parser → ImageRecord / ImageAsset → CDN downloader / image_manifest.json
 ```
 
-这是数据边界示意，不表示一次抓取会自动同时运行两个工具。图片工具拥有独立的时间线遍历、窗口、冻结请求、取消与结果状态；不执行文本长文补全。主窗口只增加“图片备份…”入口和必要的网络任务互斥。
+The Image Backup tool (`image_core.py`, `image_ui.py`) runs as an independent workflow with its own timeline traversal, frozen request state, window, and `image_manifest.json` (schema 1):
 
-Image models are not Post/Archive. Image failures do not alter text Archive integrity. Image manifest schema 1 is not the normalized text cache (schema 5), and the image tool does not affect the AI layout.
+- It saves only images explicitly returned by the timeline response and downloadable from Sina CDN (standard photos, GIFs, and Live Photo still frames; videos, covers, and avatars are excluded).
+- It preserves declared counts, returned slot counts, and enumeration gaps separately.
+- Image CDN requests use a dedicated, credential-free HTTPS client with sequential pacing, signature/size/SHA-256 verification, and atomic file + manifest commits.
 
-只有本次接口明确返回且可下载的图片在承诺范围内；声明数量、返回槽位和枚举缺口分别保留。图片 CDN 使用独立、无 Cookie 的顺序 HTTPS GET；视频不在 v1 范围内。远程 locator 只存在于运行时候选，不进入本地 manifest。图片与 manifest 均原子提交，恢复时先验证已有文件；COMPLETE / PARTIAL / CANCELLED / FAILED 与文本状态分离。
+## Runtime Dependency Policy
 
-## Runtime dependency policy
-
-`weibo_archive/` 运行时不得：
-
-- import requests
-- import playwright
-- import selenium
-- import subprocess
-- pip install
-- 下载并执行 GitHub 代码
-- 关闭 TLS certificate verification
-
-唯一 vendored 第三方组件是用于生成二维码矩阵的 `python-qrcode`。
-
-## V7 Alpha boundaries
-
-Alpha 1 已完成：
-
-- 独立 HTTPS client
-- QR SSO
-- normalized models
-- frozen V5 renderer baseline
-- range model
-- task state + generation
-- security redaction
-- tests
-
-Alpha 1 当时暂未完成的 DPAPI credential storage、稳定 AI 格式和
-PyInstaller `onedir` build 已在后续公开版本交付。以下项目仍延期：
-
-- resumable initial archive
-- incremental update
-- Authenticode signing
-
-Alpha 3 的边界是 UX polish：
-
-- frozen `ExportOptions` 是单个导出任务的展示策略快照；
-- 完整归档、AI 分析版、自定义一次只生成一个主 Markdown；
-- legacy/default renderer 调用仍保持 Alpha2/V5 golden 不变；
-- 完成窗口只在用户点击后调用 Windows 打开能力；
-- 不改变抓取、长微博、分页、认证或任务 generation 语义。
-
-Alpha 4 增加不完整档案语义：
-
-- `Post.text == ""` 表示已确认没有文字正文；
-- `Post.text is None` 只表示正文无法取得；
-- timeline preview 单独存入 `text_preview`；
-- `Archive.integrity` 从 frozen Post 树现场计算，不污染分页 `Termination`；
-- 任务可成功完成并带 integrity warning，但未知情况仍然失败。
+At runtime, `weibo_archive/` relies on the Python standard library, `tkinter`, and `qrcode` (for QR matrix generation). It never imports `requests`, `playwright`, `selenium`, or `PIL`, never spawns subprocesses or runs `pip`, never downloads remote code, and never disables TLS certificate verification.

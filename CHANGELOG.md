@@ -1,16 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Share the target UID/URL, output directory, and since-date parameters seamlessly between the main window and the Image Backup window, and normalize pasted Weibo profile URLs to UIDs when starting an image backup.
+- Show an in-place retry action in the QR login dialog when a QR code expires instead of closing the dialog abruptly.
+- Add an explicit output file selector in the post-export completion dialog when multiple Markdown outputs are generated in a single run.
+- Add keyboard shortcuts (`Return` to start, `Escape` to cancel or close dialogs), click-to-activate range inputs, keyboard-accessible update notice links, and focus-follow scrolling in the main settings canvas.
+- Harden Windows filename sanitization (`safe_filename`) against control characters, excessive length, and reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
+- Avoid import-time filesystem creation side effects in `weibo_archive.paths`, use `tempfile.mkstemp` for normalized cache writes, cache cookie redaction reads by file `mtime`/`size`, and throttle image manifest `stat()` checks during rapid progress callbacks.
+
 ## 0.7.0
 
-- Introduce `FORMAT=WEIBO_AI_2` as the AI 分析版 layout. Top-level text/comments, repost-chain (`//@`) text with unverified attribution and the reposted source are rendered on separate line types; the platform default “转发微博” is reported as `NO_COMMENT` instead of body text. Quotes or reposts are not automatically treated as the account's own views.
+- Introduce `FORMAT=WEIBO_AI_2` as the AI Analysis Edition layout. Top-level text/comments, repost-chain (`//@`) text with unverified attribution and the reposted source are rendered on separate line types; the platform default repost text is reported as `NO_COMMENT` instead of body text. Quotes or reposts are not automatically treated as the account's own views.
 - Order AI records oldest first with file-local `W` numbers, year sections with counts and a closing `END` line, so a reader can cite records and notice a truncated file. Numbers are dense per file and never reveal records excluded by a visibility or custom filter.
 - Put yearly composition, monthly record counts, top-level text volume, reposted-author counts and publication locations in the AI header. Authors are grouped by UID when available; name-only groups remain explicitly unverified.
 - Stop repeating file-wide constants on every AI record and stop emitting the device, location and engagement of other accounts' reposted posts. `REF=W<n>.OWN` and `REF=W<n>.RT` distinguish reference targets while retaining each occurrence's time, media and content state.
-- Show the character count and a rough token estimate of AI outputs in the completion window, and offer “生成更小的 AI 版…”. Generate copies in the background from the existing snapshot, limiting non-SELF complete source bodies and/or splitting by actual rendered size. Verified SELF bodies, top-level text, chains and unverified previews stay intact. Parts prefer month boundaries; indivisible oversized records are preserved and marked. Closing the dialog cancels future commits.
+- Show the character count and a rough token estimate of AI outputs in the completion window, and offer an on-demand smaller/split AI variant generator. Generate copies in the background from the existing snapshot, limiting non-SELF complete source bodies and/or splitting by actual rendered size. Verified SELF bodies, top-level text, chains and unverified previews stay intact. Parts prefer month boundaries; indivisible oversized records are preserved and marked. Closing the dialog cancels future commits.
 - Sort known-offset times by instant. Offset-free times borrow the archive's default offset for ordering only and retain `TZ?`; all parts use the same sorting calendar while displayed timestamps preserve their source offsets.
 - Prefix Unicode-separated RT and repost-chain continuation lines consistently, preventing U+2028/U+2029 from exposing unprefixed source text to line-based readers. Write Markdown with consistent LF endings.
-- Keep a post's check-in place when Weibo also reports an IP region. Previously the IP region took over the location field and the place name was dropped from both the text and the metadata. The Full archive shows it as “签到”, the AI layout as `AT=`; normalized cache writes advance to schema version 5 for the new field.
-- Add the original post link and numeric ID to every Full archive record, and the source link to reposted originals. Image-backup file names start with the same numeric ID.
+- Keep a post's check-in place when Weibo also reports an IP region. Previously the IP region took over the location field and the place name was dropped from both the text and the metadata. The Full Archive shows it as a check-in field, the AI layout as `AT=`; normalized cache writes advance to schema version 5 for the new field.
+- Add the original post link and numeric ID to every Full Archive record, and the source link to reposted originals. Image-backup file names start with the same numeric ID.
 - Keep the `WEIBO_AI_1` renderer and its goldens available for comparison; new exports no longer use it.
 - Render at the display's real DPI on scaled Windows displays, and keep the main window usable on short screens by scrolling only the settings.
 - Follow redirects in the text client only to HTTPS Weibo/Sina hosts, so the saved login cookie is never sent elsewhere.
@@ -20,7 +29,7 @@
 
 ## 0.6.0
 
-- Add a separate “图片备份…” tool for local backup of images explicitly returned by the current Weibo timeline response and successfully downloadable, independent of text export.
+- Add a separate Image Backup tool for local backup of images explicitly returned by the current Weibo timeline response and successfully downloadable, independent of text export.
 - Support ordinary still images, GIF and the still component of Live Photo, preserving separate top-level and nested-retweet ownership. Video, card covers, avatars and article media are excluded.
 - Verify image signatures, size and SHA256; use atomic file/manifest writes and verify valid existing files before skipping them on rerun.
 - Report enumeration gaps when Weibo declares more media than the returned slots contain; do not imply complete historical media coverage or original-upload quality.
@@ -71,7 +80,7 @@
 ## 0.5.2
 
 - Preserve fetch-time visibility provenance as PUBLIC, FOLLOWERS, FRIENDS, PRIVATE, or explicit UNKNOWN without inferring historical audience settings.
-- Make AI 分析版 public-only by default, with explicit opt-ins for confirmed restricted visibility categories and local-only filtering from the same frozen Archive.
+- Make AI Analysis Edition public-only by default, with explicit opt-ins for confirmed restricted visibility categories and local-only filtering from the same frozen Archive.
 - Add optional visibility filtering to Custom output while keeping Full Archive complete for all records returned to the authenticated session.
 - Keep nested repost visibility semantics uninterpreted in 0.5.2 while retaining structurally valid raw provenance in normalized cache schema version 3.
 
@@ -89,12 +98,12 @@
 ## 0.5.0-beta.2
 
 - Preserve source timestamp offsets without exporter-machine conversion and mark offset-free or relative timestamp provenance explicitly.
-- Keep missing engagement counts distinct from explicit zero in Full Archive and AI 分析版 output.
+- Keep missing engagement counts distinct from explicit zero in Full Archive and AI Analysis Edition output.
 - Preserve complete empty-body repost relations and their verified metadata instead of dropping the RT block.
 - Store optional author UIDs and mark self-reposts only after exact non-empty UID equality.
 - Add the defensive `FORMAT=WEIBO_AI_1` contract while removing source-count and source-frequency aggregates.
 - Bump normalized cache writes to schema version 2 for timestamp provenance and optional author identity.
-- Rename the current user-visible AI output to AI 分析版.
+- Rename the user-visible AI output to AI Analysis Edition.
 
 ## 0.5.0-beta.1
 
@@ -212,13 +221,12 @@
 
 ### Intentionally deferred
 - DPAPI credential storage.
-- resumable full crawl.
-- incremental update.
-- final AI token-format revision.
+- Resumable full crawl.
+- Incremental update.
+- Final AI token-format revision.
 - PyInstaller onedir / Authenticode release build.
 
-
-### Alpha 1 发布前 fail-closed 加固
-- 未知 `ok=0` JSON 不再因缺少 challenge URL 而误判为自然结束。
-- `since_date` 的提前终止要求整页时间均可解析；未知日期会保留并继续抓取。
-- 回归测试增至 15 项。
+### Pre-release fail-closed hardening
+- Unknown `ok=0` JSON responses are no longer misclassified as a natural end of timeline when a challenge URL is absent.
+- Early termination on `since_date` requires all timestamps on the page to be parseable; records with unknown dates are retained and crawling continues.
+- Expanded regression test suite to 15 checks.

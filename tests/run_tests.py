@@ -546,12 +546,12 @@ def test_windows_preview_packaging_contract():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert readme.startswith("# Weibo Text Archiver\n")
     for current_positioning in (
-        "本地 Markdown 归档",
-        "完整归档",
-        "AI 分析版",
-        "程序不内置 LLM",
-        "由用户主动向该服务披露文件内容",
-        "最近 20 条",
+        "local-first Windows desktop utility",
+        "Full Archive",
+        "AI Analysis Edition",
+        "No Built-In LLM",
+        "initiated solely by you",
+        "Latest 20 posts",
     ):
         assert current_positioning in readme
     assert not (ROOT / "README_先看.txt").exists()
@@ -5957,6 +5957,46 @@ def test_login_cookie_never_follows_offsite_redirect():
         assert follow(url) is None, url
 
 
+def test_quality_polish_range_filename_and_qr_expiry():
+    from unittest.mock import patch
+    import weibo_archive.app as app_module
+    from weibo_archive.markdown_v5 import safe_filename
+
+    assert app_module.parse_fetch_range("recent", "42") == FetchRange.recent(42)
+    assert app_module.parse_fetch_range(RangeMode.ALL) == FetchRange.all()
+    assert app_module.is_weibo_url_without_uid("https://weibo.com/n/someuser")
+    assert not app_module.is_weibo_url_without_uid("https://weibo.com/u/123456789")
+    assert not app_module.is_weibo_url_without_uid("https://weibo.com/status/123456789")
+
+    assert safe_filename("CON") == "_CON"
+    assert safe_filename("nul.txt") == "_nul.txt"
+    assert safe_filename("用户\x00\x1f名") == "用户__名"
+    assert len(safe_filename("甲" * 120)) == 80
+    assert Termination.NATURAL.label() == "自然结束"
+    assert Termination.TARGET_COUNT.label() == "达到指定条数"
+    assert Termination.SINCE_REACHED.label() == "达到起始日期"
+
+    with patch.object(app_module, "has_saved_login", return_value=False), \
+            patch.object(app_module.App, "_start_update_check"), \
+            patch.object(app_module.messagebox, "showerror") as errors:
+        app = app_module.App()
+        app.withdraw()
+        try:
+            gen, _ = app.tasks.start(TaskState.AUTHENTICATING)
+            app._open_qr_window()
+            app._set_running(True)
+            app.events.put((gen, "qr_expired", "二维码已过期，请重新获取。"))
+            app._poll_events()
+            assert app.qr_window is not None and app.qr_window.winfo_exists()
+            assert str(app.qr_refresh_btn.cget("state")) == "normal"
+            assert app.tasks.state is TaskState.IDLE
+            errors.assert_not_called()
+            app.stop_current()
+            assert app.qr_window is None
+        finally:
+            app.destroy()
+
+
 def main():
     suite = [
         ("startup import", test_startup_import),
@@ -6040,6 +6080,7 @@ def main():
         ("WEIBO_AI_2 time order and rendered part budget", test_ai2_time_order_and_rendered_part_budget),
         ("AI variant background generation, failure and close", test_ai_variant_background_dialog),
         ("check-in place kept beside IP region; Full permalinks", test_checkin_is_kept_beside_ip_region),
+        ("quality polish range, filename and QR expiry", test_quality_polish_range_filename_and_qr_expiry),
         ("zero-runtime-dependency audit", test_dependency_audit),
     ]
     for name, fn in suite:
