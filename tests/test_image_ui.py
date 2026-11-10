@@ -346,6 +346,24 @@ class TkTests(unittest.TestCase):
         self.win.start(); self.pump()
         self.assertEqual((self.app.status_var.get(), self.app.progress_detail_var.get(), self.app.activity._running), before)
 
+    def test_context_sync_and_url_normalization(self):
+        self.win.shutdown()
+        custom_dir = Path(self.tmp.name) / "custom_out"
+        self.app.output_var.set(str(custom_dir))
+        self.app.since_date_var.set("2025-02-03")
+        self.app.uid_var.set("")
+        self.win = ui.open_image_window(self.app)
+        self.assertEqual(Path(self.win.output_var.get()), custom_dir)
+        self.assertEqual(self.win.since_var.get(), "2025-02-03")
+        self.assertEqual(self.win.target_var.get(), "")
+        self.app.uid_var.set("https://weibo.com/u/987654")
+        ui.open_image_window(self.app)
+        self.assertEqual(self.win.target_var.get(), "987654")
+        self.win.target_var.set("https://m.weibo.cn/u/543210")
+        self.win.controller.runner = lambda r, e, p: outcome()
+        self.win.start(); self.pump()
+        self.assertEqual(self.win.target_var.get(), "543210")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

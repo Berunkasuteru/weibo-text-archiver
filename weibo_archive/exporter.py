@@ -95,14 +95,7 @@ def archive_to_legacy_data(archive: Archive) -> dict:
 
 
 def _termination_label(archive: Archive) -> str:
-    t = archive.report.termination
-    if t is Termination.NATURAL:
-        return "自然结束"
-    if t is Termination.TARGET_COUNT:
-        return "达到指定条数"
-    if t is Termination.SINCE_REACHED:
-        return "达到起始日期"
-    return t.value
+    return archive.report.termination.label()
 
 
 def _range_filename_label(archive: Archive) -> str:

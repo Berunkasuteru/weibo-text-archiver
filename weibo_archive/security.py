@@ -20,10 +20,25 @@ _COOKIE_PAIR_RE = re.compile(
 )
 
 
+_COOKIE_CACHE: dict[Path, tuple[tuple[int, int] | None, list[str]]] = {}
+
+
 def _read_cookie_values(cookie_file: Path = COOKIE_FILE) -> list[str]:
+    try:
+        st = cookie_file.stat()
+        stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        _COOKIE_CACHE[cookie_file] = (None, [])
+        return []
+
+    cached = _COOKIE_CACHE.get(cookie_file)
+    if cached is not None and cached[0] == stamp:
+        return list(cached[1])
+
     try:
         raw = cookie_file.read_text(encoding="utf-8", errors="ignore")
     except OSError:
+        _COOKIE_CACHE[cookie_file] = (None, [])
         return []
 
     values: list[str] = []
@@ -33,7 +48,9 @@ def _read_cookie_values(cookie_file: Path = COOKIE_FILE) -> list[str]:
         key, value = part.split("=", 1)
         if key.strip() in _SECRET_KEYS and value.strip():
             values.append(value.strip())
-    return sorted(set(values), key=len, reverse=True)
+    result = sorted(set(values), key=len, reverse=True)
+    _COOKIE_CACHE[cookie_file] = (stamp, result)
+    return list(result)
 
 
 def redact_text(value: object, cookie_file: Path = COOKIE_FILE) -> str:
@@ -58,6 +75,7 @@ def save_detailed_error(context: str, exc: BaseException) -> str:
     )
     safe = redact_text(raw)
     try:
+        ERROR_FILE.parent.mkdir(parents=True, exist_ok=True)
         ERROR_FILE.write_text(safe, encoding="utf-8")
         return str(ERROR_FILE)
     except Exception:

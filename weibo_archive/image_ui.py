@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -81,22 +82,22 @@ def failure_message(reason):
 
 def resolve_request(target, mode, recent, since, output):
     # Reuse the published account guard and range validation, not text fetching.
-    from .app import App, extract_uid, is_obvious_single_post_url
+    from .app import (
+        extract_uid,
+        is_obvious_single_post_url,
+        is_weibo_url_without_uid,
+        parse_fetch_range,
+    )
     if is_obvious_single_post_url(target):
         raise ValueError("这里需要账号的数字 UID 或账号主页链接，不是单条微博链接。")
     uid = extract_uid(target)
     if not valid_identity(uid):
+        if is_weibo_url_without_uid(target):
+            raise ValueError("此微博链接是昵称或个性域名主页，不含数字 UID；请输入数字 UID 或包含数字 UID 的主页链接。")
         raise ValueError("请输入微博数字 UID，或包含数字 UID 的账号主页链接。")
     if mode not in {m.value for m in RangeMode}:
         raise ValueError("请选择有效的备份范围。")
-    class Value:
-        def __init__(self, v): self.v = v
-        def get(self): return self.v
-    class RangeFields:
-        range_mode_var = Value(mode)
-        recent_count_var = Value(recent)
-        since_date_var = Value(since)
-    fetch_range = App._selected_range(RangeFields(), trial=mode == RangeMode.TRIAL.value)
+    fetch_range = parse_fetch_range(mode, recent, since, trial=mode == RangeMode.TRIAL.value)
     if not output.strip():
         raise ValueError("请选择图片备份的保存位置。")
     try:
@@ -125,6 +126,12 @@ def image_task_active(app):
 def open_image_window(app):
     window = getattr(app, "_image_window", None)
     if window is not None and window.winfo_exists():
+        if not window.controller.active and not window.target_var.get().strip():
+            from .app import extract_uid, is_obvious_single_post_url
+            target = app.uid_var.get()
+            uid = "" if is_obvious_single_post_url(target) else extract_uid(target)
+            if valid_identity(uid):
+                window.target_var.set(uid)
         window.deiconify()
         window.lift()
         window.focus_set()
@@ -140,6 +147,8 @@ class ProgressAdapter:
         self.request, self.publish = request, publish
         self.value = ImageProgress()
         self.started = False
+        self._last_manifest_stat = None
+        self._last_manifest_read = 0.0
 
     def discovered(self, group, posts):
         self.started = True  # Core has begun this run before it consumes discovery.
@@ -157,8 +166,21 @@ class ProgressAdapter:
         if self.started:
             try:
                 path = self.request.backup_root / "manifest.json"
-                if path.stat().st_size <= MAX_MANIFEST_BYTES:
+                st = path.stat()
+                stamp = (st.st_mtime_ns, st.st_size)
+                now = time.monotonic()
+                if (
+                    st.st_size <= MAX_MANIFEST_BYTES
+                    and stamp != self._last_manifest_stat
+                    and (
+                        self._last_manifest_read == 0.0
+                        or phase != self.value.phase
+                        or now - self._last_manifest_read >= 0.08
+                    )
+                ):
                     data = json.loads(path.read_text(encoding="utf-8"))
+                    self._last_manifest_stat = stamp
+                    self._last_manifest_read = now
                     if data.get("target_identity") == self.request.target_uid:
                         counts = Counter(data["assets"][k]["status"] for k in data["current_asset_keys"])
                         self.value = replace(self.value, saved=counts["saved"], already_present=counts["already_present"],
@@ -325,14 +347,16 @@ class ImageBackupWindow(tk.Toplevel):
         self.request = None
         self.last_outcome = None
         self.useful_root = None
+        self._started_at = None
         target = app.uid_var.get()
         uid = "" if is_obvious_single_post_url(target) else extract_uid(target)
         self.target_var = tk.StringVar(self, uid if valid_identity(uid) else "")
         self.range_var = tk.StringVar(self, RangeMode.TRIAL.value)
         self.recent_var = tk.StringVar(self, app.recent_count_var.get())
-        self.since_var = tk.StringVar(self, "")
-        self.output_var = tk.StringVar(self, str(app.default_output_dir))
+        self.since_var = tk.StringVar(self, app.since_date_var.get().strip())
+        self.output_var = tk.StringVar(self, app.output_var.get().strip() or str(app.default_output_dir))
         self.status_var = tk.StringVar(self, "就绪")
+        self.elapsed_var = tk.StringVar(self, "")
         self.counts_var = tk.StringVar(self, progress_text(ImageProgress()))
         self.note_var = tk.StringVar(self, "微博返回的图片列表可能少于声明数量，缺口会在结果中报告。")
         body = ttk.Frame(self, padding=18)
@@ -342,6 +366,7 @@ class ImageBackupWindow(tk.Toplevel):
         ttk.Label(body, text="目标账号 · UID / 主页", style="Section.TLabel").pack(anchor="w")
         self.target_entry = ttk.Entry(body, textvariable=self.target_var)
         self.target_entry.pack(fill="x", pady=(5, 12))
+        self.target_entry.bind("<Return>", lambda _event: self.start(), add="+")
         ttk.Label(body, text="备份范围", style="Section.TLabel").pack(anchor="w")
         ranges = ttk.Frame(body)
         ranges.pack(fill="x", pady=(5, 12))
@@ -349,19 +374,25 @@ class ImageBackupWindow(tk.Toplevel):
         for row, (label, mode) in enumerate((("测试备份 20 条", RangeMode.TRIAL), ("最近", RangeMode.RECENT),
                                             ("从", RangeMode.SINCE), ("全量备份", RangeMode.ALL))):
             button = ttk.Radiobutton(ranges, text=label, value=mode.value, variable=self.range_var,
-                                     command=self._range_controls)
+                                     command=lambda m=mode: self._select_range_mode(m))
             button.grid(row=row, column=0, sticky="w", pady=3)
             self.range_buttons.append(button)
         self.recent_entry = ttk.Entry(ranges, textvariable=self.recent_var, width=12)
         self.recent_entry.grid(row=1, column=1, sticky="w", padx=(8, 5))
+        self.recent_entry.bind("<Button-1>", lambda _event: self._select_range_mode(RangeMode.RECENT)
+                               if self.range_var.get() != RangeMode.RECENT.value else None, add="+")
+        self.recent_entry.bind("<Return>", lambda _event: self.start(), add="+")
         ttk.Label(ranges, text="条").grid(row=1, column=2, sticky="w")
         self.since_entry = ttk.Entry(ranges, textvariable=self.since_var, width=12)
         self.since_entry.grid(row=2, column=1, sticky="w", padx=(8, 5))
-        ttk.Label(ranges, text="起  ·  YYYY-MM-DD").grid(row=2, column=2, sticky="w")
+        self.since_entry.bind("<Button-1>", lambda _event: self._select_range_mode(RangeMode.SINCE)
+                              if self.range_var.get() != RangeMode.SINCE.value else None, add="+")
+        self.since_entry.bind("<Return>", lambda _event: self.start(), add="+")
+        ttk.Label(ranges, text="起（YYYY-MM-DD）").grid(row=2, column=2, sticky="w")
         ttk.Label(body, text="保存位置", style="Section.TLabel").pack(anchor="w")
         output = ttk.Frame(body)
         output.pack(fill="x", pady=(5, 5))
-        self.choose_btn = ttk.Button(output, text="选择…", style="Quiet.TButton", command=self.choose_output)
+        self.choose_btn = ttk.Button(output, text="选择文件夹", style="Quiet.TButton", command=self.choose_output)
         self.choose_btn.pack(side="right", padx=(8, 0))
         self.output_entry = ttk.Entry(output, textvariable=self.output_var)
         self.output_entry.pack(side="left", fill="x", expand=True)
@@ -377,14 +408,30 @@ class ImageBackupWindow(tk.Toplevel):
         card = ttk.Frame(body, style="Card.TFrame", padding=12)
         card.pack(fill="both", expand=True)
         ttk.Label(card, textvariable=self.status_var, style="Status.TLabel").pack(anchor="w")
-        self.activity = ActivityIndicator(card)
-        self.activity.pack(anchor="w", pady=(8, 6))
+        activity_row = ttk.Frame(card)
+        activity_row.pack(fill="x", pady=(8, 6))
+        self.activity = ActivityIndicator(activity_row)
+        self.activity.pack(side="left")
+        ttk.Label(activity_row, textvariable=self.elapsed_var, style="Muted.TLabel").pack(side="left", padx=(10, 0))
         ttk.Label(card, textvariable=self.counts_var, justify="left").pack(anchor="w")
         ttk.Label(card, textvariable=self.note_var, style="Muted.TLabel", wraplength=580, justify="left").pack(anchor="w", pady=(8, 0))
         self._range_controls()
+        self.bind("<Escape>", lambda _event: self.request_close(), add="+")
         self.protocol("WM_DELETE_WINDOW", self.request_close)
         app._center_child_window(self, minimum_width=660, minimum_height=640)
         self._after_id = self.after(100, self._poll)
+
+    def _select_range_mode(self, mode: RangeMode):
+        if self.controller.active:
+            return
+        self.range_var.set(mode.value)
+        self._range_controls()
+        entry = self.recent_entry if mode is RangeMode.RECENT else (self.since_entry if mode is RangeMode.SINCE else None)
+        if entry is not None:
+            try:
+                entry.focus_set()
+            except tk.TclError:
+                pass
 
     def _range_controls(self):
         for entry, mode in ((self.recent_entry, RangeMode.RECENT), (self.since_entry, RangeMode.SINCE)):
@@ -408,9 +455,18 @@ class ImageBackupWindow(tk.Toplevel):
             elif name in self._main_states:
                 w.configure(state=self._main_states.pop(name))
         if running:
+            self._started_at = time.monotonic()
+            self._update_elapsed()
             self.activity.start()
         else:
+            self._update_elapsed()
             self.activity.stop()
+
+    def _update_elapsed(self):
+        if self._started_at is None:
+            return
+        from .app import format_elapsed_time
+        self.elapsed_var.set(f"用时 {format_elapsed_time(time.monotonic() - self._started_at)}")
 
     def start(self):
         if self.controller.active or self._closing:
@@ -439,6 +495,7 @@ class ImageBackupWindow(tk.Toplevel):
             messagebox.showinfo("任务正在运行", BUSY, parent=self)
             return
         self.request = request
+        self.target_var.set(request.target_uid)
         self.last_outcome = None
         self.useful_root = None
         self.open_btn.configure(state="disabled")
@@ -484,6 +541,8 @@ class ImageBackupWindow(tk.Toplevel):
         self._after_id = None
         if self._destroyed:
             return
+        if self.controller.active:
+            self._update_elapsed()
         for event in self.controller.drain():
             self._handle_event(*event)
         if self._closing and not self.controller.active:
@@ -522,3 +581,6 @@ class ImageBackupWindow(tk.Toplevel):
         if getattr(self.app, "_image_window", None) is self:
             self.app._image_window = None
         super().destroy()
+        for value in self.__dict__.values():
+            if isinstance(value, tk.Variable):
+                value._tk = None

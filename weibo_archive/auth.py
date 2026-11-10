@@ -29,6 +29,10 @@ RETCODE_NOT_SCANNED = 50114001
 RETCODE_SCANNED = 50114002
 RETCODE_EXPIRED = 50114004
 
+
+class QrCodeExpired(TimeoutError):
+    """Raised when the login QR code expires before mobile confirmation."""
+
 PASSPORT_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/json, text/plain, */*",
@@ -230,9 +234,9 @@ def poll_qr_login(
             return cookies
 
         if retcode == RETCODE_EXPIRED or "过期" in msg or "expired" in msg.lower():
-            raise TimeoutError("二维码已过期，请重新获取。")
+            raise QrCodeExpired("二维码已过期，请重新获取。")
 
         if cancel_event.wait(2):
             raise Cancelled("用户取消了扫码登录。")
 
-    raise TimeoutError("二维码等待超时，请重新获取。")
+    raise QrCodeExpired("二维码等待超时，请重新获取。")

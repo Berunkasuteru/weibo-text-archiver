@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime
 
-from .export_options import DateFormat, ExportLayout, ExportOptions
+from .export_options import DateFormat, ExportLayout, ExportOptions, VISIBILITY_LABELS
 from .models import normalize_optional_uid
 
 # Frozen V5-compatible renderer.
@@ -11,11 +11,7 @@ from .models import normalize_optional_uid
 
 
 _VISIBILITY_LABELS = {
-    "public": "公开",
-    "followers": "粉丝可见",
-    "friends": "好友圈",
-    "private": "仅自己可见",
-    "unknown": "未知",
+    state.value: label for state, label in VISIBILITY_LABELS.items()
 }
 
 
@@ -131,8 +127,23 @@ def quote_markdown(text: str) -> str:
     return "\n".join("> " + line if line else ">" for line in text.splitlines())
 
 
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def safe_filename(name: str) -> str:
-    name = re.sub(r'[\\/:*?"<>|]', "_", name).strip(" .")
+    name = re.sub(r'[\x00-\x1f\x7f\\/:*?"<>|]', "_", str(name or "")).strip(" .")
+    if len(name) > 80:
+        name = name[:80].rstrip(" .")
+    stem = name.split(".", 1)[0].upper()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
     return name or "微博用户"
 
 

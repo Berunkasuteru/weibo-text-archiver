@@ -250,6 +250,15 @@ class Termination(str, Enum):
     TARGET_COUNT = "target_count"
     SINCE_REACHED = "since_reached"
 
+    def label(self) -> str:
+        if self is Termination.NATURAL:
+            return "自然结束"
+        if self is Termination.TARGET_COUNT:
+            return "达到指定条数"
+        if self is Termination.SINCE_REACHED:
+            return "达到起始日期"
+        return self.value
+
 
 @dataclass(frozen=True)
 class FetchReport:

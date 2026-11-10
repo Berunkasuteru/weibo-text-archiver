@@ -13,7 +13,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from . import VERSION_DISPLAY
-from .auth import begin_qr_login, poll_qr_login, qr_matrix
+from .auth import QrCodeExpired, begin_qr_login, poll_qr_login, qr_matrix
 from .client import WeiboClient
 from .credentials import (
     clear_saved_login,
@@ -221,10 +221,10 @@ def extract_uid(value: str) -> str:
     return m.group(1) if m else ""
 
 
-def is_obvious_single_post_url(value: str) -> bool:
+def _parse_weibo_url(value: str) -> urllib.parse.SplitResult | None:
     raw = (value or "").strip()
     if not raw:
-        return False
+        return None
     candidate = raw
     if "://" not in candidate and re.match(
         r"^(?:[A-Za-z0-9-]+\.)*weibo\.(?:com|cn)(?:/|$)",
@@ -235,17 +235,76 @@ def is_obvious_single_post_url(value: str) -> bool:
     try:
         parsed = urllib.parse.urlsplit(candidate)
     except ValueError:
-        return False
+        return None
     host = (parsed.hostname or "").lower()
     if host != "weibo.com" and not host.endswith(".weibo.com"):
         if host != "weibo.cn" and not host.endswith(".weibo.cn"):
-            return False
+            return None
+    return parsed
+
+
+def is_obvious_single_post_url(value: str) -> bool:
+    parsed = _parse_weibo_url(value)
+    if parsed is None:
+        return False
     segments = {
         urllib.parse.unquote(segment).casefold()
         for segment in parsed.path.split("/")
         if segment
     }
     return bool(segments & {"detail", "status"})
+
+
+def is_weibo_url_without_uid(value: str) -> bool:
+    parsed = _parse_weibo_url(value)
+    if parsed is None or is_obvious_single_post_url(value):
+        return False
+    return not extract_uid(value)
+
+
+def parse_fetch_range(
+    mode_value: str | RangeMode,
+    recent_raw: str = "",
+    since_raw: str = "",
+    *,
+    trial: bool = False,
+) -> FetchRange:
+    if trial:
+        return FetchRange.trial(TEST_EXPORT_LIMIT)
+
+    try:
+        mode = (
+            mode_value
+            if isinstance(mode_value, RangeMode)
+            else RangeMode(mode_value)
+        )
+    except ValueError as exc:
+        raise ValueError("未知导出范围。") from exc
+
+    if mode is RangeMode.TRIAL:
+        return FetchRange.trial(TEST_EXPORT_LIMIT)
+    if mode is RangeMode.ALL:
+        return FetchRange.all()
+    if mode is RangeMode.RECENT:
+        try:
+            count = int(str(recent_raw).strip())
+        except ValueError:
+            raise ValueError("“最近 N 条”必须填写整数。") from None
+        if not 1 <= count <= 50000:
+            raise ValueError("最近条数请输入 1～50000。")
+        return FetchRange.recent(count)
+    if mode is RangeMode.SINCE:
+        raw = str(since_raw).strip()
+        try:
+            d = date.fromisoformat(raw)
+        except ValueError:
+            raise ValueError(
+                "起始日期请按 YYYY-MM-DD 填写，例如 2024-01-01。"
+            ) from None
+        if d > date.today():
+            raise ValueError("起始日期不能晚于今天。")
+        return FetchRange.since_date(d)
+    raise ValueError("未知导出范围。")
 
 
 def launch_with_system(
@@ -534,6 +593,11 @@ class App(tk.Tk):
         )
         style.configure("Card.TFrame", relief="solid", borderwidth=1)
         style.configure("Muted.TLabel", foreground="#666666")
+        style.configure(
+            "Update.TLabel",
+            foreground="#005fb8",
+            font=("Microsoft YaHei UI", 9, "underline"),
+        )
 
     def _build_ui(self):
         self.root_frame = ttk.Frame(self, padding=(24, 20, 24, 18))
@@ -553,13 +617,15 @@ class App(tk.Tk):
         self.update_notice_label = ttk.Label(
             version_panel,
             text="",
-            style="Muted.TLabel",
+            style="Update.TLabel",
             cursor="hand2",
+            takefocus=True,
         )
-        self.update_notice_label.bind(
-            "<Button-1>",
-            lambda _event: launch_official_release_page(),
-        )
+        for seq in ("<Button-1>", "<Return>", "<space>"):
+            self.update_notice_label.bind(
+                seq,
+                lambda _event: launch_official_release_page(),
+            )
         ttk.Label(
             self.root_frame,
             text=APP_SUBTITLE,
@@ -593,6 +659,7 @@ class App(tk.Tk):
         )
         self.settings_canvas.bind("<Configure>", self._on_settings_canvas_configure)
         self.bind("<MouseWheel>", self._on_settings_mousewheel, add="+")
+        self.bind("<FocusIn>", self._on_settings_focus_in, add="+")
 
         # Account
         self._section_label("登录账号")
@@ -627,6 +694,11 @@ class App(tk.Tk):
         ).pack(anchor="w")
         self.uid_entry = ttk.Entry(target, textvariable=self.uid_var)
         self.uid_entry.pack(fill="x", pady=(7, 0))
+        self.uid_entry.bind(
+            "<Return>",
+            lambda _event: self.start_export(trial=False),
+            add="+",
+        )
 
         # Range
         self._section_label("导出范围")
@@ -650,7 +722,9 @@ class App(tk.Tk):
             text="最近",
             variable=self.range_mode_var,
             value=RangeMode.RECENT.value,
-            command=self._update_range_controls,
+            command=lambda: self._select_range_mode(
+                RangeMode.RECENT, self.recent_entry
+            ),
         ).pack(side="left")
         self.recent_entry = ttk.Entry(
             recent_row,
@@ -658,6 +732,20 @@ class App(tk.Tk):
             textvariable=self.recent_count_var,
         )
         self.recent_entry.pack(side="left", padx=(8, 6))
+        self.recent_entry.bind(
+            "<Button-1>",
+            lambda _event: self._select_range_mode(
+                RangeMode.RECENT, self.recent_entry
+            )
+            if self.range_mode_var.get() != RangeMode.RECENT.value
+            else None,
+            add="+",
+        )
+        self.recent_entry.bind(
+            "<Return>",
+            lambda _event: self.start_export(trial=False),
+            add="+",
+        )
         self.recent_suffix_label = ttk.Label(recent_row, text="条")
         self.recent_suffix_label.pack(side="left")
 
@@ -668,7 +756,9 @@ class App(tk.Tk):
             text="从",
             variable=self.range_mode_var,
             value=RangeMode.SINCE.value,
-            command=self._update_range_controls,
+            command=lambda: self._select_range_mode(
+                RangeMode.SINCE, self.since_entry
+            ),
         ).pack(side="left")
         self.since_entry = ttk.Entry(
             since_row,
@@ -676,6 +766,20 @@ class App(tk.Tk):
             textvariable=self.since_date_var,
         )
         self.since_entry.pack(side="left", padx=(8, 6))
+        self.since_entry.bind(
+            "<Button-1>",
+            lambda _event: self._select_range_mode(
+                RangeMode.SINCE, self.since_entry
+            )
+            if self.range_mode_var.get() != RangeMode.SINCE.value
+            else None,
+            add="+",
+        )
+        self.since_entry.bind(
+            "<Return>",
+            lambda _event: self.start_export(trial=False),
+            add="+",
+        )
         self.since_suffix_label = ttk.Label(since_row, text="起（YYYY-MM-DD）")
         self.since_suffix_label.pack(side="left")
 
@@ -886,9 +990,39 @@ class App(tk.Tk):
     def _on_settings_mousewheel(self, event) -> None:
         if not self.settings_scroll.winfo_manager():
             return
-        if not str(event.widget).startswith(str(self.settings_frame)):
+        widget_path = str(event.widget)
+        if widget_path != str(self.settings_canvas) and not widget_path.startswith(
+            str(self.settings_frame)
+        ):
             return
         self.settings_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _on_settings_focus_in(self, event) -> None:
+        if not self.settings_scroll.winfo_manager():
+            return
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or not str(widget).startswith(
+            str(self.settings_frame)
+        ):
+            return
+        try:
+            total_height = self.settings_frame.winfo_height()
+            canvas_height = self.settings_canvas.winfo_height()
+            if total_height <= canvas_height or total_height <= 0:
+                return
+            widget_top = widget.winfo_rooty() - self.settings_frame.winfo_rooty()
+            widget_bottom = widget_top + widget.winfo_height()
+            first, last = self.settings_canvas.yview()
+            view_top = first * total_height
+            view_bottom = last * total_height
+            if widget_top < view_top:
+                self.settings_canvas.yview_moveto(max(0.0, widget_top / total_height))
+            elif widget_bottom > view_bottom:
+                self.settings_canvas.yview_moveto(
+                    min(1.0, (widget_bottom - canvas_height) / total_height)
+                )
+        except tk.TclError:
+            pass
 
     def _place_initial_window(self, wanted_height: int) -> None:
         """Fit the first window into the current monitor's usable area."""
@@ -1019,6 +1153,23 @@ class App(tk.Tk):
         )
         child.geometry(_geometry_spec(width, height, x, y))
         child.deiconify()
+
+    def _select_range_mode(
+        self, mode: RangeMode, entry: ttk.Entry | None = None
+    ) -> None:
+        if self.tasks.state in (
+            TaskState.AUTHENTICATING,
+            TaskState.FETCHING,
+            TaskState.EXPORTING,
+        ):
+            return
+        self.range_mode_var.set(mode.value)
+        self._update_range_controls()
+        if entry is not None:
+            try:
+                entry.focus_set()
+            except tk.TclError:
+                pass
 
     def _update_range_controls(self):
         mode = self.range_mode_var.get()
@@ -1176,7 +1327,16 @@ class App(tk.Tk):
         ttk.Label(body, text="关键词（可选）", style="Section.TLabel").pack(
             anchor="w", pady=(12, 0)
         )
-        keyword_text = tk.Text(body, height=3, width=52, wrap="word")
+        keyword_text = tk.Text(
+            body,
+            height=3,
+            width=52,
+            wrap="word",
+            font=("Microsoft YaHei UI", 9),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+        )
         keyword_text.pack(fill="x", pady=(4, 0))
         keyword_text.insert("1.0", "，".join(current_filter.keywords))
         ttk.Label(
@@ -1298,6 +1458,7 @@ class App(tk.Tk):
             sticky="ew",
             padx=4,
         )
+        win.bind("<Escape>", lambda _event: win.destroy(), add="+")
         self._center_child_window(win)
         win.grab_set()
 
@@ -1310,6 +1471,7 @@ class App(tk.Tk):
             self.since_entry,
             self.trial_btn,
             self.export_btn,
+            self.image_backup_btn,
             self.login_btn,
             self.clear_login_btn,
             *self.output_buttons,
@@ -1416,7 +1578,12 @@ class App(tk.Tk):
         self.log_text.configure(state="disabled")
 
     def _poll_events(self):
-        self._poll_after_id = None
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+            self._poll_after_id = None
         try:
             while True:
                 generation, kind, payload = self.events.get_nowait()
@@ -1455,9 +1622,32 @@ class App(tk.Tk):
 
                 elif kind == "qr_matrix":
                     self._draw_qr(payload)
+                    if getattr(self, "qr_refresh_btn", None) is not None:
+                        try:
+                            self.qr_refresh_btn.configure(state="disabled")
+                        except tk.TclError:
+                            pass
 
                 elif kind == "qr_status":
                     self.qr_status_var.set(payload)
+
+                elif kind == "qr_expired":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._set_running(False)
+                    self.activity_status_var.set("")
+                    self.status_var.set("二维码已过期")
+                    self.progress_detail_var.set(
+                        payload or "二维码已过期，请重新获取。"
+                    )
+                    self.qr_status_var.set("二维码已过期，请点击“重新获取”刷新。")
+                    if getattr(self, "qr_refresh_btn", None) is not None:
+                        try:
+                            self.qr_refresh_btn.configure(state="normal")
+                        except tk.TclError:
+                            pass
+                    self.tasks.transition(
+                        TaskState.READY if has_saved_login() else TaskState.IDLE
+                    )
 
                 elif kind == "phase_export":
                     self.tasks.transition(TaskState.EXPORTING)
@@ -1652,7 +1842,25 @@ class App(tk.Tk):
             wraplength=340,
             justify="center",
         ).pack(pady=(4, 12))
-        ttk.Button(win, text="取消", command=self.stop_current).pack()
+        qr_actions = ttk.Frame(win)
+        qr_actions.pack(pady=(0, 8))
+        self.qr_refresh_btn = ttk.Button(
+            qr_actions,
+            text="重新获取",
+            style="Primary.TButton",
+            state="disabled",
+            command=lambda: self.start_login(
+                recovery=self._pending_export_request is not None
+            ),
+        )
+        self.qr_refresh_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(
+            qr_actions,
+            text="取消",
+            style="Quiet.TButton",
+            command=self.stop_current,
+        ).pack(side="left")
+        win.bind("<Escape>", lambda _event: self.stop_current(), add="+")
         self._center_child_window(win, minimum_width=390, minimum_height=470)
         win.grab_set()
 
@@ -1685,6 +1893,7 @@ class App(tk.Tk):
         win = self.qr_window
         self.qr_window = None
         self.qr_canvas = None
+        self.qr_refresh_btn = None
         if win is None:
             return
         try:
@@ -1760,6 +1969,11 @@ class App(tk.Tk):
             self._emit(generation, "cancelled", None)
             terminal_sent = True
 
+        except QrCodeExpired as exc:
+            self._worker_log(generation, str(exc))
+            self._emit(generation, "qr_expired", str(exc))
+            terminal_sent = True
+
         except Exception as exc:
             detail = save_detailed_error("扫码登录", exc)
             friendly = "微博扫码登录没有完成。\n\n" + redact_text(exc)
@@ -1794,32 +2008,16 @@ class App(tk.Tk):
 
     def _selected_range(self, trial: bool) -> FetchRange:
         if trial:
-            return FetchRange.trial(TEST_EXPORT_LIMIT)
+            return parse_fetch_range(RangeMode.TRIAL, trial=True)
 
-        mode = RangeMode(self.range_mode_var.get())
-        if mode is RangeMode.ALL:
-            return FetchRange.all()
-
-        if mode is RangeMode.RECENT:
-            try:
-                count = int(self.recent_count_var.get().strip())
-            except ValueError:
-                raise ValueError("“最近 N 条”必须填写整数。")
-            if not 1 <= count <= 50000:
-                raise ValueError("最近条数请输入 1～50000。")
-            return FetchRange.recent(count)
-
-        if mode is RangeMode.SINCE:
-            raw = self.since_date_var.get().strip()
-            try:
-                d = date.fromisoformat(raw)
-            except ValueError:
-                raise ValueError("起始日期请按 YYYY-MM-DD 填写，例如 2024-01-01。")
-            if d > date.today():
-                raise ValueError("起始日期不能晚于今天。")
-            return FetchRange.since_date(d)
-
-        raise ValueError("未知导出范围。")
+        mode = self.range_mode_var.get()
+        recent_raw = (
+            self.recent_count_var.get() if mode == RangeMode.RECENT.value else ""
+        )
+        since_raw = (
+            self.since_date_var.get() if mode == RangeMode.SINCE.value else ""
+        )
+        return parse_fetch_range(mode, recent_raw, since_raw)
 
     def choose_output(self):
         folder = filedialog.askdirectory(
@@ -1857,7 +2055,17 @@ class App(tk.Tk):
             return
         uid = extract_uid(target_value)
         if not uid:
-            messagebox.showwarning("请输入 UID", "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。")
+            if is_weibo_url_without_uid(target_value):
+                messagebox.showwarning(
+                    "请输入 UID",
+                    "此微博链接是昵称或个性域名主页，不含数字 UID。\n"
+                    "请在用户主页查看数字 UID，或粘贴包含数字 UID 的主页链接。",
+                )
+            else:
+                messagebox.showwarning(
+                    "请输入 UID",
+                    "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。",
+                )
             return
 
         if not has_saved_login():
@@ -2161,6 +2369,13 @@ class App(tk.Tk):
             TaskState.FETCHING,
             TaskState.EXPORTING,
         ):
+            if self.qr_window is not None:
+                self._pending_export_request = None
+                self._close_qr_window()
+                self.status_var.set("已取消")
+                self.progress_detail_var.set(
+                    "任务已取消；未完成内容不会保存为成功归档。"
+                )
             return
 
         # Invalidate the current generation immediately. Any later HTTP/worker
@@ -2188,12 +2403,7 @@ class App(tk.Tk):
         outputs = result["outputs"]
         failures = result["failures"]
 
-        if report.termination is Termination.NATURAL:
-            termination = "自然结束"
-        elif report.termination is Termination.TARGET_COUNT:
-            termination = "达到指定条数"
-        else:
-            termination = "达到起始日期"
+        termination = report.termination.label()
 
         lines = [f"{profile.screen_name} · UID {profile.id}", f"{result['count']:,} 条微博"]
         lines.extend(completion_integrity_lines(integrity))
@@ -2275,6 +2485,7 @@ class App(tk.Tk):
             body,
             text="\n".join(lines),
             justify="left",
+            wraplength=560,
         ).pack(anchor="w", pady=(10, 0))
         def launch(target: Path):
             ok, error = launch_with_system(target)
@@ -2289,11 +2500,16 @@ class App(tk.Tk):
         if variant_outputs:
             smaller = ttk.Frame(body)
             smaller.pack(fill="x", pady=(14, 0))
+            variant_arg = (
+                variant_outputs[0]
+                if len(variant_outputs) == 1
+                else variant_outputs
+            )
             ttk.Button(
                 smaller,
                 text="生成更小的 AI 版…",
                 style="Quiet.TButton",
-                command=lambda: self._open_ai_variant_dialog(win, variant_outputs[0]),
+                command=lambda: self._open_ai_variant_dialog(win, variant_arg),
             ).pack(side="left")
             ttk.Label(
                 smaller,
@@ -2333,10 +2549,13 @@ class App(tk.Tk):
             sticky="ew",
             padx=4,
         )
+        win.bind("<Escape>", lambda _event: win.destroy(), add="+")
         self._center_child_window(win)
 
-    def _open_ai_variant_dialog(self, parent, output: dict) -> None:
-        source = output["variant_source"]
+    def _open_ai_variant_dialog(self, parent, output: dict | list[dict]) -> None:
+        candidates = list(output) if isinstance(output, (list, tuple)) else [output]
+        selected_index_var = tk.IntVar(value=0)
+        current_output = candidates[0]
         win = tk.Toplevel(parent)
         win.withdraw()
         win.title("生成更小的 AI 版")
@@ -2345,9 +2564,38 @@ class App(tk.Tk):
 
         body = ttk.Frame(win, padding=18)
         body.pack(fill="both", expand=True)
+        choices = []
+        size_var = tk.StringVar(
+            value=f"当前 {current_output['label']}：{ai_size_text(current_output['stats'])}"
+        )
+
+        def select_candidate():
+            nonlocal current_output
+            current_output = candidates[selected_index_var.get()]
+            size_var.set(
+                f"当前 {current_output['label']}：{ai_size_text(current_output['stats'])}"
+            )
+
+        if len(candidates) > 1:
+            ttk.Label(body, text="基于以下输出生成", style="Section.TLabel").pack(
+                anchor="w"
+            )
+            source_row = ttk.Frame(body)
+            source_row.pack(fill="x", pady=(4, 10))
+            for idx, item in enumerate(candidates):
+                btn = ttk.Radiobutton(
+                    source_row,
+                    text=item["label"],
+                    variable=selected_index_var,
+                    value=idx,
+                    command=select_candidate,
+                )
+                btn.pack(side="left", padx=(0, 16))
+                choices.append(btn)
+
         ttk.Label(
             body,
-            text=f"当前 {output['label']}：{ai_size_text(output['stats'])}",
+            textvariable=size_var,
         ).pack(anchor="w")
         ttk.Label(
             body,
@@ -2356,7 +2604,6 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(2, 0))
 
         limit_var = tk.StringVar(value="full")
-        choices = []
         ttk.Label(body, text="转发原文（已确认的本人原文除外）", style="Section.TLabel").pack(
             anchor="w", pady=(14, 0)
         )
@@ -2461,14 +2708,17 @@ class App(tk.Tk):
                 button.configure(state="disabled")
             result_var.set("正在生成…关闭此窗口可停止后续生成，已生成文件会保留。")
 
+            target_output = current_output
+            target_source = target_output["variant_source"]
+
             def worker():
                 try:
                     results = export_ai_variant(
-                        source["archive"], output["path"].parent, output["options"],
-                        source["filename_suffix"], source_body_limit=limit,
-                        max_part_chars=part_chars, selection_notice=source["selection_notice"],
-                        visibility_scope=source["visibility_scope"],
-                        unknown_visibility_excluded_count=source["unknown_visibility_excluded_count"],
+                        target_source["archive"], target_output["path"].parent, target_output["options"],
+                        target_source["filename_suffix"], source_body_limit=limit,
+                        max_part_chars=part_chars, selection_notice=target_source["selection_notice"],
+                        visibility_scope=target_source["visibility_scope"],
+                        unknown_visibility_excluded_count=target_source["unknown_visibility_excluded_count"],
                         before_commit=check_cancelled,
                     )
                 except Cancelled:
@@ -2507,9 +2757,10 @@ class App(tk.Tk):
             text="打开归档文件夹",
             style="Quiet.TButton",
             state="disabled",
-            command=lambda: launch_with_system(output["path"].parent),
+            command=lambda: launch_with_system(current_output["path"].parent),
         )
         open_btn.pack(side="left")
+        win.bind("<Escape>", lambda _event: win.destroy(), add="+")
         self._center_child_window(win)
 
     def _on_close(self):
@@ -2548,7 +2799,11 @@ class App(tk.Tk):
                 self.after_cancel(update_after_id)
             except tk.TclError:
                 pass
+        self._app_icon_image = None
         super().destroy()
+        for value in self.__dict__.values():
+            if isinstance(value, tk.Variable):
+                value._tk = None
 
 
 def main():
