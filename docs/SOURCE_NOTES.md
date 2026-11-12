@@ -2,7 +2,7 @@
 
 ## Weibo Text Archiver Implementation
 
-The `weibo_archive/` codebase, tests (`tests/`), documentation (`docs/`), packaging scripts (`tools/`), and GUI assets (`assets/`) are original to this project and are released under the root [MIT License](../LICENSE).
+The `weibo_archive/` codebase, tests (`tests/`), documentation (`docs/`), packaging scripts (`tools/`), and GUI assets (`weibo_archive/assets/`) are original to this project and are released under the root [MIT License](../LICENSE).
 
 ## Historical Background
 
@@ -16,6 +16,6 @@ All Weibo HTTPS requests, Passport QR authentication, timeline pagination, long-
 
 ## Bundled Third-Party Components
 
-The source tree does not vendor third-party source code.
+The repository vendors `python-qrcode` (under `vendor/qrcode/`) for offline QR matrix generation without runtime `pip install` or network downloads. Its license and attribution are documented in [vendor/THIRD_PARTY_NOTICES.txt](../vendor/THIRD_PARTY_NOTICES.txt) and [vendor/THIRD_PARTY_LICENSES/python-qrcode_LICENSE.txt](../vendor/THIRD_PARTY_LICENSES/python-qrcode_LICENSE.txt).
 
-When building the standalone Windows release bundle (`WeiboTextArchiver_Windows.zip`), the build environment bundles the CPython runtime, Tcl/Tk, Pillow, and `python-qrcode`. Their licenses and attributions are documented in [THIRD_PARTY_NOTICES.txt](../THIRD_PARTY_NOTICES.txt) and `THIRD_PARTY_LICENSES/`.
+`Pillow` is a build-time dependency only (`tools/build/requirements-build.txt`, used to generate Windows icons in `tools/generate_icon.py`); it is excluded from the packaged runtime bundle (`WeiboTextArchiver_Windows.zip`), which contains the CPython runtime, Tcl/Tk, `weibo_archive/`, and vendored `python-qrcode`.

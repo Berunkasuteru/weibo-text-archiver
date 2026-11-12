@@ -4,6 +4,7 @@ import json
 import random
 import re
 import threading
+import urllib.parse
 from dataclasses import dataclass
 from datetime import date, datetime
 from json import JSONDecoder
@@ -43,6 +44,8 @@ from .performance import PerformanceMetrics
 API_CONTAINER = "https://m.weibo.cn/api/container/getIndex"
 API_EXTEND = "https://m.weibo.cn/statuses/extend"
 DETAIL_URL = "https://m.weibo.cn/detail/{id}"
+API_CONFIG = "https://m.weibo.cn/api/config"
+API_WEB_PROFILE_INFO = "https://weibo.com/ajax/profile/info"
 
 PAGE_SIZE = 100
 PAGE_DELAY = (0.2, 0.5)
@@ -55,10 +58,6 @@ SESSION_REST = 120.0
 
 class InvalidUser(RuntimeError):
     pass
-
-
-class NeedLogin(AuthenticationExpired):
-    """Backward-compatible name for explicit authentication expiry."""
 
 
 @dataclass(frozen=True)
@@ -254,6 +253,62 @@ def _embedded_status_from_detail(html: str) -> Optional[dict]:
     return value if isinstance(value, dict) else None
 
 
+def identify_logged_in_account(http: HttpClient) -> tuple[str, str]:
+    """Resolve the currently authenticated UID and best-effort nickname."""
+    cfg = http.json(
+        API_CONFIG,
+        timeout=12,
+        retries=1,
+        performance_category="account_config",
+    )
+    if not isinstance(cfg, dict):
+        raise InvalidResponse("登录会话配置响应格式异常。")
+    data = cfg.get("data")
+    msg = str(cfg.get("msg") or "")
+    url = str(cfg.get("url") or "")
+    combined = f"{msg}\n{url}".lower()
+    if (
+        cfg.get("ok") == 0
+        or (isinstance(data, dict) and data.get("login") is False)
+        or "登录" in msg
+        or "login" in combined
+        or "passport" in combined
+    ):
+        raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
+    uid = str(data.get("uid") or "").strip() if isinstance(data, dict) else ""
+    if not re.fullmatch(r"\d{5,}", uid):
+        raise InvalidResponse("未能从微博会话中识别当前登录 UID。")
+
+    screen_name = ""
+    try:
+        basic = http.json(
+            API_CONTAINER,
+            params={"containerid": "100505" + uid},
+            timeout=12,
+            retries=1,
+            performance_category="account_profile",
+        )
+        bdata = basic.get("data") if isinstance(basic, dict) else None
+        user_info = bdata.get("userInfo") if isinstance(bdata, dict) else None
+        if isinstance(user_info, dict):
+            screen_name = str(user_info.get("screen_name") or "").strip()
+    except NetworkError:
+        pass
+    return uid, screen_name
+
+
+def _uid_from_weibo_location(url_or_html: str) -> str:
+    for pattern in (
+        r"/(?:u|profile)/(\d{5,})(?:[/?#\"'&\s]|$)",
+        r"containerid\s*(?:=|:|%3D)\s*['\"]?100505(\d{5,})",
+        r"\$CONFIG\['oid'\]\s*=\s*['\"](\d{5,})['\"]",
+    ):
+        matched = re.search(pattern, url_or_html)
+        if matched:
+            return matched.group(1)
+    return ""
+
+
 class WeiboClient:
     def __init__(
         self,
@@ -318,7 +373,7 @@ class WeiboClient:
             API_CONTAINER,
             params={"containerid": "100505" + uid},
             timeout=15,
-            retries=4,
+            retries=3,
             performance_category="profile_basic",
         )
 
@@ -356,6 +411,130 @@ class WeiboClient:
             self._emit("扩展资料暂时不可用，将继续备份正文。")
 
         return parse_profile(uid, basic, detail)
+
+    def identify_current_account(self) -> tuple[str, str]:
+        return identify_logged_in_account(self.http)
+
+    def resolve_profile_url(self, target_url: str) -> tuple[str, str]:
+        """Resolve a Weibo /n/<nickname> or custom domain URL into (uid, screen_name)."""
+        raw = (target_url or "").strip()
+        if not raw:
+            raise InvalidUser("请输入微博账号链接。")
+        candidate = raw
+        if "://" not in candidate and re.match(
+            r"^(?:[A-Za-z0-9-]+\.)*weibo\.(?:com|cn)(?:/|$)",
+            candidate,
+            re.IGNORECASE,
+        ):
+            candidate = "https://" + candidate
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+        except ValueError as exc:
+            raise InvalidUser("微博主页链接格式无效。") from exc
+        host = (parsed.hostname or "").lower()
+        if (
+            host != "weibo.com"
+            and not host.endswith(".weibo.com")
+            and host != "weibo.cn"
+            and not host.endswith(".weibo.cn")
+        ):
+            raise InvalidUser("仅支持解析 weibo.com / weibo.cn 的账号主页链接。")
+
+        segments = [
+            urllib.parse.unquote(seg).strip()
+            for seg in parsed.path.split("/")
+            if seg.strip()
+        ]
+        folded = {seg.casefold() for seg in segments}
+        if folded & {"detail", "status"}:
+            raise InvalidUser("这里需要账号主页链接，不是单条微博链接。")
+
+        direct_uid = _uid_from_weibo_location(candidate)
+        if not direct_uid and segments and re.fullmatch(r"\d{5,}", segments[0]):
+            if len(segments) == 1:
+                direct_uid = segments[0]
+        if direct_uid:
+            profile = self.fetch_profile(direct_uid)
+            return profile.id, profile.screen_name
+
+        if not segments:
+            raise InvalidUser("链接中缺少用户路径，请提供完整主页链接或数字 UID。")
+
+        self._emit("正在解析昵称 / 个性域名主页…")
+        if len(segments) >= 2 and segments[0].casefold() == "n":
+            params = {"screen_name": segments[1]}
+            mobile_path = "n/" + urllib.parse.quote(segments[1], safe="")
+        else:
+            params = {"custom": segments[0]}
+            mobile_path = urllib.parse.quote(segments[0], safe="")
+
+        try:
+            js = self.http.json(
+                API_WEB_PROFILE_INFO,
+                params=params,
+                headers={"Referer": "https://weibo.com/"},
+                timeout=15,
+                retries=2,
+                performance_category="resolve_profile",
+            )
+        except (AuthenticationExpired, ChallengeRequired):
+            raise
+        except NetworkError:
+            js = None
+
+        if isinstance(js, dict):
+            msg = str(js.get("msg") or "")
+            url = str(js.get("url") or "")
+            combined = f"{msg}\n{url}".lower()
+            if any(marker in msg for marker in ("验证", "验证码", "安全验证")):
+                raise ChallengeRequired(
+                    "微博要求安全验证；本次操作已停止。请稍后重试。"
+                )
+            if "登录" in msg or "login" in combined or "passport" in combined:
+                raise AuthenticationExpired("微博登录已过期，需要重新扫码。")
+            data = js.get("data")
+            user = data.get("user") if isinstance(data, dict) else None
+            if isinstance(user, dict):
+                uid = str(user.get("idstr") or user.get("id") or "").strip()
+                if re.fullmatch(r"\d{5,}", uid):
+                    return uid, str(user.get("screen_name") or "").strip()
+
+        # Safe Weibo-only mobile redirect / page lookup fallback.
+        try:
+            resp = self.http.request(
+                "https://m.weibo.cn/" + mobile_path,
+                headers={"Referer": "https://m.weibo.cn/"},
+                timeout=15,
+                retries=1,
+                performance_category="resolve_profile_fallback",
+            )
+        except (AuthenticationExpired, ChallengeRequired):
+            raise
+        except NetworkError:
+            resp = None
+
+        if resp is not None:
+            resolved = _uid_from_weibo_location(resp.url)
+            if resolved:
+                return resolved, ""
+            text = resp.body.decode("utf-8", errors="replace")
+            category, detail = classify_non_json_response(
+                url=resp.url,
+                status=resp.status,
+                content_type=resp.content_type,
+                body=resp.body,
+            )
+            if category == "challenge":
+                raise ChallengeRequired(detail)
+            if category == "login":
+                raise AuthenticationExpired(detail)
+            resolved = _uid_from_weibo_location(text)
+            if resolved:
+                return resolved, ""
+
+        raise InvalidUser(
+            "无法解析该昵称或个性域名主页对应的数字 UID，请检查链接或改用数字 UID。"
+        )
 
     def _begin_long_text_acquisition(self, post_id: str) -> None:
         if post_id not in self._long_text_attempted_ids:
@@ -503,8 +682,8 @@ class WeiboClient:
                 )
             )
 
-        # Compatibility fallback: current weibo-crawler reads the embedded status
-        # object from the mobile detail page. We do the same, but keep TLS verification on.
+        # Fallback: read the embedded status object from the mobile detail page
+        # over strict verified HTTPS.
         self._wait_random(0.5, 1.2, "longtext_pacing")
         self.performance.increment_longtext("detail_attempted")
         try:
@@ -685,7 +864,7 @@ class WeiboClient:
                 "count": PAGE_SIZE,
             },
             timeout=15,
-            retries=4,
+            retries=3,
             performance_category="timeline",
         )
 

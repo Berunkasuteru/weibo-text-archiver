@@ -75,6 +75,7 @@ last_success.json.tmp
 *.db
 *.pickle
 *.pkl
+# Legacy and default local export directories
 /微博文字备份/
 /exports/
 /Archives/

@@ -252,11 +252,29 @@ class CredentialStore:
         except Exception:
             pass
 
-    def _remove_legacy_after_verified_protected(self) -> None:
+    def _remove_legacy_after_verified_protected(self) -> bool:
+        """Retire the plaintext legacy cookie file after a verified DPAPI save.
+
+        The content is overwritten before the delete is attempted, so a locked
+        or undeletable file no longer holds a readable cookie. Returns False
+        when readable plaintext may still be on disk.
+        """
+        if not self.legacy_file.exists():
+            return True
+        try:
+            self.atomic_write(self.legacy_file, b"")
+        except Exception:
+            pass
         try:
             self.legacy_file.unlink(missing_ok=True)
         except OSError:
             pass
+        try:
+            return self.legacy_file.stat().st_size == 0
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
 
     def _migrate_legacy(self) -> str:
         header = self._read_legacy()
@@ -293,16 +311,17 @@ class CredentialStore:
             "未找到可用的微博登录状态，请重新扫码登录。"
         )
 
-    def save_cookies(self, cookies: dict[str, str]) -> None:
+    def save_cookies(self, cookies: dict[str, str]) -> bool:
+        """Save the login; report whether plaintext legacy residue was retired."""
         header = _serialize_cookies(cookies)
         if self.use_dpapi:
             self._write_protected(header)
-            self._remove_legacy_after_verified_protected()
-        else:
-            try:
-                self.atomic_write(self.legacy_file, header.encode("utf-8"))
-            except Exception:
-                raise CredentialError("本机登录状态保存失败。") from None
+            return self._remove_legacy_after_verified_protected()
+        try:
+            self.atomic_write(self.legacy_file, header.encode("utf-8"))
+        except Exception:
+            raise CredentialError("本机登录状态保存失败。") from None
+        return True
 
     def clear_saved_login(self) -> None:
         failed = False
@@ -331,8 +350,30 @@ def load_cookie_header() -> str:
     return _default_store().load_cookie_header()
 
 
-def save_cookies(cookies: dict[str, str]) -> None:
-    _default_store().save_cookies(cookies)
+def legacy_cookie_file() -> str:
+    """Describe the plaintext legacy file so callers never need its path."""
+    return str(_default_store().legacy_file)
+
+
+def peek_cookie_header() -> str:
+    """Return the stored login cookie for redaction only.
+
+    Strictly read-only: never migrates, writes or deletes, so it is safe to call
+    from error handling. Yields "" when nothing is stored or it cannot be read.
+    """
+    store = _default_store()
+    try:
+        if store.use_dpapi and store.protected_file.exists():
+            return store._read_protected()
+        if store.legacy_file.exists():
+            return store._read_legacy()
+    except Exception:
+        return ""
+    return ""
+
+
+def save_cookies(cookies: dict[str, str]) -> bool:
+    return _default_store().save_cookies(cookies)
 
 
 def clear_saved_login() -> None:

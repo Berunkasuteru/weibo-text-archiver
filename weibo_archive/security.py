@@ -5,7 +5,8 @@ import time
 import traceback
 from pathlib import Path
 
-from .paths import COOKIE_FILE, ERROR_FILE
+from .credentials import peek_cookie_header
+from .paths import COOKIE_FILE, CREDENTIAL_FILE, ERROR_FILE
 
 
 _SECRET_KEYS = ("SUB", "SUBP", "SSOLoginState", "X-CSRF-TOKEN")
@@ -21,6 +22,18 @@ _COOKIE_PAIR_RE = re.compile(
 
 
 _COOKIE_CACHE: dict[Path, tuple[tuple[int, int] | None, list[str]]] = {}
+_PROTECTED_CACHE: tuple[tuple[int, int] | None, list[str]] | None = None
+
+
+def _extract_secret_values(header: str) -> list[str]:
+    values: list[str] = []
+    for part in header.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        if key.strip() in _SECRET_KEYS and value.strip():
+            values.append(value.strip())
+    return values
 
 
 def _read_cookie_values(cookie_file: Path = COOKIE_FILE) -> list[str]:
@@ -41,21 +54,39 @@ def _read_cookie_values(cookie_file: Path = COOKIE_FILE) -> list[str]:
         _COOKIE_CACHE[cookie_file] = (None, [])
         return []
 
-    values: list[str] = []
-    for part in raw.split(";"):
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        if key.strip() in _SECRET_KEYS and value.strip():
-            values.append(value.strip())
-    result = sorted(set(values), key=len, reverse=True)
+    result = sorted(set(_extract_secret_values(raw)), key=len, reverse=True)
     _COOKIE_CACHE[cookie_file] = (stamp, result)
     return list(result)
 
 
-def redact_text(value: object, cookie_file: Path = COOKIE_FILE) -> str:
+def _protected_cookie_values() -> list[str]:
+    """Secrets from the DPAPI store, which outlives the legacy plaintext file."""
+    global _PROTECTED_CACHE
+    try:
+        st = CREDENTIAL_FILE.stat()
+        stamp: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+
+    if _PROTECTED_CACHE is not None and _PROTECTED_CACHE[0] == stamp:
+        return list(_PROTECTED_CACHE[1])
+
+    values = _extract_secret_values(peek_cookie_header()) if stamp else []
+    result = sorted(set(values), key=len, reverse=True)
+    _PROTECTED_CACHE = (stamp, result)
+    return list(result)
+
+
+def _secret_values(cookie_file: Path | None) -> list[str]:
+    if cookie_file is not None:
+        return _read_cookie_values(cookie_file)
+    values = _read_cookie_values(COOKIE_FILE) + _protected_cookie_values()
+    return sorted(set(values), key=len, reverse=True)
+
+
+def redact_text(value: object, cookie_file: Path | None = None) -> str:
     out = str(value)
-    for secret in _read_cookie_values(cookie_file):
+    for secret in _secret_values(cookie_file):
         out = out.replace(secret, "***")
     out = _COOKIE_PAIR_RE.sub(
         lambda m: f"{m.group('key')}{m.group('sep')}***", out

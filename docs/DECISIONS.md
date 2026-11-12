@@ -1,6 +1,6 @@
 # DECISIONS
 
-Last updated: 2026-10-02
+Last updated: 2026-11-10
 
 This document records durable product and engineering decisions for Weibo Text Archiver.
 Do not reverse these decisions casually. If a decision changes, update this file with the reason.
@@ -337,3 +337,15 @@ Use a separate verified-HTTPS CDN client with no Weibo Cookie or credentials, a 
 ## D027 — The saved login cookie follows redirects only to Weibo/Sina HTTPS hosts
 
 The text client sends the saved cookie as an explicit header, which the standard redirect handler would resend to any redirect target. Redirects are followed only to HTTPS `weibo.cn`, `weibo.com` and `sina.com.cn` hosts on the default port; any other redirect fails the request without retry.
+
+The QR login flow holds the same tickets in its request URLs, so it uses the identical host allowlist and the same redirect handler, and caps every passport response it reads.
+
+## D028 — The frozen V5/FULL layout does not escape structural lines in post bodies
+
+`weibo_archive/markdown_v5.py` renders post bodies verbatim. A body line that happens to read `---`, `## ...` or `可见范围（抓取时）：...` is therefore indistinguishable from a real record separator, timestamp heading or visibility line in FULL and `WEIBO_AI_1` output.
+
+This is a known limitation, accepted deliberately: the file header marks V5 as a frozen renderer whose output must stay byte-compatible with existing V5 archives and goldens. Escaping body lines would change every affected archive's bytes.
+
+`WEIBO_AI_2` does not inherit the limitation — it normalizes Unicode line separators and escapes structural prefixes before emitting `W<n>`, `RT`, `CHAIN` and body lines (see D026). Readers who need machine-verifiable structure should use `WEIBO_AI_2`.
+
+Revisit only together with a decision to break V5 compatibility, and regenerate `tests/golden/` in the same change.

@@ -96,7 +96,9 @@ def _time_text(post: Post, default_offset: str, date_only: bool) -> str:
 
 
 def _id_key(post: Post):
-    return (1, int(post.id)) if post.id.isdigit() else (0, post.id)
+    # isdigit() also accepts non-ASCII digits such as "²", which int() rejects.
+    numeric = post.id.isascii() and post.id.isdigit()
+    return (1, int(post.id)) if numeric else (0, post.id)
 
 
 def _calendar_time(post: Post, default_offset: str) -> datetime | None:
@@ -452,9 +454,11 @@ def render_ai_markdown(
                 seen = locations.setdefault(location, [0, None, None])
                 seen[0] += 1
                 if post.created_at is not None:
-                    day = post.created_at.strftime("%Y-%m-%d")
-                    seen[1] = min(seen[1], day) if seen[1] else day
-                    seen[2] = max(seen[2], day) if seen[2] else day
+                    cal = _calendar_time(post, default_offset)
+                    if cal is not None:
+                        day = cal.strftime("%Y-%m-%d")
+                        seen[1] = min(seen[1], day) if seen[1] else day
+                        seen[2] = max(seen[2], day) if seen[2] else day
         media_text = _media_text(post)
         if media_text:
             head.append(media_text)
@@ -687,9 +691,13 @@ def render_ai_markdown(
             + "; ".join(top_authors)
         )
     if locations:
+        sorted_locations = sorted(
+            locations.items(),
+            key=lambda item: (-item[1][0], item[1][1] or "9999-99-99", item[0]),
+        )
         entries = [
             f"{name}×{count}" + (f" ({first}~{last})" if first else "")
-            for name, (count, first, last) in list(locations.items())[:_TOP_LOCATIONS]
+            for name, (count, first, last) in sorted_locations[:_TOP_LOCATIONS]
         ]
         if len(locations) > _TOP_LOCATIONS:
             entries.append(f"{len(locations) - _TOP_LOCATIONS} more")

@@ -1,6 +1,7 @@
 """Offline Tk/controller integration. Uses synthetic identities and no network."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -97,9 +98,11 @@ class PureTests(unittest.TestCase):
     def test_real_worker_adapters_use_image_core_only(self):
         from test_image_core import Opener, Response, raw
         from weibo_archive.image_downloader import ImageDownloader
-        opener = Opener(Response())
+        opener = Opener(Response(status=500), Response())
         original_init = ImageDownloader.__init__
+        created_retries = []
         def configure(d, **kw):
+            created_retries.append(kw.get("retries"))
             original_init(d, opener=opener, spacing=0, reserve=0, **kw)
         with tempfile.TemporaryDirectory() as folder:
             request = self.request(output=folder, mode="recent", recent="1")
@@ -112,7 +115,8 @@ class PureTests(unittest.TestCase):
                 second = ui.run_image_request(request, threading.Event(), progress.append)
             self.assertEqual(first.result.saved, 1)
             self.assertEqual(second.result.already_present, 1)
-            self.assertEqual(len(opener.requests), 1)
+            self.assertEqual(created_retries, [2, 2])
+            self.assertEqual(len(opener.requests), 2)
             self.assertTrue(any(p.slots == 1 for p in progress))
             self.assertFalse(list(Path(folder).rglob("*.md")))
             self.assertNotIn("https", repr(progress))
@@ -201,20 +205,33 @@ class ControllerTests(unittest.TestCase):
 
 class TkTests(unittest.TestCase):
     def setUp(self):
+        import weibo_archive.paths as paths_module
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.patches = [patch.object(app_module, "has_saved_login", return_value=False),
+        self.patches = [patch.object(paths_module, "SETTINGS_FILE", Path(self.tmp.name) / "settings.json"),
+                        patch.object(app_module, "has_saved_login", return_value=False),
                         patch.object(app_module.App, "_start_update_check"),
                         patch.object(ui, "has_saved_login", return_value=True),
                         patch.object(ui.messagebox, "showinfo"), patch.object(ui.messagebox, "showwarning"),
+                        patch.object(ui.messagebox, "showerror"),
                         patch.object(ui.messagebox, "askyesno", return_value=True)]
         for p in self.patches: p.start(); self.addCleanup(p.stop)
         self.app = app_module.App()
         self.app.withdraw()
         self.app.uid_var.set("123456")
-        self.addCleanup(self.app.destroy)
         self.win = ui.open_image_window(self.app)
         self.win.output_var.set(self.tmp.name)
+        self.addCleanup(self._cleanup_tk)
+
+    def _cleanup_tk(self):
+        self.win = None
+        app = getattr(self, "app", None)
+        self.app = None
+        if app is not None:
+            app.destroy()
+        # Reclaim cyclic Tk widget references on the main thread so background
+        # worker threads never trigger Python 3.15 Tcl cross-thread warnings.
+        gc.collect()
 
     def pump(self):
         deadline = time.monotonic() + 3
@@ -363,6 +380,26 @@ class TkTests(unittest.TestCase):
         self.win.controller.runner = lambda r, e, p: outcome()
         self.win.start(); self.pump()
         self.assertEqual(self.win.target_var.get(), "543210")
+
+    def test_output_dir_fallback_only_for_default(self):
+        blocked_default = Path(self.tmp.name) / "blocked_default"
+        blocked_default.write_text("file", encoding="utf-8")
+        fallback_dir = Path(self.tmp.name) / "fallback_docs"
+        self.app.default_output_dir = blocked_default
+        self.app.fallback_output_dir = fallback_dir
+        self.win.output_var.set(str(blocked_default))
+        started_requests = []
+        self.win.controller.runner = lambda r, e, p: started_requests.append(r) or outcome()
+        self.win.start(); self.pump()
+        self.assertEqual(len(started_requests), 1)
+        self.assertEqual(started_requests[0].output_base, fallback_dir.resolve())
+        self.assertEqual(Path(self.win.output_var.get()), fallback_dir.resolve())
+
+        blocked_custom = Path(self.tmp.name) / "blocked_custom"
+        blocked_custom.write_text("file", encoding="utf-8")
+        self.win.output_var.set(str(blocked_custom))
+        self.win.start()
+        self.assertEqual(len(started_requests), 1)
 
 
 if __name__ == "__main__":

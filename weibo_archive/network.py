@@ -27,6 +27,14 @@ _RATE_LIMIT_COOLDOWN = {
     432: (120.0, 120.0),
 }
 
+# HttpClient only carries JSON/HTML API responses; image bytes and the update
+# check use their own openers with tighter caps.
+_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+
+# 4xx codes that are genuinely transient; every other 4xx fails identically on
+# retry and only burns the rate-limit budget.
+_TRANSIENT_CLIENT_ERRORS = (408, 425)
+
 RetryNotice = Callable[[int, float], None]
 
 
@@ -241,18 +249,33 @@ class HttpClient:
             request_started = self.performance.clock()
             try:
                 with self.opener.open(req, timeout=timeout) as resp:
-                    body = resp.read()
+                    body = resp.read(_MAX_RESPONSE_BYTES + 1)
                     self.performance.record_request(
                         performance_category,
                         self.performance.clock() - request_started,
                     )
+                    status = getattr(resp, "status", 200)
+                    content_type = _normalized_content_type(
+                        resp.headers.get("Content-Type")
+                    )
+                    if len(body) > _MAX_RESPONSE_BYTES:
+                        self.performance.increment_error("response_too_large")
+                        host, path = _safe_endpoint(url)
+                        raise InvalidResponse(
+                            "微博返回的数据超过大小上限，本次请求已停止。",
+                            diagnostic=SafeRequestDiagnostic(
+                                classification="response_too_large",
+                                host=host,
+                                path=path,
+                                status=status,
+                                content_type=content_type,
+                            ),
+                        )
                     return ResponseData(
                         body=body,
                         url=resp.geturl(),
-                        status=getattr(resp, "status", 200),
-                        content_type=_normalized_content_type(
-                            resp.headers.get("Content-Type")
-                        ),
+                        status=status,
+                        content_type=content_type,
                     )
             except urllib.error.HTTPError as exc:
                 self.performance.record_request(
@@ -301,7 +324,10 @@ class HttpClient:
                         diagnostic=diagnostic,
                     )
                     stop_retrying = (
-                        restriction_retry_used or attempt + 1 >= max_attempts
+                        (400 <= exc.code < 500
+                         and exc.code not in _TRANSIENT_CLIENT_ERRORS)
+                        or restriction_retry_used
+                        or attempt + 1 >= max_attempts
                     )
             except (
                 urllib.error.URLError,

@@ -31,6 +31,11 @@ _PLATFORM_TOMBSTONE_NOTICES = frozenset(
         "抱歉，根据作者设置的微博可见时间范围，此微博已不可见。",
         "抱歉，此微博已被作者删除。查看帮助： 网页链接",
         "该账号因违反相关法律法规和政策，现已无法查看。查看帮助 网页链接",
+        "抱歉，由于作者设置，你暂时没有这条微博的查看权限哦。查看帮助： 网页链接",
+        "该微博因违反法律法规或《微博社区公约》的相关规定，已被删除。查看帮助： 网页链接",
+        "该账号内容存在风险，用户验证之前暂时不能查看。查看帮助 网页链接",
+        "该账号因用户自行申请关闭，现已无法查看。",
+        "该账号因被投诉违反《微博社区公约》的相关规定，现已无法查看。查看帮助 网页链接",
     }
 )
 
@@ -188,10 +193,6 @@ def parse_created_at_fact(
         return base, TimestampProvenance.RELATIVE_UNVERIFIED
 
     return None, TimestampProvenance.UNKNOWN
-
-
-def parse_created_at(value: Any, now: Optional[datetime] = None) -> Optional[datetime]:
-    return parse_created_at_fact(value, now)[0]
 
 
 def _media_info(raw: dict, article_from_text: bool) -> MediaInfo:

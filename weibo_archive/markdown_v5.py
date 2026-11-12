@@ -6,8 +6,7 @@ from datetime import datetime
 from .export_options import DateFormat, ExportLayout, ExportOptions, VISIBILITY_LABELS
 from .models import normalize_optional_uid
 
-# Frozen V5-compatible renderer.
-# V7 deliberately keeps this rendering surface stable while replacing the crawler beneath it.
+# Frozen V5-compatible renderer retained for Full Archive and legacy baseline tests.
 
 
 _VISIBILITY_LABELS = {
@@ -30,7 +29,7 @@ def normalize_text(value) -> str:
     text = str(value)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace("\u200b", "")
-    # 压缩过多空行，但保留正文分段
+    # Collapse excessive blank lines while preserving paragraph breaks.
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
@@ -148,7 +147,7 @@ def safe_filename(name: str) -> str:
 
 
 def safe_count(value, *, unknown: str = "未知") -> str:
-    """把转发/评论/点赞数统一转成适合 Markdown 显示的文本。"""
+    """Format repost/comment/like counts for Markdown display."""
     if value is None or value == "":
         return unknown
     try:
@@ -158,7 +157,7 @@ def safe_count(value, *, unknown: str = "未知") -> str:
 
 
 def engagement_line(item: dict) -> str:
-    """紧凑显示：转 12 · 评 34 · 赞 56"""
+    """Render compact engagement counts: 转 12 · 评 34 · 赞 56."""
     reposts = safe_count(item.get("reposts_count"))
     comments = safe_count(item.get("comments_count"))
     likes = safe_count(item.get("attitudes_count"))
@@ -166,7 +165,7 @@ def engagement_line(item: dict) -> str:
 
 
 def clean_profile_value(value) -> str:
-    """清理用户资料字段；空值不输出。"""
+    """Normalize profile values for output; empty values are omitted."""
     if value is None:
         return ""
     if isinstance(value, (list, tuple)):
@@ -189,7 +188,7 @@ def append_profile_line(out: list[str], label: str, value) -> None:
 
 
 def post_meta_line(item: dict, options: ExportOptions | None = None) -> str:
-    """生成每条微博的来源/位置行；无值则不显示。"""
+    """Build the source/location/check-in line for a post; omitted if empty."""
     source = normalize_text(item.get("source"))
     location = normalize_text(item.get("location"))
 
@@ -219,10 +218,7 @@ def option_time(item: dict, options: ExportOptions) -> str:
 
 
 def count_media_values(value, separator=None) -> int:
-    """
-    统计媒体字段数量。
-    兼容 weibo-crawler 常见的字符串格式，也兼容未来可能出现的 list/tuple/set。
-    """
+    """Count media entries in delimited string, sequence, or mapping fields."""
     if value is None:
         return 0
 
@@ -243,14 +239,13 @@ def count_media_values(value, separator=None) -> int:
 
 
 def media_counts(item: dict) -> tuple[int, int, int]:
-    """
-    返回 (图片数, 视频媒体数, 头条文章数)。
+    """Return ``(images, video_media, articles)`` counts for a post.
 
-    weibo-crawler 当前 JSON 中：
-    - pics: 多图通常用英文逗号分隔
-    - video_url: 多个视频 URL 通常用英文分号分隔；
-      Live Photo 的视频部分也归入该字段，因此这里不强行区分普通视频和 Live Photo
-    - article_url: 有值时视为 1 篇头条文章
+    In normalized V5 item dicts:
+    - ``pics``: comma-separated image entries
+    - ``video_url``: semicolon-separated video URLs (also holds Live Photo
+      video components, so standard videos and Live Photo clips are combined)
+    - ``article_url``: treated as 1 headline article when non-empty
     """
     pics = count_media_values(item.get("pics"), ",")
     videos = count_media_values(item.get("video_url"), ";")
@@ -259,13 +254,7 @@ def media_counts(item: dict) -> tuple[int, int, int]:
 
 
 def compact_media(item: dict) -> str:
-    """
-    AI 版媒体标签：
-      I=图片（Image）
-      V=视频媒体（Video，可能含 Live Photo 视频部分）
-      A=头条文章（Article）
-    没有媒体时返回空字符串。
-    """
+    """Return AI compact media tags (``I`` images, ``V`` video, ``A`` article)."""
     pics, videos, articles = media_counts(item)
     parts = []
     if pics:
@@ -278,7 +267,7 @@ def compact_media(item: dict) -> str:
 
 
 def full_media_line(item: dict) -> str:
-    """完整版的人类可读媒体提示，不写任何媒体 URL。"""
+    """Return human-readable media counts for Full Archive without raw URLs."""
     pics, videos, articles = media_counts(item)
     parts = []
     if pics:
@@ -291,10 +280,7 @@ def full_media_line(item: dict) -> str:
 
 
 def media_summary(items: list[dict]) -> dict:
-    """
-    统计整个账号媒体分布。
-    同时统计“无文字但有媒体”的微博，提醒 AI 不要把空正文误解为无内容。
-    """
+    """Aggregate media counts across posts, including media-only posts."""
     result = {
         "posts_with_images": 0,
         "total_images": 0,
@@ -327,7 +313,7 @@ def media_summary(items: list[dict]) -> dict:
 
 
 def compact_engagement(item: dict) -> str:
-    """AI 版互动数字：R=转发 C=评论 L=点赞。"""
+    """Format AI engagement metrics: ``R=reposts C=comments L=likes``."""
     return (
         f"R={safe_count(item.get('reposts_count'), unknown='UNKNOWN')} "
         f"C={safe_count(item.get('comments_count'), unknown='UNKNOWN')} "
@@ -336,7 +322,7 @@ def compact_engagement(item: dict) -> str:
 
 
 def prepare_items(data: dict) -> list[dict]:
-    """微博按 ID 去重，并按新 -> 旧排序。"""
+    """Deduplicate posts by ID and sort newest-first."""
     weibos = data.get("weibo") or []
     unique = {}
     for item in weibos:
@@ -360,12 +346,7 @@ def build_source_dictionary(
     *,
     include_retweets: bool = False,
 ) -> tuple[dict[str, str], list[tuple[str, str]]]:
-    """
-    高频来源优先分配短代码 S1/S2...
-    返回：
-      source_to_code: {"iPhone客户端": "S1", ...}
-      rows: [("S1", "iPhone客户端"), ...]
-    """
+    """Assign short ``S1``/``S2``... codes to the most frequent post sources."""
     counts = {}
     first_seen = {}
 
@@ -393,10 +374,7 @@ def build_source_dictionary(
 
 
 def retweet_key(retweet: dict) -> str:
-    """
-    优先用原微博 ID/BID 去重；
-    若接口没有 ID，再退回“作者 + 正文”。
-    """
+    """Identify a repost source by ID/BID, falling back to author + body."""
     rid = retweet.get("id") or retweet.get("bid")
     if rid:
         return f"id:{rid}"
@@ -446,12 +424,12 @@ def get_date_range(
     items: list[dict],
     options: ExportOptions | None = None,
 ) -> tuple[str, str]:
-    """返回最早和最晚日期（AI 版格式）。"""
+    """Return ``(oldest, newest)`` formatted timestamps."""
     time_renderer = compact_time if options is None else lambda item: option_time(item, options)
     valid = [time_renderer(x) for x in items if display_time(x)]
     if not valid:
         return "", ""
-    # items 已按新 -> 旧
+    # items are ordered newest-first.
     return valid[-1], valid[0]
 
 
@@ -460,15 +438,7 @@ def build_ai_markdown(
     uid: str,
     options: ExportOptions | None = None,
 ) -> tuple[str, str, dict]:
-    """
-    生成 AI 分析版：
-    - 用户资料只出现一次
-    - 时间去秒
-    - 发布来源字典化
-    - 位置仅存在时输出
-    - 互动数使用 R/C/L
-    - 相同转发原文只完整保存一次，之后引用 RT 编号
-    """
+    """Render the legacy ``WEIBO_AI_1`` compact Markdown layout."""
     if options is not None and options.layout is not ExportLayout.AI:
         raise ValueError("AI renderer requires AI layout options")
 
@@ -495,7 +465,7 @@ def build_ai_markdown(
 
     oldest, newest = get_date_range(items, options)
 
-    # 预扫描转发原文，统计“唯一原文”和“重复引用”数量
+    # Pre-scan repost sources to count unique targets and deduplicated references.
     seen_content_by_key = {}
     unique_retweets = 0
     duplicate_retweets = 0

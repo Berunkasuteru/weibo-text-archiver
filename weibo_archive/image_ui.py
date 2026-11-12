@@ -18,6 +18,8 @@ from .image_manifest import MAX_MANIFEST_BYTES
 from .image_models import ImageBackupResult, ImageError, ImageResultState, valid_identity
 from .models import FetchRange, RangeMode
 from .network import AuthenticationExpired, Cancelled
+from .paths import prepare_output_dir
+from .security import save_detailed_error
 from .tasking import TaskState
 
 
@@ -213,7 +215,7 @@ def run_image_request(request, cancel, publish):
                 return super().download(url, **kwargs)
         client = Timeline(cookie_header=cookie, cancel_event=cancel)
         core = ImageBackup(request.backup_root, cancel_event=cancel,
-                           downloader=Downloader(cancel_event=cancel))
+                           downloader=Downloader(cancel_event=cancel, retries=2))
         result = core.run(request.target_uid, request.fetch_range, client=client)
     except CredentialError:
         reason = "login_required"
@@ -221,7 +223,8 @@ def run_image_request(request, cancel, publish):
         reason = "authentication_expired"
     except Cancelled:
         reason = "cancelled"
-    except Exception:
+    except Exception as exc:
+        save_detailed_error("图片备份", exc)
         reason = "unexpected_failure"
     if result is None:
         result = ImageBackupResult(ImageResultState.CANCELLED if reason == "cancelled" else ImageResultState.FAILED,
@@ -273,7 +276,8 @@ class ImageTaskController:
             outcome = self.runner(request, cancel, lambda p: self._publish(generation, "progress", p))
             kind = {ImageResultState.COMPLETE: "done", ImageResultState.PARTIAL: "partial",
                     ImageResultState.CANCELLED: "cancelled", ImageResultState.FAILED: "error"}[outcome.result.state]
-        except Exception:
+        except Exception as exc:
+            save_detailed_error("图片备份任务", exc)
             outcome = ImageOutcome(ImageBackupResult(ImageResultState.FAILED, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                                     "unexpected_failure"), ImageProgress())
             kind = "error"
@@ -494,6 +498,23 @@ class ImageBackupWindow(tk.Toplevel):
         if text_task_active(self.app):
             messagebox.showinfo("任务正在运行", BUSY, parent=self)
             return
+        fallback_base = (
+            self.app.fallback_output_dir
+            if request.output_base == self.app.default_output_dir.resolve()
+            else None
+        )
+        try:
+            prepared_base = prepare_output_dir(request.output_base, fallback=fallback_base).resolve()
+        except OSError as exc:
+            messagebox.showerror("保存位置不可用", str(exc), parent=self)
+            return
+        if prepared_base != request.output_base:
+            self.output_var.set(str(prepared_base))
+            request = replace(
+                request,
+                output_base=prepared_base,
+                backup_root=prepared_base / f"WeiboImages_{request.target_uid}",
+            )
         self.request = request
         self.target_var.set(request.target_uid)
         self.last_outcome = None

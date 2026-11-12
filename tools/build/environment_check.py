@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "vendor"))
 sys.path.insert(0, str(ROOT))
 
 checks = []
@@ -52,7 +53,10 @@ for module in (
     except Exception as exc:
         fail(f"import {module}", exc)
 
-for asset in (ROOT / "assets/app_icon.png", ROOT / "assets/app_icon.ico"):
+for asset in (
+    ROOT / "weibo_archive" / "assets" / "app_icon.png",
+    ROOT / "weibo_archive" / "assets" / "app_icon.ico",
+):
     if asset.is_file():
         ok(f"asset {asset.name}")
     else:
@@ -81,7 +85,7 @@ try:
 except Exception as exc:
     fail("GUI startup smoke", exc)
 
-log = Path.home() / ".weibo_v7_environment_check.txt"
+log = Path.home() / ".weibo_environment_check.txt"
 text = "RESULT: PASS\n" if not errors else "RESULT: FAIL\n" + "\n".join(errors) + "\n"
 try:
     log.write_text(text, encoding="utf-8")

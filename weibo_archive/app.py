@@ -18,6 +18,7 @@ from .client import WeiboClient
 from .credentials import (
     clear_saved_login,
     has_saved_login,
+    legacy_cookie_file,
     load_cookie_header,
     save_cookies,
 )
@@ -39,8 +40,10 @@ from .export_options import (
     parse_filter_terms,
     visibility_scope_text,
 )
+from .ai_format import estimate_tokens, render_ai_markdown
 from .exporter import export_ai_variant, export_markdown
 from .models import (
+    Archive,
     ArchiveIntegrity,
     FetchRange,
     RangeMode,
@@ -48,6 +51,15 @@ from .models import (
     VisibilityState,
 )
 from .network import AuthenticationExpired, Cancelled, NetworkError, RateLimited
+from .offline_archive import (
+    OfflineArchiveError,
+    export_offline_html,
+    export_portable_json,
+    incremental_since_date,
+    list_cached_archives,
+    load_normalized_archive_file,
+    merge_incremental_archives,
+)
 from .paths import (
     APP_ICON_PNG,
     default_output_dir,
@@ -55,9 +67,14 @@ from .paths import (
     prepare_output_dir,
 )
 from .security import redact_text, save_detailed_error
+from .settings import UiPreferences, load_ui_settings, save_ui_settings
 from .storage import save_normalized_archive
 from .tasking import TaskManager, TaskState
-from .update_check import find_newer_github_version, launch_official_release_page
+from .update_check import (
+    GITHUB_LATEST_RELEASE_PAGE,
+    find_newer_github_version,
+    launch_official_release_page,
+)
 from .image_ui import image_task_active, open_image_window
 
 
@@ -69,6 +86,8 @@ DEFAULT_COMPACT_HEIGHT = 760
 MIN_WINDOW_HEIGHT = 650
 # Tk geometry is the client area; leave room for the title bar and borders.
 WINDOW_FRAME_ALLOWANCE = 48
+# A full-archive run logs one line per page; keep the widget from growing forever.
+MAX_LOG_LINES = 2000
 
 
 @dataclass(frozen=True)
@@ -79,6 +98,8 @@ class ExportRequest:
     export_selections: tuple[ExportSelection, ...]
     fallback_dir: Path | None = None
     auth_retry_count: int = 0
+    target_url: str | None = None
+    incremental_cache_path: Path | None = None
 
 
 def format_elapsed_time(seconds: float) -> str:
@@ -216,8 +237,76 @@ def _load_app_icon(window, icon_path: Path = APP_ICON_PNG):
         return None
 
 
+_PROFILE_TAB_SEGMENTS = frozenset(
+    {
+        "profile",
+        "home",
+        "feed",
+        "info",
+        "about",
+        "follow",
+        "follows",
+        "following",
+        "fans",
+        "followers",
+        "album",
+        "photos",
+        "photo",
+        "video",
+        "videos",
+        "article",
+        "articles",
+        "weibo",
+        "original",
+        "super",
+        "manage",
+        "all",
+        "mine",
+    }
+)
+
+
+def _path_segments(parsed: urllib.parse.SplitResult) -> list[str]:
+    return [
+        urllib.parse.unquote(segment).strip()
+        for segment in parsed.path.split("/")
+        if segment.strip()
+    ]
+
+
 def extract_uid(value: str) -> str:
-    m = re.search(r"(?<!\d)(\d{5,})(?!\d)", (value or "").strip())
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    parsed = _parse_weibo_url(raw)
+    if parsed is not None:
+        if is_obvious_single_post_url(raw):
+            return ""
+        segments = _path_segments(parsed)
+        if segments:
+            first = segments[0].casefold()
+            if first in {"u", "profile"} and len(segments) >= 2:
+                if re.fullmatch(r"\d{5,}", segments[1]):
+                    return segments[1]
+            elif first == "p" and len(segments) >= 2:
+                matched = re.fullmatch(r"100505(\d{5,})", segments[1])
+                if matched:
+                    return matched.group(1)
+            elif re.fullmatch(r"\d{5,}", segments[0]):
+                if len(segments) == 1 or segments[1].casefold() in _PROFILE_TAB_SEGMENTS:
+                    return segments[0]
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=False)
+        for key in ("uid", "user_id"):
+            for candidate in query.get(key, ()):
+                stripped = candidate.strip()
+                if re.fullmatch(r"\d{5,}", stripped):
+                    return stripped
+        for candidate in query.get("containerid", ()):
+            matched = re.fullmatch(r"(?:100505|230413|107603)(\d{5,})", candidate.strip())
+            if matched:
+                return matched.group(1)
+        return ""
+    m = re.search(r"(?<!\d)(\d{5,})(?!\d)", raw)
     return m.group(1) if m else ""
 
 
@@ -247,12 +336,20 @@ def is_obvious_single_post_url(value: str) -> bool:
     parsed = _parse_weibo_url(value)
     if parsed is None:
         return False
-    segments = {
-        urllib.parse.unquote(segment).casefold()
-        for segment in parsed.path.split("/")
-        if segment
-    }
-    return bool(segments & {"detail", "status"})
+    segments = _path_segments(parsed)
+    folded = {segment.casefold() for segment in segments}
+    if folded & {"detail", "status"}:
+        return True
+    if len(segments) == 2 and re.fullmatch(r"\d{5,13}", segments[0]):
+        second = segments[1]
+        if second.casefold() not in _PROFILE_TAB_SEGMENTS:
+            if (
+                re.fullmatch(r"\d{14,}", second)
+                or re.fullmatch(r"[A-Za-z0-9]{8,12}", second)
+                or (re.fullmatch(r"[A-Za-z0-9]{7}", second) and any(ch.isdigit() for ch in second))
+            ):
+                return True
+    return False
 
 
 def is_weibo_url_without_uid(value: str) -> bool:
@@ -367,6 +464,119 @@ def completion_integrity_lines(integrity: ArchiveIntegrity) -> list[str]:
         ),
         "无法验证的内容已在 Markdown 中明确标记。",
     ]
+
+
+def render_export_selections(
+    archive: Archive,
+    export_selections: tuple[ExportSelection, ...],
+    output_dir: Path,
+    fallback_dir: Path | None,
+    *,
+    before_commit=None,
+    log_fn=None,
+) -> tuple[list[dict], list[dict], Path]:
+    """Filter and write all requested Markdown export selections for an Archive."""
+    outputs: list[dict] = []
+    failures: list[dict] = []
+    current_dir = output_dir
+    current_fallback = fallback_dir
+
+    for selection in export_selections:
+        if before_commit is not None:
+            before_commit()
+
+        render_archive = archive
+        filter_report: CustomFilterReport | None = None
+        visibility_report = None
+        selection_notice = None
+        if selection.preset is ExportPreset.AI_COMPACT:
+            render_archive, visibility_report = filter_archive_visibility(
+                archive,
+                selection.visibility_states,
+            )
+        elif selection.preset is ExportPreset.CUSTOM:
+            render_archive, filter_report = filter_archive(
+                archive,
+                selection.custom_filter,
+            )
+            selection_notice = filter_report_notice(
+                filter_report,
+                english=selection.options.layout is ExportLayout.AI,
+            )
+
+        unknown_excluded = (
+            visibility_report.unknown_excluded_count
+            if visibility_report is not None
+            else filter_report.unknown_visibility_count
+            if filter_report is not None
+            else 0
+        )
+
+        def write_selection(target_dir: Path):
+            return export_markdown(
+                render_archive,
+                target_dir,
+                selection.options,
+                selection.filename_suffix,
+                before_commit=before_commit,
+                selection_notice=selection_notice,
+                visibility_scope=visibility_scope_text(selection.visibility_states),
+                unknown_visibility_excluded_count=unknown_excluded,
+            )
+
+        try:
+            try:
+                output_path, stats = write_selection(current_dir)
+            except PermissionError:
+                if current_fallback is None:
+                    raise
+                current_dir = prepare_output_dir(current_fallback)
+                current_fallback = None
+                if log_fn is not None:
+                    log_fn(f"应用目录不可写，改用备用保存位置：{current_dir}")
+                output_path, stats = write_selection(current_dir)
+        except Cancelled:
+            raise
+        except Exception as exc:
+            safe_error = redact_text(exc)
+            failures.append({"label": selection.label, "error": safe_error})
+            if log_fn is not None:
+                log_fn(f"{selection.label} 本地输出失败：{safe_error}")
+            continue
+
+        current_fallback = None
+        outputs.append(
+            {
+                "label": selection.label,
+                "path": output_path,
+                "options": selection.options,
+                "stats": stats,
+                "filter_report": filter_report,
+                "visibility_report": visibility_report,
+                # Lets the completion window write a smaller AI file
+                # from this same snapshot without fetching again.
+                "variant_source": (
+                    {
+                        "archive": render_archive,
+                        "filename_suffix": selection.filename_suffix,
+                        "selection_notice": selection_notice,
+                        "visibility_scope": visibility_scope_text(
+                            selection.visibility_states
+                        ),
+                        "unknown_visibility_excluded_count": unknown_excluded,
+                    }
+                    if selection.options.layout is ExportLayout.AI
+                    else None
+                ),
+            }
+        )
+        if log_fn is not None:
+            log_fn(f"已生成 {selection.label}：{output_path.name}")
+
+    if not outputs:
+        failed_labels = "、".join(item["label"] for item in failures)
+        raise RuntimeError(f"所有本地输出均失败：{failed_labels}")
+    return outputs, failures, current_dir
 
 
 class ActivityIndicator(tk.Canvas):
@@ -504,8 +714,9 @@ class ActivityIndicator(tk.Canvas):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, *, settings_path: Path | None = None):
         super().__init__()
+        self._settings_path = settings_path
         self.ui_scale = _ui_scale(self)
         self._app_icon_image = _load_app_icon(self)
         self.title(f"{APP_TITLE} · {VERSION_DISPLAY}")
@@ -525,20 +736,25 @@ class App(tk.Tk):
         self.uid_var = tk.StringVar()
         self.default_output_dir = default_output_dir()
         self.fallback_output_dir = fallback_output_dir()
-        self.output_var = tk.StringVar(value=str(self.default_output_dir))
-        self.range_mode_var = tk.StringVar(value=RangeMode.ALL.value)
-        self.recent_count_var = tk.StringVar(value="1000")
-        self.since_date_var = tk.StringVar(value="")
-        self.full_output_var = tk.BooleanVar(value=True)
-        self.ai_output_var = tk.BooleanVar(value=True)
-        self.custom_output_var = tk.BooleanVar(value=False)
-        self.custom_options = ExportOptions()
-        self.custom_filter = CustomFilterOptions()
-        self.ai_followers_var = tk.BooleanVar(value=False)
-        self.ai_friends_var = tk.BooleanVar(value=False)
-        self.ai_private_var = tk.BooleanVar(value=False)
+        prefs = load_ui_settings(self._settings_path)
+        self.output_var = tk.StringVar(
+            value=prefs.output_dir or str(self.default_output_dir)
+        )
+        self.range_mode_var = tk.StringVar(value=prefs.range_mode)
+        self.recent_count_var = tk.StringVar(value=prefs.recent_count)
+        self.since_date_var = tk.StringVar(value=prefs.since_date)
+        self.full_output_var = tk.BooleanVar(value=prefs.full_output)
+        self.ai_output_var = tk.BooleanVar(value=prefs.ai_output)
+        self.custom_output_var = tk.BooleanVar(value=prefs.custom_output)
+        self.custom_options = prefs.custom_options
+        self.custom_filter = prefs.custom_filter
+        self.ai_followers_var = tk.BooleanVar(value=prefs.ai_followers)
+        self.ai_friends_var = tk.BooleanVar(value=prefs.ai_friends)
+        self.ai_private_var = tk.BooleanVar(value=prefs.ai_private)
         self.content_summary_var = tk.StringVar()
         self.login_var = tk.StringVar()
+        self._logged_in_uid = ""
+        self._logged_in_name = ""
         self.status_var = tk.StringVar(value="就绪")
         self.progress_detail_var = tk.StringVar(value="等待任务")
         self.activity_status_var = tk.StringVar(value="")
@@ -621,11 +837,17 @@ class App(tk.Tk):
             cursor="hand2",
             takefocus=True,
         )
+        def open_release_page(_event=None):
+            if not launch_official_release_page():
+                messagebox.showerror(
+                    "无法打开",
+                    "Windows 无法打开官方发布页面，请手动访问：\n"
+                    + GITHUB_LATEST_RELEASE_PAGE,
+                    parent=self.root_frame,
+                )
+
         for seq in ("<Button-1>", "<Return>", "<space>"):
-            self.update_notice_label.bind(
-                seq,
-                lambda _event: launch_official_release_page(),
-            )
+            self.update_notice_label.bind(seq, open_release_page)
         ttk.Label(
             self.root_frame,
             text=APP_SUBTITLE,
@@ -681,6 +903,13 @@ class App(tk.Tk):
             command=self.start_login,
         )
         self.login_btn.pack(side="right", padx=(0, 8))
+        self.my_account_btn = ttk.Button(
+            account,
+            text="填入我的账号",
+            style="Quiet.TButton",
+            command=self.identify_and_fill_my_account,
+        )
+        self.my_account_btn.pack(side="right", padx=(0, 8))
 
         # Target
         self._section_label("目标账号")
@@ -689,7 +918,7 @@ class App(tk.Tk):
 
         ttk.Label(
             target,
-            text="数字 UID 或包含数字 UID 的微博主页链接",
+            text="数字 UID、账号主页链接或个性域名链接（如 weibo.com/n/...）",
             style="Muted.TLabel",
         ).pack(anchor="w")
         self.uid_entry = ttk.Entry(target, textvariable=self.uid_var)
@@ -910,6 +1139,13 @@ class App(tk.Tk):
             command=lambda: open_image_window(self),
         )
         self.image_backup_btn.pack(side="right", padx=(0, 8))
+        self.offline_tools_btn = ttk.Button(
+            actions,
+            text="离线缓存…",
+            style="Quiet.TButton",
+            command=self._open_offline_tools_dialog,
+        )
+        self.offline_tools_btn.pack(side="right", padx=(0, 8))
 
         # Status
         status_card = ttk.Frame(self.footer_frame, style="Card.TFrame", padding=12)
@@ -1233,8 +1469,49 @@ class App(tk.Tk):
         win.transient(self)
         win.resizable(False, False)
 
-        body = ttk.Frame(win, padding=18)
-        body.pack(fill="both", expand=True)
+        outer = ttk.Frame(win, padding=18)
+        outer.pack(fill="both", expand=True)
+
+        actions = ttk.Frame(outer)
+        actions.pack(side="bottom", fill="x", pady=(16, 0))
+        for column in range(2):
+            actions.columnconfigure(column, weight=1, uniform="custom_actions")
+
+        scroll_row = ttk.Frame(outer)
+        scroll_row.pack(side="top", fill="both", expand=True)
+        surface_bg = ttk.Style(win).lookup("TFrame", "background")
+        canvas_kwargs = {"highlightthickness": 0, "borderwidth": 0}
+        if surface_bg:
+            canvas_kwargs["background"] = surface_bg
+        canvas = tk.Canvas(scroll_row, **canvas_kwargs)
+        scrollbar = ttk.Scrollbar(
+            scroll_row, orient="vertical", command=canvas.yview
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        body = ttk.Frame(canvas, padding=(0, 0, 8, 0))
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+
+        def sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def sync_canvas_width(event):
+            canvas.itemconfigure(body_window, width=event.width)
+
+        def on_mousewheel(event):
+            if not canvas.winfo_exists():
+                return
+            delta = -int(event.delta / 120) if event.delta else 0
+            if delta == 0 and event.delta:
+                delta = -1 if event.delta > 0 else 1
+            if delta:
+                canvas.yview_scroll(delta, "units")
+
+        body.bind("<Configure>", sync_scrollregion, add="+")
+        canvas.bind("<Configure>", sync_canvas_width, add="+")
+        win.bind("<MouseWheel>", on_mousewheel, add="+")
 
         layout_var = tk.StringVar(value=current.layout.value)
         source_var = tk.BooleanVar(value=current.include_source)
@@ -1395,11 +1672,6 @@ class App(tk.Tk):
             style="Muted.TLabel",
         ).pack(anchor="w", pady=(12, 0))
 
-        actions = ttk.Frame(body)
-        actions.pack(fill="x", pady=(18, 0))
-        for column in range(2):
-            actions.columnconfigure(column, weight=1, uniform="custom_actions")
-
         def save():
             def optional_date(raw: str, label: str) -> date | None:
                 value = raw.strip()
@@ -1439,6 +1711,7 @@ class App(tk.Tk):
             self.custom_filter = custom_filter
             self.custom_output_var.set(True)
             self._update_content_controls()
+            self._save_preferences()
             win.destroy()
 
         ttk.Button(
@@ -1459,6 +1732,15 @@ class App(tk.Tk):
             padx=4,
         )
         win.bind("<Escape>", lambda _event: win.destroy(), add="+")
+        if not getattr(win, "_layout_scaled", False):
+            win._layout_scaled = True
+            _scale_layout(win, self.ui_scale)
+        win.update_idletasks()
+        canvas.configure(
+            width=body.winfo_reqwidth(),
+            height=body.winfo_reqheight(),
+        )
+        sync_scrollregion()
         self._center_child_window(win)
         win.grab_set()
 
@@ -1472,7 +1754,9 @@ class App(tk.Tk):
             self.trial_btn,
             self.export_btn,
             self.image_backup_btn,
+            self.offline_tools_btn,
             self.login_btn,
+            self.my_account_btn,
             self.clear_login_btn,
             *self.output_buttons,
             *self.ai_visibility_buttons,
@@ -1574,6 +1858,11 @@ class App(tk.Tk):
             text += "\n"
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text)
+        # Tk reports a phantom trailing line, so subtract it before counting.
+        lines = int(self.log_text.index("end-1c").split(".")[0]) - 1
+        excess = lines - MAX_LOG_LINES
+        if excess > 0:
+            self.log_text.delete("1.0", f"{excess + 1}.0")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
@@ -1658,9 +1947,16 @@ class App(tk.Tk):
                     self.tasks.terminal(generation, TaskState.READY)
                     self._close_qr_window()
                     self._set_running(False)
+                    account_uid = str((payload or {}).get("uid") or "").strip()
+                    account_name = str((payload or {}).get("screen_name") or "").strip()
+                    recovery = bool(payload and payload.get("recovery"))
+                    if account_uid:
+                        self._logged_in_uid = account_uid
+                        self._logged_in_name = account_name
+                        if not recovery and not self.uid_var.get().strip():
+                            self.uid_var.set(account_uid)
                     self._refresh_login_status()
                     self.activity_status_var.set("")
-                    recovery = bool(payload and payload.get("recovery"))
                     pending = self._pending_export_request if recovery else None
                     if pending is not None:
                         self._pending_export_request = None
@@ -1677,6 +1973,45 @@ class App(tk.Tk):
                         self.status_var.set("就绪")
                         self.progress_detail_var.set("登录成功，可以开始导出。")
                         messagebox.showinfo("登录成功", "微博登录状态已保存到本机。")
+
+                elif kind == "account_identified":
+                    self.tasks.terminal(generation, TaskState.READY)
+                    self._set_running(False)
+                    self.activity_status_var.set("")
+                    account_uid = str((payload or {}).get("uid") or "").strip()
+                    account_name = str((payload or {}).get("screen_name") or "").strip()
+                    if account_uid:
+                        self._logged_in_uid = account_uid
+                        self._logged_in_name = account_name
+                        self.uid_var.set(account_uid)
+                    self._refresh_login_status()
+                    self.status_var.set("就绪")
+                    desc = (
+                        f"{account_name} (UID {account_uid})"
+                        if account_name
+                        else f"UID {account_uid}"
+                    )
+                    self.progress_detail_var.set(f"已填入当前登录账号：{desc}")
+
+                elif kind == "account_auth_expired":
+                    self.tasks.terminal(generation, TaskState.ERROR)
+                    self._stop_activity_timer()
+                    self._set_running(False)
+                    self._logged_in_uid = ""
+                    self._logged_in_name = ""
+                    self.login_var.set("○ 登录已过期，请重新扫码")
+                    self.status_var.set("登录已过期")
+                    self.progress_detail_var.set("当前会话已失效，请重新扫码登录。")
+                    messagebox.showwarning(
+                        "登录已过期",
+                        "微博登录已过期，无法识别当前账号。请重新扫码登录。",
+                    )
+                    self.tasks.transition(TaskState.READY if has_saved_login() else TaskState.IDLE)
+
+                elif kind == "resolved_uid":
+                    resolved_uid = str(payload or "").strip()
+                    if resolved_uid:
+                        self.uid_var.set(resolved_uid)
 
                 elif kind == "auth_expired":
                     self.tasks.terminal(generation, TaskState.ERROR)
@@ -1800,10 +2135,16 @@ class App(tk.Tk):
 
     def _refresh_login_status(self):
         if has_saved_login():
-            self.login_var.set("● 已保存登录信息")
+            if self._logged_in_uid:
+                display_name = self._logged_in_name or self._logged_in_uid
+                self.login_var.set(f"● 已登录：{display_name} (UID {self._logged_in_uid})")
+            else:
+                self.login_var.set("● 已保存登录信息")
             if self.tasks.state is TaskState.IDLE:
                 self.tasks.transition(TaskState.READY)
         else:
+            self._logged_in_uid = ""
+            self._logged_in_name = ""
             self.login_var.set("○ 未登录")
 
     def _open_qr_window(self):
@@ -1960,9 +2301,39 @@ class App(tk.Tk):
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
 
-            save_cookies(cookies)
+            legacy_retired = save_cookies(cookies)
             self._worker_log(generation, "扫码登录成功；凭据已保存。")
-            self._emit(generation, "ready", {"recovery": recovery})
+            if not legacy_retired:
+                self._worker_log(
+                    generation,
+                    f"警告：旧版明文登录文件 {legacy_cookie_file()} 无法清除，请手动删除。",
+                )
+            account_uid = ""
+            account_name = ""
+            try:
+                identify_client = WeiboClient(
+                    cookie_header=load_cookie_header(),
+                    cancel_event=cancel,
+                )
+                account_uid, account_name = identify_client.identify_current_account()
+                if account_uid:
+                    self._worker_log(
+                        generation,
+                        f"已识别当前登录账号：{account_name} (UID {account_uid})"
+                        if account_name
+                        else f"已识别当前登录账号 UID：{account_uid}",
+                    )
+            except Exception:
+                account_uid, account_name = "", ""
+            self._emit(
+                generation,
+                "ready",
+                {
+                    "recovery": recovery,
+                    "uid": account_uid,
+                    "screen_name": account_name,
+                },
+            )
             terminal_sent = True
 
         except Cancelled:
@@ -1986,6 +2357,79 @@ class App(tk.Tk):
                 detail = save_detailed_error("登录终态保护", exc)
                 self._emit(generation, "error", (str(exc), detail))
 
+    def identify_and_fill_my_account(self):
+        if image_task_active(self):
+            messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再试。")
+            return
+        if not has_saved_login():
+            messagebox.showwarning("需要登录", "请先扫码登录，再识别当前登录账号。")
+            return
+        if self._logged_in_uid:
+            self.uid_var.set(self._logged_in_uid)
+            desc = (
+                f"{self._logged_in_name} (UID {self._logged_in_uid})"
+                if self._logged_in_name
+                else f"UID {self._logged_in_uid}"
+            )
+            self.progress_detail_var.set(f"已填入当前登录账号：{desc}")
+            return
+        try:
+            generation, cancel = self.tasks.start(TaskState.AUTHENTICATING)
+        except RuntimeError:
+            messagebox.showinfo("任务正在运行", "已有任务正在运行，请等待完成。")
+            return
+
+        self._stop_activity_timer()
+        self._activity_started_at = None
+        self._activity_read_count = 0
+        self.activity_status_var.set("账号识别中")
+        self._set_running(True)
+        self.status_var.set("正在识别当前登录账号")
+        self.progress_detail_var.set("正在查询已保存 Cookie 对应的微博账号…")
+        self._append_log("\n=== 识别当前登录账号 ===\n")
+
+        self.worker = threading.Thread(
+            target=self._identify_account_worker,
+            args=(generation, cancel),
+            daemon=True,
+        )
+        self.worker.start()
+
+    def _identify_account_worker(self, generation: int, cancel: threading.Event):
+        terminal_sent = False
+        try:
+            cookie = load_cookie_header()
+            client = WeiboClient(cookie_header=cookie, cancel_event=cancel)
+            uid, screen_name = client.identify_current_account()
+            self._worker_log(
+                generation,
+                f"已识别当前登录账号：{screen_name} (UID {uid})"
+                if screen_name
+                else f"已识别当前登录账号 UID：{uid}",
+            )
+            self._emit(
+                generation,
+                "account_identified",
+                {"uid": uid, "screen_name": screen_name},
+            )
+            terminal_sent = True
+        except Cancelled:
+            self._emit(generation, "cancelled", None)
+            terminal_sent = True
+        except AuthenticationExpired:
+            self._emit(generation, "account_auth_expired", None)
+            terminal_sent = True
+        except Exception as exc:
+            detail = save_detailed_error("识别当前登录账号", exc)
+            friendly = "未能识别当前登录账号。\n\n" + redact_text(exc)
+            self._emit(generation, "error", (friendly, detail))
+            terminal_sent = True
+        finally:
+            if not terminal_sent and self.tasks.accepts(generation):
+                exc = RuntimeError("账号识别任务异常结束，未产生终态。")
+                detail = save_detailed_error("账号识别终态保护", exc)
+                self._emit(generation, "error", (str(exc), detail))
+
     def clear_login(self):
         if image_task_active(self):
             messagebox.showinfo("任务正在运行", "请先完成或取消图片备份，再清除登录信息。")
@@ -1997,6 +2441,8 @@ class App(tk.Tk):
             return
         try:
             clear_saved_login()
+            self._logged_in_uid = ""
+            self._logged_in_name = ""
             if self.tasks.state is TaskState.READY:
                 self.tasks.transition(TaskState.IDLE)
             self._refresh_login_status()
@@ -2019,6 +2465,37 @@ class App(tk.Tk):
         )
         return parse_fetch_range(mode, recent_raw, since_raw)
 
+    def _current_preferences(self) -> UiPreferences:
+        raw_output = self.output_var.get().strip()
+        if not raw_output or raw_output == str(self.default_output_dir):
+            saved_output = None
+        else:
+            saved_output = raw_output
+        recent_raw = self.recent_count_var.get().strip()
+        recent_count = recent_raw if recent_raw.isdigit() and int(recent_raw) > 0 else "1000"
+        since_raw = self.since_date_var.get().strip()
+        try:
+            since_date = date.fromisoformat(since_raw).isoformat() if since_raw else ""
+        except ValueError:
+            since_date = ""
+        return UiPreferences(
+            output_dir=saved_output,
+            range_mode=self.range_mode_var.get(),
+            recent_count=recent_count,
+            since_date=since_date,
+            full_output=self.full_output_var.get(),
+            ai_output=self.ai_output_var.get(),
+            custom_output=self.custom_output_var.get(),
+            ai_followers=self.ai_followers_var.get(),
+            ai_friends=self.ai_friends_var.get(),
+            ai_private=self.ai_private_var.get(),
+            custom_options=self.custom_options,
+            custom_filter=self.custom_filter,
+        )
+
+    def _save_preferences(self) -> None:
+        save_ui_settings(self._current_preferences(), self._settings_path)
+
     def choose_output(self):
         folder = filedialog.askdirectory(
             title="选择 Markdown 保存位置",
@@ -2026,6 +2503,7 @@ class App(tk.Tk):
         )
         if folder:
             self.output_var.set(folder)
+            self._save_preferences()
 
     def _selected_export_selections(self) -> tuple[ExportSelection, ...]:
         return build_export_selections(
@@ -2041,6 +2519,25 @@ class App(tk.Tk):
             ),
         )
 
+    def _prepare_target_output_dir(self, *, parent=None) -> tuple[Path, Path | None] | None:
+        requested_output_dir = Path(
+            self.output_var.get().strip() or self.default_output_dir
+        ).expanduser()
+        is_default_output = requested_output_dir == self.default_output_dir
+        fallback_dir = self.fallback_output_dir if is_default_output else None
+        try:
+            output_dir = prepare_output_dir(
+                requested_output_dir,
+                fallback=fallback_dir,
+            )
+        except OSError as exc:
+            messagebox.showerror("保存位置不可用", str(exc), parent=parent)
+            return None
+        if output_dir != requested_output_dir:
+            self.output_var.set(str(output_dir))
+            fallback_dir = None
+        return output_dir, fallback_dir
+
     def start_export(self, *, trial: bool):
         if image_task_active(self):
             messagebox.showinfo("任务正在运行", "图片备份正在运行，请完成或取消后再开始其他微博任务。")
@@ -2054,19 +2551,16 @@ class App(tk.Tk):
             )
             return
         uid = extract_uid(target_value)
+        target_url: str | None = None
         if not uid:
             if is_weibo_url_without_uid(target_value):
-                messagebox.showwarning(
-                    "请输入 UID",
-                    "此微博链接是昵称或个性域名主页，不含数字 UID。\n"
-                    "请在用户主页查看数字 UID，或粘贴包含数字 UID 的主页链接。",
-                )
+                target_url = target_value.strip()
             else:
                 messagebox.showwarning(
                     "请输入 UID",
-                    "请输入微博数字 UID，或粘贴包含数字 UID 的主页链接。",
+                    "请输入微博数字 UID，或粘贴微博账号主页链接。",
                 )
-            return
+                return
 
         if not has_saved_login():
             messagebox.showwarning("需要登录", "本工具不再匿名尝试抓取。请先扫码登录。")
@@ -2079,22 +2573,10 @@ class App(tk.Tk):
             messagebox.showwarning("导出设置有误", str(exc))
             return
 
-        requested_output_dir = Path(
-            self.output_var.get().strip() or self.default_output_dir
-        ).expanduser()
-        is_default_output = requested_output_dir == self.default_output_dir
-        fallback_dir = self.fallback_output_dir if is_default_output else None
-        try:
-            output_dir = prepare_output_dir(
-                requested_output_dir,
-                fallback=fallback_dir,
-            )
-        except OSError as exc:
-            messagebox.showerror("保存位置不可用", str(exc))
+        prepared = self._prepare_target_output_dir()
+        if prepared is None:
             return
-        if output_dir != requested_output_dir:
-            self.output_var.set(str(output_dir))
-            fallback_dir = None
+        output_dir, fallback_dir = prepared
 
         request = ExportRequest(
             uid=uid,
@@ -2102,7 +2584,9 @@ class App(tk.Tk):
             output_dir=output_dir,
             export_selections=export_selections,
             fallback_dir=fallback_dir,
+            target_url=target_url,
         )
+        self._save_preferences()
         self._launch_export_request(request)
 
     def _launch_export_request(self, request: ExportRequest) -> None:
@@ -2113,20 +2597,28 @@ class App(tk.Tk):
         except RuntimeError:
             return
 
-        self.uid_var.set(request.uid)
+        if request.uid:
+            self.uid_var.set(request.uid)
         self._start_activity_timer()
         self._set_running(True)
+        mode_note = "（基于本地缓存增量更新）" if request.incremental_cache_path else ""
         if request.auth_retry_count:
             self.status_var.set("正在重新开始")
             self.progress_detail_var.set("登录已更新，正在重新开始刚才的导出…")
+        elif not request.uid and request.target_url:
+            self.status_var.set("正在解析账号链接")
+            self.progress_detail_var.set(
+                f"{request.fetch_range.label()} · 正在从个性主页链接识别 UID…"
+            )
         else:
             self.status_var.set("正在读取")
             self.progress_detail_var.set(
-                f"{request.fetch_range.label()} · 正在开始读取微博…"
+                f"{request.fetch_range.label()}{mode_note} · 正在开始读取微博…"
             )
+        target_desc = f"UID {request.uid}" if request.uid else (request.target_url or "")
         self._append_log(
-            f"\n=== WEIBO TEXT ARCHIVER · UID {request.uid} · "
-            f"{request.fetch_range.label()} ===\n"
+            f"\n=== WEIBO TEXT ARCHIVER · {target_desc} · "
+            f"{request.fetch_range.label()}{mode_note} ===\n"
         )
 
         self.worker = threading.Thread(
@@ -2146,6 +2638,12 @@ class App(tk.Tk):
         output_dir = request.output_dir
         fallback_dir = request.fallback_dir
         try:
+            existing_archive: Archive | None = None
+            if request.incremental_cache_path is not None:
+                existing_archive = load_normalized_archive_file(
+                    request.incremental_cache_path
+                )
+
             cookie = load_cookie_header()
 
             def progress(message: str, data=None):
@@ -2157,8 +2655,30 @@ class App(tk.Tk):
                 cancel_event=cancel,
                 progress=progress,
             )
+            target_uid = request.uid
+            if not target_uid and request.target_url:
+                target_uid, resolved_name = client.resolve_profile_url(request.target_url)
+                self._worker_log(
+                    generation,
+                    f"已从主页链接识别账号：{resolved_name} (UID {target_uid})"
+                    if resolved_name
+                    else f"已从主页链接识别 UID：{target_uid}",
+                )
+                self._emit(generation, "resolved_uid", target_uid)
+                if cancel.is_set():
+                    raise Cancelled("任务已取消。")
+
+            if (
+                existing_archive is not None
+                and existing_archive.profile.id != target_uid
+            ):
+                raise OfflineArchiveError(
+                    f"增量更新账号不一致：缓存为 {existing_archive.profile.id}，"
+                    f"目标为 {target_uid}。"
+                )
+
             try:
-                archive = client.fetch(request.uid, request.fetch_range)
+                fetched_archive = client.fetch(target_uid, request.fetch_range)
             finally:
                 # Timing and restriction counters matter most when the fetch failed.
                 performance = getattr(client, "performance", None)
@@ -2168,11 +2688,22 @@ class App(tk.Tk):
             if cancel.is_set():
                 raise Cancelled("任务已取消。")
 
+            if existing_archive is not None:
+                archive = merge_incremental_archives(existing_archive, fetched_archive)
+                self._worker_log(
+                    generation,
+                    f"增量拉取完成（新扫 {len(fetched_archive.posts):,} 条）；"
+                    f"已与本地缓存合并，共 {len(archive.posts):,} 条微博。",
+                )
+            else:
+                archive = fetched_archive
+
             self._emit(generation, "phase_export", None)
             try:
                 save_normalized_archive(archive)
             except OSError as exc:
-                # The cache is never read back; losing it must not cost the export.
+                # The cache is never read back automatically without user intent;
+                # losing it must not cost the export.
                 self._worker_log(
                     generation,
                     f"本机规范化缓存未能保存，不影响 Markdown 导出：{exc}",
@@ -2184,124 +2715,18 @@ class App(tk.Tk):
                 if cancel.is_set():
                     raise Cancelled("任务已取消。")
 
-            outputs = []
-            failures = []
-            for selection in request.export_selections:
-                if cancel.is_set():
-                    raise Cancelled("任务已取消。")
-
-                render_archive = archive
-                filter_report: CustomFilterReport | None = None
-                visibility_report = None
-                selection_notice = None
-                if selection.preset is ExportPreset.AI_COMPACT:
-                    render_archive, visibility_report = filter_archive_visibility(
-                        archive,
-                        selection.visibility_states,
-                    )
-                elif selection.preset is ExportPreset.CUSTOM:
-                    render_archive, filter_report = filter_archive(
-                        archive,
-                        selection.custom_filter,
-                    )
-                    selection_notice = filter_report_notice(
-                        filter_report,
-                        english=selection.options.layout is ExportLayout.AI,
-                    )
-
-                def write_selection(target_dir: Path):
-                    return export_markdown(
-                        render_archive,
-                        target_dir,
-                        selection.options,
-                        selection.filename_suffix,
-                        before_commit=before_commit,
-                        selection_notice=selection_notice,
-                        visibility_scope=visibility_scope_text(
-                            selection.visibility_states
-                        ),
-                        unknown_visibility_excluded_count=(
-                            visibility_report.unknown_excluded_count
-                            if visibility_report is not None
-                            else filter_report.unknown_visibility_count
-                            if filter_report is not None
-                            else 0
-                        ),
-                    )
-
-                try:
-                    try:
-                        output_path, stats = write_selection(output_dir)
-                    except PermissionError:
-                        if fallback_dir is None:
-                            raise
-                        output_dir = prepare_output_dir(fallback_dir)
-                        fallback_dir = None
-                        self._worker_log(
-                            generation,
-                            f"应用目录不可写，改用备用保存位置：{output_dir}",
-                        )
-                        output_path, stats = write_selection(output_dir)
-                except Cancelled:
-                    raise
-                except Exception as exc:
-                    safe_error = redact_text(exc)
-                    failures.append(
-                        {
-                            "label": selection.label,
-                            "error": safe_error,
-                        }
-                    )
-                    self._worker_log(
-                        generation,
-                        f"{selection.label} 本地输出失败：{safe_error}",
-                    )
-                    continue
-
-                fallback_dir = None
-
-                outputs.append(
-                    {
-                        "label": selection.label,
-                        "path": output_path,
-                        "options": selection.options,
-                        "stats": stats,
-                        "filter_report": filter_report,
-                        "visibility_report": visibility_report,
-                        # Lets the completion window write a smaller AI file
-                        # from this same snapshot without fetching again.
-                        "variant_source": (
-                            {
-                                "archive": render_archive,
-                                "filename_suffix": selection.filename_suffix,
-                                "selection_notice": selection_notice,
-                                "visibility_scope": visibility_scope_text(
-                                    selection.visibility_states
-                                ),
-                                "unknown_visibility_excluded_count": (
-                                    visibility_report.unknown_excluded_count
-                                    if visibility_report is not None
-                                    else filter_report.unknown_visibility_count
-                                    if filter_report is not None
-                                    else 0
-                                ),
-                            }
-                            if selection.options.layout is ExportLayout.AI
-                            else None
-                        ),
-                    }
-                )
-                self._worker_log(
-                    generation,
-                    f"已生成 {selection.label}：{output_path.name}",
-                )
-
-            if not outputs:
-                failed_labels = "、".join(item["label"] for item in failures)
-                raise RuntimeError(f"所有本地输出均失败：{failed_labels}")
+            outputs, failures, output_dir = render_export_selections(
+                archive,
+                request.export_selections,
+                output_dir,
+                fallback_dir,
+                before_commit=before_commit,
+                log_fn=lambda msg: self._worker_log(generation, msg),
+            )
 
             report = archive.report
             summary = {
+                "archive": archive,
                 "profile": archive.profile,
                 "report": report,
                 "integrity": archive.integrity,
@@ -2497,25 +2922,38 @@ class App(tk.Tk):
             for output in outputs
             if output.get("variant_source") and "estimated_tokens" in output["stats"]
         ]
-        if variant_outputs:
+        archive_obj = result.get("archive")
+        if variant_outputs or archive_obj is not None:
             smaller = ttk.Frame(body)
             smaller.pack(fill="x", pady=(14, 0))
-            variant_arg = (
-                variant_outputs[0]
-                if len(variant_outputs) == 1
-                else variant_outputs
-            )
-            ttk.Button(
-                smaller,
-                text="生成更小的 AI 版…",
-                style="Quiet.TButton",
-                command=lambda: self._open_ai_variant_dialog(win, variant_arg),
-            ).pack(side="left")
-            ttk.Label(
-                smaller,
-                text="文件太大、模型读不完时使用；不会重新联网。",
-                style="Muted.TLabel",
-            ).pack(side="left", padx=(10, 0))
+            if variant_outputs:
+                variant_arg = (
+                    variant_outputs[0]
+                    if len(variant_outputs) == 1
+                    else variant_outputs
+                )
+                ttk.Button(
+                    smaller,
+                    text="生成更小的 AI 版…",
+                    style="Quiet.TButton",
+                    command=lambda: self._open_ai_variant_dialog(win, variant_arg),
+                ).pack(side="left", padx=(0, 8))
+            if archive_obj is not None:
+                default_bundle_dir = result.get("output_dir") or outputs[0]["path"].parent
+                ttk.Button(
+                    smaller,
+                    text="导出 JSON / HTML 图文版…",
+                    style="Quiet.TButton",
+                    command=lambda: self._open_bundle_export_dialog(
+                        win, archive_obj, default_output_dir=default_bundle_dir
+                    ),
+                ).pack(side="left")
+            if variant_outputs:
+                ttk.Label(
+                    smaller,
+                    text="均直接基于本次抓取结果生成，不会重新联网。",
+                    style="Muted.TLabel",
+                ).pack(side="left", padx=(10, 0))
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(18, 0))
@@ -2618,9 +3056,11 @@ class App(tk.Tk):
             choices.append(button)
 
         part_var = tk.StringVar(value="none")
+        custom_part_var = tk.StringVar(value="80000")
         ttk.Label(body, text="拆分成多个文件", style="Section.TLabel").pack(
             anchor="w", pady=(14, 0)
         )
+        part_choices = []
         for value, text in (
             ("none", "不拆分"),
             ("200000", "每个文件约 20 万字符"),
@@ -2630,6 +3070,26 @@ class App(tk.Tk):
             button = ttk.Radiobutton(body, text=text, variable=part_var, value=value)
             button.pack(anchor="w", pady=(3, 0))
             choices.append(button)
+            part_choices.append(button)
+        custom_part_row = ttk.Frame(body)
+        custom_part_row.pack(anchor="w", pady=(3, 0))
+        custom_part_radio = ttk.Radiobutton(
+            custom_part_row,
+            text="自定义字符上限",
+            variable=part_var,
+            value="custom",
+        )
+        custom_part_radio.pack(side="left")
+        choices.append(custom_part_radio)
+        part_choices.append(custom_part_radio)
+        custom_part_entry = ttk.Entry(
+            custom_part_row,
+            textvariable=custom_part_var,
+            width=10,
+            state="disabled",
+        )
+        custom_part_entry.pack(side="left", padx=(8, 4))
+        ttk.Label(custom_part_row, text="字/卷").pack(side="left")
         ttk.Label(
             body,
             text=(
@@ -2655,6 +3115,23 @@ class App(tk.Tk):
         cancel = threading.Event()
         running = False
         poll_id = None
+        latest_generated_paths: list[Path] = []
+
+        def sync_custom_part_state(*_args):
+            if not running and part_var.get() == "custom":
+                custom_part_entry.configure(state="normal")
+            else:
+                custom_part_entry.configure(state="disabled")
+
+        for btn in part_choices:
+            btn.configure(command=sync_custom_part_state)
+        custom_part_entry.bind(
+            "<Button-1>",
+            lambda _event: (part_var.set("custom"), sync_custom_part_state())
+            if not running
+            else None,
+            add="+",
+        )
 
         def check_cancelled():
             if cancel.is_set():
@@ -2682,11 +3159,22 @@ class App(tk.Tk):
             running = False
             for button in [generate_btn, *choices]:
                 button.configure(state="normal")
+            sync_custom_part_state()
             if kind == "error":
+                latest_generated_paths.clear()
                 result_var.set("生成失败；如已有部分文件生成，将保留在归档文件夹。")
                 messagebox.showerror("生成失败", payload, parent=win)
+                open_file_btn.configure(text="打开文件", state="disabled")
             else:
+                latest_generated_paths[:] = [path for path, _ in payload]
                 result_var.set("已生成：\n" + ai_variant_summary(payload))
+                if latest_generated_paths:
+                    open_file_btn.configure(
+                        text="打开第 1 卷" if len(latest_generated_paths) > 1 else "打开文件",
+                        state="normal",
+                    )
+                else:
+                    open_file_btn.configure(text="打开文件", state="disabled")
             open_btn.configure(state="normal")
             self._center_child_window(win)
 
@@ -2695,7 +3183,20 @@ class App(tk.Tk):
             if running:
                 return
             limit = None if limit_var.get() == "full" else int(limit_var.get())
-            part_chars = None if part_var.get() == "none" else int(part_var.get())
+            if part_var.get() == "none":
+                part_chars = None
+            elif part_var.get() == "custom":
+                raw_part = custom_part_var.get().strip()
+                if not raw_part.isdigit() or int(raw_part) < 2000:
+                    messagebox.showwarning(
+                        "拆分数设置有误",
+                        "请输入不少于 2000 的整数字符上限。",
+                        parent=win,
+                    )
+                    return
+                part_chars = int(raw_part)
+            else:
+                part_chars = int(part_var.get())
             if limit is None and part_chars is None:
                 messagebox.showinfo(
                     "无需生成",
@@ -2704,8 +3205,10 @@ class App(tk.Tk):
                 )
                 return
             running = True
-            for button in [generate_btn, open_btn, *choices]:
+            latest_generated_paths.clear()
+            for button in [generate_btn, open_btn, open_file_btn, *choices]:
                 button.configure(state="disabled")
+            sync_custom_part_state()
             result_var.set("正在生成…关闭此窗口可停止后续生成，已生成文件会保留。")
 
             target_output = current_output
@@ -2752,16 +3255,553 @@ class App(tk.Tk):
             style="Quiet.TButton",
             command=win.destroy,
         ).pack(side="right", padx=(0, 8))
+        def open_output_dir():
+            ok, error = launch_with_system(current_output["path"].parent)
+            if not ok:
+                messagebox.showerror("无法打开", error, parent=win)
+
+        def open_first_file():
+            if not latest_generated_paths:
+                return
+            ok, error = launch_with_system(latest_generated_paths[0])
+            if not ok:
+                messagebox.showerror("无法打开", error, parent=win)
+
         open_btn = ttk.Button(
             actions,
             text="打开归档文件夹",
             style="Quiet.TButton",
             state="disabled",
-            command=lambda: launch_with_system(current_output["path"].parent),
+            command=open_output_dir,
         )
         open_btn.pack(side="left")
+        open_file_btn = ttk.Button(
+            actions,
+            text="打开文件",
+            style="Quiet.TButton",
+            state="disabled",
+            command=open_first_file,
+        )
+        open_file_btn.pack(side="left", padx=(8, 0))
         win.bind("<Escape>", lambda _event: win.destroy(), add="+")
         self._center_child_window(win)
+
+    def _build_offline_variant_output(
+        self,
+        archive: Archive,
+        output_dir: Path,
+    ) -> dict:
+        vis = AIVisibilityOptions(
+            include_followers=self.ai_followers_var.get(),
+            include_friends=self.ai_friends_var.get(),
+            include_private=self.ai_private_var.get(),
+        )
+        visibility_states = vis.included_states
+        filtered_archive, vis_report = filter_archive_visibility(
+            archive, visibility_states
+        )
+        ai_options = ExportOptions(layout=ExportLayout.AI)
+        text, _username, stats = render_ai_markdown(filtered_archive, ai_options)
+        summary_stats = dict(stats)
+        summary_stats.setdefault("output_chars", len(text))
+        summary_stats.setdefault("estimated_tokens", estimate_tokens(text))
+        summary_stats["count"] = len(filtered_archive.posts)
+        return {
+            "label": "AI 分析版（缓存）",
+            "path": output_dir / f"{archive.profile.id}.md",
+            "options": ai_options,
+            "stats": summary_stats,
+            "variant_source": {
+                "archive": filtered_archive,
+                "filename_suffix": "AI分析版",
+                "selection_notice": None,
+                "visibility_scope": visibility_scope_text(visibility_states),
+                "unknown_visibility_excluded_count": vis_report.unknown_excluded_count,
+            },
+        }
+
+    def _open_bundle_export_dialog(
+        self,
+        parent,
+        archive: Archive,
+        *,
+        default_output_dir: Path | None = None,
+    ) -> None:
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.title("导出 JSON / HTML 图文版")
+        win.transient(parent)
+        win.resizable(False, False)
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(
+            body,
+            text=f"{archive.profile.screen_name} · UID {archive.profile.id} · {len(archive.posts):,} 条微博",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(anchor="w")
+
+        initial_out = (
+            default_output_dir
+            or Path(self.output_var.get().strip() or self.default_output_dir).expanduser()
+        )
+        json_var = tk.BooleanVar(value=True)
+        html_var = tk.BooleanVar(value=True)
+        out_dir_var = tk.StringVar(value=str(initial_out))
+        img_dir_var = tk.StringVar(value="")
+        img_status_var = tk.StringVar()
+        result_var = tk.StringVar(value="")
+        latest_files: list[Path] = []
+
+        ttk.Checkbutton(
+            body,
+            text="导出结构化 JSON 备份 (.json)",
+            variable=json_var,
+        ).pack(anchor="w", pady=(10, 0))
+        ttk.Checkbutton(
+            body,
+            text="导出离线 HTML 图文浏览版 (.html，支持本地搜索/过滤与大图预览)",
+            variable=html_var,
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Label(body, text="保存位置", style="Section.TLabel").pack(
+            anchor="w", pady=(12, 0)
+        )
+        out_row = ttk.Frame(body)
+        out_row.pack(fill="x", pady=(4, 0))
+        ttk.Entry(out_row, textvariable=out_dir_var, width=48).pack(
+            side="left", fill="x", expand=True
+        )
+
+        def browse_out():
+            chosen = filedialog.askdirectory(
+                parent=win,
+                initialdir=out_dir_var.get().strip() or str(initial_out),
+            )
+            if chosen:
+                out_dir_var.set(chosen)
+
+        ttk.Button(
+            out_row, text="浏览…", style="Quiet.TButton", command=browse_out
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(
+            body,
+            text="本地图片目录（留空则自动查找保存位置下的 WeiboImages_<UID>）",
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(12, 0))
+        img_row = ttk.Frame(body)
+        img_row.pack(fill="x", pady=(4, 0))
+        ttk.Entry(img_row, textvariable=img_dir_var, width=48).pack(
+            side="left", fill="x", expand=True
+        )
+
+        def browse_img():
+            chosen = filedialog.askdirectory(
+                parent=win,
+                initialdir=out_dir_var.get().strip() or str(initial_out),
+            )
+            if chosen:
+                img_dir_var.set(chosen)
+
+        ttk.Button(
+            img_row, text="浏览…", style="Quiet.TButton", command=browse_img
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(
+            body,
+            textvariable=img_status_var,
+            style="Muted.TLabel",
+            wraplength=480,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        def refresh_image_status(*_args):
+            custom_img = img_dir_var.get().strip()
+            base_out = Path(out_dir_var.get().strip() or initial_out).expanduser()
+            candidate = (
+                Path(custom_img).expanduser()
+                if custom_img
+                else base_out / f"WeiboImages_{archive.profile.id}"
+            )
+            if (candidate / "manifest.json").is_file():
+                img_status_var.set(f"● 已检测到本地图片清单：{candidate}")
+            else:
+                img_status_var.set(
+                    f"○ 未在 {candidate} 找到图片清单；HTML 仍可正常导出（仅显示文字与图片占位）。"
+                )
+
+        out_dir_var.trace_add("write", refresh_image_status)
+        img_dir_var.trace_add("write", refresh_image_status)
+        refresh_image_status()
+
+        ttk.Label(
+            body,
+            textvariable=result_var,
+            wraplength=480,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(14, 0))
+
+        def open_first():
+            if latest_files:
+                ok, error = launch_with_system(latest_files[0])
+                if not ok:
+                    messagebox.showerror("无法打开", error, parent=win)
+
+        open_btn = ttk.Button(
+            actions,
+            text="打开文件",
+            style="Quiet.TButton",
+            state="disabled",
+            command=open_first,
+        )
+        open_btn.pack(side="left")
+
+        def run_bundle_export():
+            if not json_var.get() and not html_var.get():
+                messagebox.showwarning(
+                    "请选择格式", "请至少勾选 JSON 或 HTML 中的一种格式。", parent=win
+                )
+                return
+            requested_dir = Path(
+                out_dir_var.get().strip() or initial_out
+            ).expanduser()
+            try:
+                target_dir = prepare_output_dir(requested_dir)
+            except OSError as exc:
+                messagebox.showerror("保存位置不可用", str(exc), parent=win)
+                return
+
+            generated: list[Path] = []
+            notes: list[str] = []
+            try:
+                if html_var.get():
+                    custom_img = img_dir_var.get().strip()
+                    img_root = Path(custom_img).expanduser() if custom_img else None
+                    html_path, html_stats = export_offline_html(
+                        archive, target_dir, image_root=img_root
+                    )
+                    generated.append(html_path)
+                    notes.append(
+                        f"HTML 图文版：{html_path.name}（已关联本地图片 {html_stats['linked_images']} 张）"
+                    )
+                if json_var.get():
+                    json_path, _json_stats = export_portable_json(archive, target_dir)
+                    generated.append(json_path)
+                    notes.append(f"结构化 JSON：{json_path.name}")
+            except Exception as exc:
+                messagebox.showerror("导出失败", redact_text(exc), parent=win)
+                return
+
+            latest_files[:] = generated
+            open_btn.configure(state="normal")
+            result_var.set("已生成：\n" + "\n".join(notes))
+            self._center_child_window(win)
+
+        ttk.Button(
+            actions, text="开始导出", style="Primary.TButton", command=run_bundle_export
+        ).pack(side="right")
+        ttk.Button(
+            actions, text="关闭", style="Quiet.TButton", command=win.destroy
+        ).pack(side="right", padx=(0, 8))
+
+        win.bind("<Escape>", lambda _event: win.destroy(), add="+")
+        self._center_child_window(win)
+        win.grab_set()
+
+    def _open_offline_tools_dialog(self) -> None:
+        win = tk.Toplevel(self)
+        win.withdraw()
+        win.title("本地缓存管理与图文导出")
+        win.transient(self)
+        win.resizable(True, True)
+        win.minsize(self._px(680), self._px(440))
+
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+
+        header = ttk.Frame(body)
+        header.pack(fill="x")
+        ttk.Label(
+            header,
+            text="本机已保存的 Schema-5 归档快照",
+            font=("Microsoft YaHei UI", 12, "bold"),
+        ).pack(side="left")
+
+        list_frame = ttk.Frame(body)
+        list_frame.pack(fill="both", expand=True, pady=(8, 0))
+        tree = ttk.Treeview(
+            list_frame,
+            columns=("uid", "name", "count", "time", "range"),
+            show="headings",
+            selectmode="browse",
+            height=6,
+        )
+        for col, title, width in (
+            ("uid", "UID", 110),
+            ("name", "昵称", 150),
+            ("count", "微博数", 70),
+            ("time", "快照时间", 145),
+            ("range", "抓取范围", 130),
+        ):
+            tree.heading(col, text=title)
+            tree.column(col, width=self._px(width), anchor="w")
+        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        detail_var = tk.StringVar(value="请选择一条本地缓存记录，或浏览外部备份的 last_success.json 文件。")
+        ttk.Label(
+            body,
+            textvariable=detail_var,
+            style="Muted.TLabel",
+            wraplength=640,
+            justify="left",
+        ).pack(anchor="w", pady=(10, 0))
+
+        path_by_iid: dict[str, Path] = {}
+        loaded_by_path: dict[Path, Archive] = {}
+
+        def populate_rows(extra_paths: list[Path] | None = None):
+            tree.delete(*tree.get_children())
+            path_by_iid.clear()
+            rows = list_cached_archives()
+            seen = {item.path.resolve() for item in rows}
+            for item in rows:
+                iid = tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item.uid,
+                        item.screen_name,
+                        f"{item.post_count:,}",
+                        f"{item.fetched_at:%Y-%m-%d %H:%M}",
+                        item.fetch_range_label,
+                    ),
+                )
+                path_by_iid[iid] = item.path
+            for custom in extra_paths or []:
+                resolved = custom.resolve()
+                if resolved in seen:
+                    continue
+                arch = loaded_by_path.get(custom)
+                if arch is None:
+                    continue
+                seen.add(resolved)
+                iid = tree.insert(
+                    "",
+                    0,
+                    values=(
+                        arch.profile.id,
+                        arch.profile.screen_name,
+                        f"{len(arch.posts):,}",
+                        f"{arch.fetched_at:%Y-%m-%d %H:%M}",
+                        arch.fetch_range.label(),
+                    ),
+                )
+                path_by_iid[iid] = custom
+            children = tree.get_children()
+            if children:
+                tree.selection_set(children[0])
+                tree.focus(children[0])
+                on_select()
+
+        def current_selection() -> tuple[Path, Archive] | None:
+            selected = tree.selection()
+            if not selected:
+                return None
+            cache_path = path_by_iid.get(selected[0])
+            if cache_path is None:
+                return None
+            arch = loaded_by_path.get(cache_path)
+            if arch is None:
+                try:
+                    arch = load_normalized_archive_file(cache_path)
+                except OfflineArchiveError as exc:
+                    messagebox.showerror("缓存读取失败", str(exc), parent=win)
+                    return None
+                loaded_by_path[cache_path] = arch
+            return cache_path, arch
+
+        def on_select(_event=None):
+            pair = current_selection()
+            if pair is None:
+                return
+            cache_path, arch = pair
+            since_hint = incremental_since_date(arch)
+            integrity = arch.integrity
+            detail_var.set(
+                f"当前选中：{arch.profile.screen_name} (UID {arch.profile.id}) · "
+                f"共 {len(arch.posts):,} 条（完整 {integrity.complete_records:,}，"
+                f"不完整 {integrity.incomplete_records:,}）· "
+                f"建议增量起始日：{since_hint:%Y-%m-%d}\n"
+                f"缓存路径：{cache_path}"
+            )
+
+        tree.bind("<<TreeviewSelect>>", on_select, add="+")
+
+        extra_loaded_paths: list[Path] = []
+
+        def browse_external_json():
+            chosen = filedialog.askopenfilename(
+                parent=win,
+                title="选择缓存 JSON 文件",
+                filetypes=[("Schema-5 归档 JSON", "*.json"), ("所有文件", "*.*")],
+            )
+            if not chosen:
+                return
+            candidate = Path(chosen)
+            try:
+                arch = load_normalized_archive_file(candidate)
+            except OfflineArchiveError as exc:
+                messagebox.showerror("无法打开缓存", str(exc), parent=win)
+                return
+            loaded_by_path[candidate] = arch
+            extra_loaded_paths.append(candidate)
+            populate_rows(extra_loaded_paths)
+
+        ttk.Button(
+            header,
+            text="浏览本地缓存 JSON…",
+            style="Quiet.TButton",
+            command=browse_external_json,
+        ).pack(side="right")
+
+        def reexport_markdown():
+            pair = current_selection()
+            if pair is None:
+                messagebox.showinfo("未选择缓存", "请先选择一条缓存记录。", parent=win)
+                return
+            _path, arch = pair
+            try:
+                selections = self._selected_export_selections()
+            except ValueError as exc:
+                messagebox.showwarning("导出设置有误", str(exc), parent=win)
+                return
+            prepared = self._prepare_target_output_dir(parent=win)
+            if prepared is None:
+                return
+            out_dir, fallback_dir = prepared
+            try:
+                outputs, failures, final_dir = render_export_selections(
+                    arch,
+                    selections,
+                    out_dir,
+                    fallback_dir,
+                    log_fn=self._append_log,
+                )
+            except Exception as exc:
+                messagebox.showerror("重新导出失败", redact_text(exc), parent=win)
+                return
+            summary = {
+                "archive": arch,
+                "profile": arch.profile,
+                "report": arch.report,
+                "integrity": arch.integrity,
+                "count": len(arch.posts),
+                "outputs": outputs,
+                "failures": failures,
+                "output_dir": final_dir,
+            }
+            self._show_completion(summary)
+
+        def open_variant():
+            pair = current_selection()
+            if pair is None:
+                messagebox.showinfo("未选择缓存", "请先选择一条缓存记录。", parent=win)
+                return
+            _path, arch = pair
+            prepared = self._prepare_target_output_dir(parent=win)
+            if prepared is None:
+                return
+            out_dir, _ = prepared
+            variant_out = self._build_offline_variant_output(arch, out_dir)
+            self._open_ai_variant_dialog(win, variant_out)
+
+        def open_bundle():
+            pair = current_selection()
+            if pair is None:
+                messagebox.showinfo("未选择缓存", "请先选择一条缓存记录。", parent=win)
+                return
+            _path, arch = pair
+            prepared = self._prepare_target_output_dir(parent=win)
+            if prepared is None:
+                return
+            out_dir, _ = prepared
+            self._open_bundle_export_dialog(win, arch, default_output_dir=out_dir)
+
+        def launch_incremental():
+            pair = current_selection()
+            if pair is None:
+                messagebox.showinfo("未选择缓存", "请先选择一条缓存记录。", parent=win)
+                return
+            if image_task_active(self) or self.tasks.state not in (
+                TaskState.IDLE,
+                TaskState.READY,
+                TaskState.CANCELLED,
+            ):
+                messagebox.showinfo("任务正在运行", "当前有其他任务正在运行，请等待完成。", parent=win)
+                return
+            if not has_saved_login():
+                messagebox.showwarning("需要登录", "增量抓取需要微博登录凭据，请先扫码登录。", parent=win)
+                return
+            cache_path, arch = pair
+            since_date = incremental_since_date(arch)
+            if not messagebox.askyesno(
+                "确认增量更新",
+                f"将从 {since_date:%Y-%m-%d} 起抓取 {arch.profile.screen_name} (UID {arch.profile.id}) "
+                "的最新微博（含 1 天重叠窗口防漏抓），并与当前缓存合并去重。\n\n确定开始吗？",
+                parent=win,
+            ):
+                return
+            try:
+                selections = self._selected_export_selections()
+            except ValueError as exc:
+                messagebox.showwarning("导出设置有误", str(exc), parent=win)
+                return
+            prepared = self._prepare_target_output_dir(parent=win)
+            if prepared is None:
+                return
+            out_dir, fallback_dir = prepared
+            self._save_preferences()
+            request = ExportRequest(
+                uid=arch.profile.id,
+                fetch_range=FetchRange.since_date(since_date),
+                output_dir=out_dir,
+                export_selections=selections,
+                fallback_dir=fallback_dir,
+                incremental_cache_path=cache_path,
+            )
+            win.destroy()
+            self._launch_export_request(request)
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(14, 0))
+        ttk.Button(
+            actions, text="重导 Markdown", style="Quiet.TButton", command=reexport_markdown
+        ).pack(side="left")
+        ttk.Button(
+            actions, text="AI 分卷 / 精简版…", style="Quiet.TButton", command=open_variant
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            actions, text="JSON / HTML 图文版…", style="Quiet.TButton", command=open_bundle
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            actions, text="增量更新 →", style="Primary.TButton", command=launch_incremental
+        ).pack(side="right")
+        ttk.Button(
+            actions, text="关闭", style="Quiet.TButton", command=win.destroy
+        ).pack(side="right", padx=(0, 8))
+
+        populate_rows()
+        win.bind("<Escape>", lambda _event: win.destroy(), add="+")
+        self._center_child_window(win)
+        win.grab_set()
 
     def _on_close(self):
         if image_task_active(self):
@@ -2778,6 +3818,7 @@ class App(tk.Tk):
             ):
                 return
             self.tasks.cancel()
+        self._save_preferences()
         self.destroy()
 
     def destroy(self):

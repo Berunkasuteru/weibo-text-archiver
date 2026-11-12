@@ -1,13 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
+
+- **Signed-In Account Detection & Vanity URL Resolution** — Added `填入我的账号` (`identify_logged_in_account`) to query the authenticated UID and display name on demand and after QR login, plus worker-side `resolve_profile_url` support for `/n/<nickname>` and custom Weibo profile domain links. Expanded URL/UID parsing (`extract_uid` and `is_obvious_single_post_url`) for `/p/100505<uid>`, `/profile/<uid>`, `/<uid>`, `/<uid>/<tab>`, while rejecting `100808` super-topic IDs and single-post URLs cleanly.
+- **Offline Schema-5 Cache Management & Incremental Merge (`离线缓存…`)** — Added read/merge workflows (`weibo_archive.offline_archive`) over local `last_success.json` snapshots without altering the write-only Schema-5 writer (`storage.py`): inspect cached accounts or browse external cache files, re-export Markdown or smaller/split AI volumes completely offline, and launch overlapping-window (`since - 1 day`) incremental updates that deduplicate and preserve complete bodies.
+- **Structured JSON & Image-Linked Offline HTML Viewer** — Export normalized, credential-free portable JSON backups (`*_结构化备份.json`) and zero-external-request HTML viewers (`*_图文浏览版.html`) featuring search, type filters, chronological sorting, pagination, lightbox preview, strict HTML/script escaping, and read-only local image matching from verified `WeiboImages_<UID>/manifest.json` entries.
+- **UI Preferences Persistence & Custom Settings Polish** — Persist non-sensitive UI preferences (output directory, range mode/count/since date, output selections, custom filter/options, and AI visibility toggles) atomically in `settings.json` with zero cookies/UIDs, and wrap `_open_custom_settings` in a scrollable canvas so smaller screens never clip action buttons.
+- **AI Export Speed, Budget Control & Parser Accuracy** — Added an in-run render cache in `export_ai_variant`, custom character budget input (`>= 2000`) plus direct one-click open actions in the smaller AI dialog, aligned `WEIBO_AI_2` `LOCATIONS` date windows and sorting with `_calendar_time`, and expanded `_PLATFORM_TOMBSTONE_NOTICES` for nested platform-deleted posts.
+- **Image Backup Resilience** — Increased timeline pagination retries (`retries=3`) with periodic pacing delays, added bounded opt-in transient retries in the UI download flow for network/timeout/429/5xx errors without retrying deterministic 403s, and enabled default output-directory fallback resolution on launch.
+
+## 0.8.0
 
 - Share the target UID/URL, output directory, and since-date parameters seamlessly between the main window and the Image Backup window, and normalize pasted Weibo profile URLs to UIDs when starting an image backup.
 - Show an in-place retry action in the QR login dialog when a QR code expires instead of closing the dialog abruptly.
-- Add an explicit output file selector in the post-export completion dialog when multiple Markdown outputs are generated in a single run.
+- Add per-output open actions in the post-export completion dialog and an explicit source selector in the smaller/split AI dialog when multiple outputs are generated in a single run.
 - Add keyboard shortcuts (`Return` to start, `Escape` to cancel or close dialogs), click-to-activate range inputs, keyboard-accessible update notice links, and focus-follow scrolling in the main settings canvas.
 - Harden Windows filename sanitization (`safe_filename`) against control characters, excessive length, and reserved Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`).
 - Avoid import-time filesystem creation side effects in `weibo_archive.paths`, use `tempfile.mkstemp` for normalized cache writes, cache cookie redaction reads by file `mtime`/`size`, and throttle image manifest `stat()` checks during rapid progress callbacks.
+- Fix double HTML entity decoding of post text, which rewrote literal entity text and turned escaped markup into live HTML tags in exported Markdown.
+- Stop the Weibo location icon from swallowing the following body text when a block-level tag separates them; inline wrappers such as the check-in link still resolve to the location.
+- Flush and `fsync` exported Markdown before the atomic rename, and bound the `_2`, `_3`, ... collision suffixes instead of retrying them indefinitely.
+- Keep value-based redaction working after DPAPI migration retires the plaintext `cookie.txt`, overwrite that file before deleting it, treat `PermissionError` on verification as unretired, and warn in the log when it cannot be retired.
+- Cap `HttpClient` and passport response sizes, stop retrying deterministic 4xx responses, and apply the Weibo/Sina-only redirect allowlist to the QR login flow.
+- Record `last_error.txt` diagnostics for unexpected image-backup failures, report failures from the archive-folder button and the update notice link, and cap the main log widget at 2000 lines.
 
 ## 0.7.0
 

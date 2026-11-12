@@ -3,15 +3,27 @@ from __future__ import annotations
 import http.client
 import http.cookiejar
 import json
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+if not getattr(sys, "frozen", False):
+    _VENDOR_DIR = str(Path(__file__).resolve().parents[1] / "vendor")
+    if _VENDOR_DIR not in sys.path:
+        sys.path.insert(0, _VENDOR_DIR)
 
 import qrcode
 
-from .network import USER_AGENT, Cancelled
+from .network import (
+    USER_AGENT,
+    Cancelled,
+    _redirect_allowed,
+    _WeiboOnlyRedirectHandler,
+)
 
 
 PASSPORT_BASE = "https://passport.weibo.com"
@@ -28,6 +40,9 @@ RETCODE_SUCCESS = 20000000
 RETCODE_NOT_SCANNED = 50114001
 RETCODE_SCANNED = 50114002
 RETCODE_EXPIRED = 50114004
+
+# Passport responses are small JSON documents; anything larger is not a login.
+_MAX_PASSPORT_BYTES = 1024 * 1024
 
 
 class QrCodeExpired(TimeoutError):
@@ -47,7 +62,11 @@ PASSPORT_HEADERS = {
 
 def _make_opener():
     jar = http.cookiejar.CookieJar()
-    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(jar),
+        # Login tickets ride in the URL, so a 3xx may only stay on Weibo/Sina.
+        _WeiboOnlyRedirectHandler(),
+    )
     return opener, jar
 
 
@@ -65,8 +84,10 @@ def _request(opener, url, params=None, headers=None, timeout=30):
 
 def _request_json(opener, url, params=None, headers=None, timeout=30):
     with _request(opener, url, params, headers, timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-    return json.loads(raw)
+        body = resp.read(_MAX_PASSPORT_BYTES + 1)
+    if len(body) > _MAX_PASSPORT_BYTES:
+        raise RuntimeError("微博登录返回的数据超过大小上限，登录已停止。")
+    return json.loads(body.decode("utf-8", errors="replace"))
 
 
 def _cookie_value(jar, name):
@@ -201,8 +222,10 @@ def poll_qr_login(
             if cross_url:
                 if cross_url.startswith("//"):
                     cross_url = "https:" + cross_url
-                if urllib.parse.urlsplit(cross_url).scheme != "https":
-                    raise RuntimeError("微博登录返回了非 HTTPS 的跳转地址，登录已停止。")
+                if not _redirect_allowed(cross_url):
+                    raise RuntimeError(
+                        "微博登录返回了无法安全跟随的跳转地址，登录已停止。"
+                    )
                 try:
                     with _request(opener, cross_url, headers={"User-Agent": USER_AGENT}) as resp:
                         resp.read(1024)

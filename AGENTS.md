@@ -1,52 +1,52 @@
-# 项目工作规则
+# Project Working Rules
 
-适用于在本仓库工作的 Codex、Claude Code 等代理。回复使用中文。
+Applies to coding agents (Codex, Claude Code, etc.) working in this repository. Reply in Chinese.
 
-## 工作范围与质量
+## Scope and Quality
 
-- 做能完整解决当前请求的最小改动，遵循现有风格；不要顺带增加功能、抽象、配置或文件。
-- 一次性脚本在真实输入上运行并核对输出即可，不额外建立测试套件、fixture 或重建流程。
-- 仅对会复用且失败可能静默的逻辑增加必要的永久测试；优先一个有意义的检查。
-- 不重复运行已通过且覆盖内容没有变化的检查。
-- 未经要求，不生成报告、README、清单、哈希记录或备份副本。
-- 使用标准库及已安装依赖；新增依赖先征求同意。
-- 结果有实质歧义时先问一个问题；否则采用明显合理的理解，并说明假设。
-- 删除或覆盖用户没有要求处理的内容前先确认；不相关问题只说明，不顺带修复。
-- 保留输入校验、真实失败路径处理及删除、凭据、资金相关保护；修复根因，不删除或放宽检查来通过测试。
-- 宣称可用前运行适当检查并阅读输出；说明执行了什么、实际返回什么。没运行或未通过的检查必须明确说明。
+- Make the smallest coherent change that resolves the request and follow existing conventions; do not add unrequested features, abstractions, configuration, or files.
+- Run one-off scripts against authorized real inputs and verify their output directly without creating extra test suites, fixtures, or rebuild workflows.
+- Add permanent tests only for reusable logic whose failure could be silent; prefer a single meaningful check.
+- Do not repeat passing checks whose covered code and inputs have not changed.
+- Do not generate extra reports, READMEs, manifests, hash records, or backup copies unless requested.
+- Use the Python standard library and already-installed dependencies; ask before adding a new dependency.
+- Ask one focused question when requirements have a material ambiguity; otherwise apply the obvious reasonable interpretation and state your assumptions.
+- Confirm before deleting or overwriting content outside the requested scope; mention unrelated problems without fixing them incidentally.
+- Preserve input validation, real failure-path handling, and guards around deletion, credentials, and financial/sensitive operations; fix root causes rather than deleting or relaxing checks to pass tests.
+- Run appropriate checks and inspect their output before claiming readiness; report exact commands executed and actual results, and explicitly note any unrun or failing checks.
 
-## Git 身份与 UTC
+## Git Identity and UTC
 
-- 本人的提交和附注标签只使用公开身份：`Berunkasuteru`、`31027379+Berunkasuteru@users.noreply.github.com`。
-- 所有提交的作者时间、提交者时间以及附注标签时间必须为 UTC，Git 原始偏移为 `+0000`。
-- Git 命令的执行环境使用 `TZ=UTC0`。PowerShell 设置 `$env:TZ='UTC0'`；Bash 在命令环境中设置 `TZ=UTC0`。
-- 不假设既有进程已加载 Codex 配置，也不假设 Claude Code 会继承 Codex 配置。每个用于提交、打标签或推送的执行环境都须实际检查。
-- 提交或打标签前运行 `git var GIT_AUTHOR_IDENT` 和 `git var GIT_COMMITTER_IDENT`，核对身份及结尾 `+0000`。若环境中的日期或身份变量覆盖配置，先排查，不制造检查通过的假象。
-- 保持仓库级 `user.useConfigOnly=true`，禁止由系统用户名或主机名猜测 Git 身份。
-- 不未经同意修改 Windows 主时区、系统级环境变量、全局 Git 身份或全局钩子路径。
+- Author commits and annotated tags solely with the public identity: `Berunkasuteru` and `31027379+Berunkasuteru@users.noreply.github.com`.
+- All commit author/committer timestamps and annotated tag timestamps must use UTC with raw Git offset `+0000`.
+- Run Git commands with `TZ=UTC0` (`$env:TZ='UTC0'` in PowerShell; `TZ=UTC0` in Bash).
+- Never assume an existing shell or another agent client inherits environment config; verify the execution environment whenever committing, tagging, or pushing.
+- Before committing or tagging, run `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT` to verify identity and trailing `+0000`. Investigate any environment override rather than faking a pass.
+- Keep repository-level `user.useConfigOnly=true`; do not infer Git identity from the OS username or hostname.
+- Never modify Windows system timezone, system environment variables, global Git identity, or global hook paths without explicit consent.
 
-## 推送与历史保护
+## Push and History Protection
 
-- 在当前正式工作副本操作。非活动副本只供读取，不恢复其推送目标。
-- 不通过旧提交、旧分支或旧标签带入其他历史；需要保留功能时只迁移所需文件改动，再创建新的 UTC 提交。
-- 未获当前任务授权，不推送、合并、发布、强推、重写历史或删除远程仓库、分支、标签及 Release。
-- 推送前检查所有待推送引用可达的提交及附注标签元数据：非 UTC 时间、私人身份信息或读取失败都应阻止推送。
-- 保留本地 `pre-push` 保护，不使用 `--no-verify` 或禁用钩子绕过失败。
-- 钩子和仓库级配置不会随 clone 自动复制。新 clone 必须重新设置身份并安装符合上述规则的钩子；缺失时先处理，不直接推送，也不覆盖其他项目的钩子。
+- Work in this active official working copy; treat inactive copies as read-only and never restore their push targets.
+- Do not pull in unrelated history via legacy commits, branches, or tags; migrate only required file changes and create fresh UTC commits.
+- Never push, merge, publish, force-push, rewrite history, or delete remote repositories, branches, tags, or Releases without authorization for the current task.
+- Before pushing, inspect all reachable commits and annotated tag metadata: block pushing on any non-UTC timestamp, private identity marker, or read failure.
+- Preserve the local `pre-push` hook protection; never bypass failures using `--no-verify` or by disabling hooks.
+- Hooks and repository-level Git config are not copied by `git clone`; new clones must configure identity and install compliant hooks before pushing (and must never overwrite another project's hooks).
 
-## 发布包与公开信息
+## Release Bundles and Public Metadata
 
-- 发布文件和说明不包含私人姓名、私人邮箱、机器用户名、个人目录绝对路径、凭据或未授权的个人资料。
-- ZIP 条目时间统一为 `1980-01-01 00:00:00`。核对本地文件头、中央目录和额外时间字段；内嵌 ZIP 也要检查，不能只比较解压后内容。
-- 每次改变附件字节后重算 SHA256，同步更新 Release 正文；上传后核对 GitHub 返回的附件 digest。
-- 不能假设现有打包脚本会规范文件时间；正式上传前必须验证，涉及后续打包改进时再作最小必要修复。
-- 测试样例和第三方时区数据库中的时间属于功能数据，不因个人身份保护而机械改写或删除。
+- Release files and notes must not contain private names, private emails, machine usernames, personal directory absolute paths, credentials, or unauthorized personal data.
+- Normalize all ZIP entry timestamps to `1980-01-01 00:00:00`. Verify local file headers, central directory headers, and extra timestamp fields — including nested ZIPs — rather than checking unpacked contents alone.
+- Recompute SHA-256 after every byte change to release assets, update release notes accordingly, and verify GitHub's returned asset digest after upload.
+- Do not assume an existing packaging script normalizes all timestamps; verify before upload and make minimal packaging fixes if needed.
+- Historical timestamps in test fixtures and third-party timezone databases are functional data; do not mechanically rewrite or remove them for privacy rules.
 
-## 项目定位
+## Project Context
 
-- 仓库：`https://github.com/Berunkasuteru/weibo-text-archiver`。
-- `main` 是默认主分支，当前最新正式发布标签为 `v0.7.0`（旧 `post-0.6.0-fixes` 分支已归并退役）。工作前核对当前分支与标签状态。
-- 合并主分支、推送远程或发布新版本须有当前任务授权。
-- 现有检查入口：`python tests/run_tests.py`、`python tests/test_image_core.py`、`python tests/test_image_ui.py`。
-- UI 检查需要可用的 Tk 桌面环境。遇到初始化或沙箱问题先排查运行环境，不删除断言或跳过检查来报通过。
-- 不用过去固定的测试数量判断通过；不同分支的测试数量可能不同，读取当前实际结果。
+- Repository: `https://github.com/Berunkasuteru/weibo-text-archiver`.
+- Default branch is `main`, with the latest published release tag currently `v0.9.0` (legacy `post-0.6.0-fixes` was merged and retired). Verify current branch and tags before starting work.
+- Merging to `main`, pushing to remote, or publishing a new release requires authorization for the current task.
+- Test entry points: `python tests/run_tests.py`, `python tests/test_image_core.py`, `python tests/test_image_ui.py`.
+- UI checks require a working Tk desktop environment; troubleshoot initialization or sandbox issues instead of removing assertions or skipping checks.
+- Do not rely on fixed historical test counts; actual counts vary across branches and versions — read the live test output.

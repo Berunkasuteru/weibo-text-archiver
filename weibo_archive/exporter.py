@@ -19,7 +19,7 @@ from .export_options import (
     ExportOptions,
     options_provenance,
 )
-from .models import Archive, ContentState, Post, RangeMode, Termination
+from .models import Archive, ContentState, Post, RangeMode
 
 
 # WEIBO_AI_1 stays renderable for comparison; new exports use WEIBO_AI_2.
@@ -31,6 +31,9 @@ _ALLOWED_FILENAME_SUFFIXES = {
     "自定义_完整",
     "自定义_AI分析",
 }
+
+# Upper bound for the "_2", "_3", ... collision suffixes tried before giving up.
+_MAX_COLLISION_SUFFIX = 50
 
 
 def _post_to_legacy(post: Post) -> dict:
@@ -261,7 +264,7 @@ def _inject_ai_provenance(
 
 
 def render_legacy_markdown(archive: Archive) -> tuple[str, str]:
-    """Keep the accepted Alpha2/V5 renderer baseline directly testable."""
+    """Keep the retained legacy V5/WEIBO_AI_1 renderer baseline testable."""
     data = archive_to_legacy_data(archive)
     uid = archive.profile.id
 
@@ -296,12 +299,14 @@ def _atomic_write_text(
     os.close(fd)
     temp_path = Path(temp_name)
     try:
-        temp_path.write_text(text, encoding="utf-8", newline="\n")
+        with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
         if before_commit is not None:
             before_commit()
         candidate = final_path
-        index = 2
-        while True:
+        for index in range(2, _MAX_COLLISION_SUFFIX + 2):
             try:
                 if os.name == "nt":
                     temp_path.rename(candidate)
@@ -313,7 +318,10 @@ def _atomic_write_text(
                 candidate = final_path.with_name(
                     f"{final_path.stem}_{index}{final_path.suffix}"
                 )
-                index += 1
+        raise RuntimeError(
+            f"无法为导出文件找到可用名称（已尝试 {final_path.name} 至 "
+            f"{final_path.stem}_{_MAX_COLLISION_SUFFIX}{final_path.suffix}）。"
+        )
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -437,17 +445,27 @@ def export_ai_variant(
         raise ValueError("source_body_limit must not be negative")
     default_offset = _default_offset(archive.posts)
 
+    render_cache: dict[tuple[tuple[int, ...], tuple[str, ...]], tuple[str, dict, dict]] = {}
+
     def render_part(part, extra=()):
         if before_commit is not None:
             before_commit()
+        extra_tuple = tuple(extra)
+        cache_key = (tuple(id(post) for post in part.posts), extra_tuple)
+        cached = render_cache.get(cache_key)
+        if cached is not None:
+            cached_text, cached_meta, cached_stats = cached
+            return cached_text, cached_meta, dict(cached_stats)
         provenance = _ai2_provenance_lines(
             part, options, selection_notice, visibility_scope or "UNFILTERED",
             unknown_visibility_excluded_count,
         )
-        return render_ai_markdown(
-            part, options, provenance_lines=[*provenance, *extra],
+        rendered = render_ai_markdown(
+            part, options, provenance_lines=[*provenance, *extra_tuple],
             source_body_limit=source_body_limit, default_offset=default_offset,
         )
+        render_cache[cache_key] = (rendered[0], rendered[1], dict(rendered[2]))
+        return rendered
 
     parts = (
         split_archive_for_parts(
