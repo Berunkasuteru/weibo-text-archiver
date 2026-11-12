@@ -14,9 +14,9 @@ BUNDLE_NAME = f"WeiboTextArchiver_{VERSION}_Windows"
 
 a = Analysis(
     [str(ROOT / "WeiboTextArchiver.pyw")],
-    pathex=[str(ROOT)],
+    pathex=[str(ROOT), str(ROOT / "vendor")],
     binaries=[],
-    datas=[(str(ROOT / "assets" / "app_icon.png"), "assets")],
+    datas=[(str(ROOT / "weibo_archive" / "assets" / "app_icon.png"), str(Path("weibo_archive") / "assets"))],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -44,7 +44,7 @@ exe = EXE(
     upx=False,
     console=False,
     disable_windowed_traceback=False,
-    icon=str(ROOT / "assets" / "app_icon.ico"),
+    icon=str(ROOT / "weibo_archive" / "assets" / "app_icon.ico"),
 )
 
 coll = COLLECT(

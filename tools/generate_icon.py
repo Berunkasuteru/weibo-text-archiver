@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSET_DIR = ROOT / "assets"
+ASSET_DIR = ROOT / "weibo_archive" / "assets"
 PNG_PATH = ASSET_DIR / "app_icon.png"
 ICO_PATH = ASSET_DIR / "app_icon.ico"
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)

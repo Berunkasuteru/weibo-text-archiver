@@ -757,6 +757,51 @@ class EngineTests(unittest.TestCase):
                 with ManifestStore(alias, "42"):
                     pass
 
+    def test_transient_retry_on_downloader_and_non_retryable_403(self):
+        body = JPEG + b"ok"
+        opener = Opener(Response(status=500), urllib.error.URLError("temp"), Response(body))
+        d = ImageDownloader(opener=opener, spacing=0, reserve=0, retries=2)
+        calls = []
+        path, facts = d.download(
+            URL,
+            allocate=lambda media: calls.append(("alloc", media)) or (self.root / "ok.jpg"),
+            prepared=lambda p, f: calls.append(("prep", p.name, f.byte_size)),
+        )
+        self.assertEqual(len(opener.requests), 3)
+        self.assertEqual(facts.byte_size, len(body))
+        self.assertEqual(path, self.root / "ok.jpg")
+        self.assertEqual(len([c for c in calls if c[0] == "prep"]), 1)
+
+        opener_403 = Opener(Response(status=403), Response(body))
+        d_403 = ImageDownloader(opener=opener_403, spacing=0, reserve=0, retries=2)
+        with self.assertRaisesRegex(ImageError, "http_403"):
+            d_403.download(URL, allocate=lambda m: Path("unused.jpg"), prepared=lambda p, f: None)
+        self.assertEqual(len(opener_403.requests), 1)
+
+    def test_timeline_client_retries_3_and_batch_wait(self):
+        http = JsonHTTP({"ok": 1, "data": {"cards": []}})
+        waits = []
+        http.wait = waits.append
+        c = ImageTimelineClient(http=http)
+        self.assertEqual(c.timeline_page("42", 1), ([], True))
+        self.assertEqual(http.calls[0][1]["retries"], 3)
+
+        class PagedHTTP:
+            def __init__(self):
+                self.waits = []
+            def wait(self, seconds):
+                self.waits.append(seconds)
+            def json(self, url, **kwargs):
+                page = kwargs["params"]["page"]
+                if page <= 5:
+                    return {"ok": 1, "data": {"cards": [{"mblog": raw(page, user={"id": "42"})}]}}
+                return {"ok": 1, "data": {"cards": []}}
+
+        paged_http = PagedHTTP()
+        paged_client = ImageTimelineClient(http=paged_http)
+        self.assertEqual(len(list(paged_client.iter_posts("42", FetchRange.all()))), 5)
+        self.assertGreaterEqual(len(paged_http.waits), 6)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

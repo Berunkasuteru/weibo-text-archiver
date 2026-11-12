@@ -68,6 +68,7 @@ APP_DATA_DIR = app_data_dir()
 COOKIE_FILE = APP_DATA_DIR / "cookie.txt"
 CREDENTIAL_FILE = APP_DATA_DIR / "credential.dat"
 ERROR_FILE = APP_DATA_DIR / "last_error.txt"
+SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 CACHE_DIR = APP_DATA_DIR / "v7_cache"
 
-APP_ICON_PNG = resource_path("assets/app_icon.png")
+APP_ICON_PNG = resource_path("weibo_archive/assets/app_icon.png")

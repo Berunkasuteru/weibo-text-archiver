@@ -28,6 +28,10 @@ class _WeiboHTMLParser(HTMLParser):
             return
 
         if tag in self.BLOCK_TAGS:
+            # Inline tags may wrap the location text, but a block boundary ends
+            # the location region; without this the following body text would be
+            # consumed as the location and disappear from the post.
+            self._capture_location = False
             self.parts.append("\n")
 
         if tag == "img":
@@ -46,6 +50,7 @@ class _WeiboHTMLParser(HTMLParser):
         if self._skip_depth:
             return
         if tag in ("p", "div", "li"):
+            self._capture_location = False
             self.parts.append("\n")
 
     def handle_data(self, data):
@@ -68,9 +73,10 @@ def html_to_text(value: object) -> tuple[str, str, bool]:
         parser.close()
         text = "".join(parser.parts)
     except Exception:
-        text = re.sub(r"<[^>]+>", "", raw)
+        # Only this fallback needs unescaping: HTMLParser already converts
+        # charrefs, and a second pass would turn escaped markup into live tags.
+        text = html.unescape(re.sub(r"<[^>]+>", "", raw))
 
-    text = html.unescape(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\u200b", "")
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n[ \t]+", "\n", text)

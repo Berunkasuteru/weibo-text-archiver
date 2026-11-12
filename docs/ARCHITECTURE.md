@@ -2,6 +2,23 @@
 
 The architecture establishes strict boundaries between upstream Weibo API payloads, normalized domain models, local persistence, and output renderers.
 
+## Repository Layout
+
+```text
+.
+├── WeiboTextArchiver.pyw      Windows no-console GUI launcher
+├── weibo_archive/             Application package and bundled icon assets (`assets/`)
+│   ├── app.py / tasking.py / update_check.py
+│   ├── auth.py / credentials.py / security.py / paths.py
+│   ├── network.py / client.py / htmltext.py / parser.py / models.py / storage.py / performance.py
+│   ├── export_options.py / exporter.py / ai_format.py / markdown_v5.py
+│   └── image_models.py / image_parser.py / image_client.py / image_downloader.py / image_manifest.py / image_backup.py / image_ui.py
+├── vendor/                    Third-party vendored python-qrcode, notices, and licenses
+├── tests/                     Offline suites (run_tests.py, test_image_core.py, test_image_ui.py), fixtures, goldens
+├── tools/                     Build spec, env check, icon generator, Windows launchers & ZIP packager
+└── docs/                      Architecture, durable decisions, source provenance, and security policy
+```
+
 ## Data Flow
 
 ```text
@@ -88,10 +105,10 @@ timeline response → parser normalization → frozen Post.visibility → Archiv
 ```text
 timeline raw
 ├─ text client/parser  → Post / Archive → Markdown
-└─ image client/parser → ImageRecord / ImageAsset → CDN downloader / image_manifest.json
+└─ image client/parser → ImageRecord / ImageAsset → CDN downloader / manifest.json
 ```
 
-The Image Backup tool (`image_core.py`, `image_ui.py`) runs as an independent workflow with its own timeline traversal, frozen request state, window, and `image_manifest.json` (schema 1):
+The Image Backup tool (`image_backup.py`, `image_client.py`, `image_downloader.py`, `image_manifest.py`, `image_models.py`, `image_parser.py`, `image_ui.py`) runs as an independent workflow with its own timeline traversal, frozen request state, window, and `manifest.json` (schema 1):
 
 - It saves only images explicitly returned by the timeline response and downloadable from Sina CDN (standard photos, GIFs, and Live Photo still frames; videos, covers, and avatars are excluded).
 - It preserves declared counts, returned slot counts, and enumeration gaps separately.
@@ -99,4 +116,4 @@ The Image Backup tool (`image_core.py`, `image_ui.py`) runs as an independent wo
 
 ## Runtime Dependency Policy
 
-At runtime, `weibo_archive/` relies on the Python standard library, `tkinter`, and `qrcode` (for QR matrix generation). It never imports `requests`, `playwright`, `selenium`, or `PIL`, never spawns subprocesses or runs `pip`, never downloads remote code, and never disables TLS certificate verification.
+At runtime, `weibo_archive/` relies on the Python standard library, `tkinter`, and vendored `qrcode` (for QR matrix generation). It never imports `requests`, `playwright`, `selenium`, or `PIL`, never spawns subprocesses or runs `pip`, never downloads remote code, and never disables TLS certificate verification.

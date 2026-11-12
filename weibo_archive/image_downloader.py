@@ -128,15 +128,20 @@ def inspect_file(path: Path, *, max_bytes=MAX_IMAGE_BYTES, check=lambda: None) -
 
 
 class ImageDownloader:
+    _RETRYABLE_REASONS = frozenset(
+        {"network_error", "timeout", "length_mismatch", "http_429", "http_500", "http_502", "http_503", "http_504"}
+    )
+
     def __init__(self, *, cancel_event=None, max_bytes=MAX_IMAGE_BYTES,
                  socket_timeout=SOCKET_TIMEOUT, deadline=IMAGE_DEADLINE,
-                 spacing=CDN_START_SPACING, reserve=DISK_RESERVE,
+                 spacing=CDN_START_SPACING, reserve=DISK_RESERVE, retries: int = 0,
                  opener=None, clock=time.monotonic, disk_usage=shutil.disk_usage):
-        if max_bytes <= 0 or socket_timeout <= 0 or deadline <= 0 or spacing < 0 or reserve < 0:
+        if (max_bytes <= 0 or socket_timeout <= 0 or deadline <= 0
+                or spacing < 0 or reserve < 0 or type(retries) is not int or retries < 0):
             raise ImageError("invalid_config")
         self.cancel_event = cancel_event or threading.Event()
         self.max_bytes, self.socket_timeout, self.deadline = max_bytes, socket_timeout, deadline
-        self.spacing, self.reserve = spacing, reserve
+        self.spacing, self.reserve, self.retries = spacing, reserve, retries
         self.clock, self.disk_usage = clock, disk_usage
         self._last_start = None
         self.request_count = 0
@@ -163,14 +168,23 @@ class ImageDownloader:
         """
         reason = None
         cancelled = False
-        try:
-            return self._download(url, allocate, prepared)
-        except Cancelled:
-            cancelled = True
-        except ImageError as exc:
-            reason = exc.reason
-        except OSError:
-            reason = "storage_error"
+        for attempt in range(self.retries + 1):
+            reason = None
+            try:
+                return self._download(url, allocate, prepared)
+            except Cancelled:
+                cancelled = True
+                break
+            except ImageError as exc:
+                reason = exc.reason
+            except OSError:
+                reason = "storage_error"
+            if reason in self._RETRYABLE_REASONS and attempt < self.retries:
+                if self.spacing > 0 and self.cancel_event.wait(min(4.0, self.spacing * (2 ** attempt))):
+                    cancelled = True
+                    break
+                continue
+            break
         if cancelled:
             raise Cancelled("image_cancelled")
         raise ImageError(reason)

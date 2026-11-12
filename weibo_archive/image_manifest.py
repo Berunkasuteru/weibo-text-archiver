@@ -141,7 +141,7 @@ class ManifestStore:
 
     def _load(self):
         if not self.path.exists():
-            return {"schema_version": 1, "target_identity": self.target_identity, "assets": {}}
+            return {"schema_version": SCHEMA_VERSION, "target_identity": self.target_identity, "assets": {}}
         reason = None
         try:
             if self.path.stat().st_size > MAX_MANIFEST_BYTES:
@@ -160,7 +160,7 @@ class ManifestStore:
         # Strict shape, not a raw JSON passthrough: unknown fields never round-trip.
         # full=False skips records and asset entries unchanged since they last passed;
         # records are append-only within a run, and every file operation re-checks its own path.
-        if not isinstance(data, dict) or set(data) != TOP_KEYS or type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        if not isinstance(data, dict) or set(data) != TOP_KEYS or type(data["schema_version"]) is not int or data["schema_version"] != SCHEMA_VERSION:
             raise ValueError()
         if not valid_identity(data["target_identity"]):
             raise ValueError()

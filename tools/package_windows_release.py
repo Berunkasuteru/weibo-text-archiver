@@ -91,11 +91,11 @@ def _copy_release_docs() -> None:
     shutil.copy2(ROOT / "LICENSE", BUNDLE_DIR / "LICENSE")
     shutil.copy2(ROOT / "README.md", BUNDLE_DIR / "README.md")
     shutil.copy2(
-        ROOT / "THIRD_PARTY_NOTICES.txt",
+        ROOT / "vendor" / "THIRD_PARTY_NOTICES.txt",
         BUNDLE_DIR / "THIRD_PARTY_NOTICES.txt",
     )
     shutil.copytree(
-        ROOT / "THIRD_PARTY_LICENSES",
+        ROOT / "vendor" / "THIRD_PARTY_LICENSES",
         BUNDLE_DIR / "THIRD_PARTY_LICENSES",
         dirs_exist_ok=True,
     )

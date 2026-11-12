@@ -1,3 +1,3 @@
-# Claude Code 项目规则
+# Claude Code Project Rules
 
 @AGENTS.md

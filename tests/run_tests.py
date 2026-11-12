@@ -253,8 +253,8 @@ def test_startup_import():
 def test_alpha4_version_and_gui_launcher():
     from weibo_archive import VERSION_DISPLAY, __version__
 
-    assert __version__ == "0.7.0"
-    assert VERSION_DISPLAY == "0.7.0"
+    assert __version__ == "0.9.0"
+    assert VERSION_DISPLAY == "0.9.0"
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     assert "from . import VERSION_DISPLAY" in app_source
@@ -368,7 +368,7 @@ def test_windows_preview_packaging_contract():
     from weibo_archive.paths import resource_path
 
     assert APP_TITLE == "Weibo Text Archiver"
-    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.7.0"
+    assert f"{APP_TITLE} · {VERSION_DISPLAY}" == "Weibo Text Archiver · 0.9.0"
     assert TEST_EXPORT_LIMIT == 20
     trial_range = App._selected_range(object(), True)
     assert trial_range.mode is RangeMode.TRIAL
@@ -392,11 +392,14 @@ def test_windows_preview_packaging_contract():
     formal_range = App._selected_range(formal_controls, False)
     assert formal_range.mode is RangeMode.RECENT
     assert formal_range.limit == 37
-    png_path = ROOT / "assets" / "app_icon.png"
-    ico_path = ROOT / "assets" / "app_icon.ico"
+    png_path = ROOT / "weibo_archive" / "assets" / "app_icon.png"
+    ico_path = ROOT / "weibo_archive" / "assets" / "app_icon.ico"
     assert png_path.is_file()
     assert ico_path.is_file()
-    assert resource_path("assets/app_icon.png").resolve() == png_path.resolve()
+    assert (
+        resource_path("weibo_archive/assets/app_icon.png").resolve()
+        == png_path.resolve()
+    )
 
     png_header = png_path.read_bytes()[:24]
     assert png_header[:8] == b"\x89PNG\r\n\x1a\n"
@@ -560,7 +563,7 @@ def test_windows_preview_packaging_contract():
     assert not (ROOT / "环境检查.bat").exists()
     assert (ROOT / "docs" / "ARCHITECTURE.md").is_file()
     assert (ROOT / "docs" / "SOURCE_NOTES.md").is_file()
-    assert (ROOT / "THIRD_PARTY_NOTICES.txt").is_file()
+    assert (ROOT / "vendor" / "THIRD_PARTY_NOTICES.txt").is_file()
 
     app_source = (ROOT / "weibo_archive" / "app.py").read_text(encoding="utf-8")
     for chinese_ui_text in (
@@ -649,27 +652,33 @@ def test_portable_archives_path_and_initial_output_defaults():
     for migration_operation in ("shutil", ".rename(", ".replace(", ".unlink("):
         assert migration_operation not in paths_source
 
+    import weibo_archive.paths as paths_module
+
     original_has_saved_login = app_module.has_saved_login
+    original_settings_file = paths_module.SETTINGS_FILE
     app_module.has_saved_login = lambda: False
     app = None
     try:
-        app = App()
-        app.withdraw()
-        assert app.full_output_var.get() is True
-        assert app.ai_output_var.get() is True
-        assert app.custom_output_var.get() is False
-        assert Path(app.output_var.get()) == ROOT / "Archives"
-        selections = app._selected_export_selections()
-        assert tuple(selection.preset for selection in selections) == (
-            ExportPreset.AI_COMPACT,
-            ExportPreset.FULL_ARCHIVE,
-        )
-        assert selections[0].visibility_states == frozenset(
-            {VisibilityState.PUBLIC}
-        )
+        with tempfile.TemporaryDirectory(prefix="weibo_settings_iso_") as settings_td:
+            paths_module.SETTINGS_FILE = Path(settings_td) / "settings.json"
+            app = App()
+            app.withdraw()
+            assert app.full_output_var.get() is True
+            assert app.ai_output_var.get() is True
+            assert app.custom_output_var.get() is False
+            assert Path(app.output_var.get()) == ROOT / "Archives"
+            selections = app._selected_export_selections()
+            assert tuple(selection.preset for selection in selections) == (
+                ExportPreset.AI_COMPACT,
+                ExportPreset.FULL_ARCHIVE,
+            )
+            assert selections[0].visibility_states == frozenset(
+                {VisibilityState.PUBLIC}
+            )
     finally:
         if app is not None:
             app.destroy()
+        paths_module.SETTINGS_FILE = original_settings_file
         app_module.has_saved_login = original_has_saved_login
 
 
@@ -748,7 +757,12 @@ def test_final_polish_activity_status_and_localized_ui():
     assert activity_status_text(347, 42) == "已读取 347 条 · 用时 00:42"
     assert activity_status_text(1000, 3600) == "已读取 1,000 条 · 用时 1:00:00"
 
+    import weibo_archive.paths as paths_module
+
     original_has_saved_login = app_module.has_saved_login
+    original_settings_file = paths_module.SETTINGS_FILE
+    settings_tmp = tempfile.TemporaryDirectory(prefix="weibo_settings_polish_")
+    paths_module.SETTINGS_FILE = Path(settings_tmp.name) / "settings.json"
     app_module.has_saved_login = lambda: False
     app = None
     try:
@@ -756,7 +770,7 @@ def test_final_polish_activity_status_and_localized_ui():
         app.withdraw()
         app.update_idletasks()
         assert app.title() == f"{APP_TITLE} · {VERSION_DISPLAY}"
-        assert VERSION_DISPLAY == "0.7.0"
+        assert VERSION_DISPLAY == "0.9.0"
         assert APP_SUBTITLE == "把微博历史整理成便于长期保存与 AI 分析的本地归档"
         assert app.full_output_var.get() is True
         assert app.ai_output_var.get() is True
@@ -912,10 +926,15 @@ def test_final_polish_activity_status_and_localized_ui():
             str(by_text[label].cget("state")) == "disabled"
             for label in ("公开", "粉丝可见", "好友圈", "仅自己可见", "未知")
         )
+        custom_descendants = list(descendants(custom_window))
+        assert any(isinstance(widget, tk.Canvas) for widget in custom_descendants)
+        assert any(isinstance(widget, ttk.Scrollbar) for widget in custom_descendants)
         custom_window.destroy()
     finally:
         if app is not None:
             app.destroy()
+        paths_module.SETTINGS_FILE = original_settings_file
+        settings_tmp.cleanup()
         app_module.has_saved_login = original_has_saved_login
 
 
@@ -1141,6 +1160,11 @@ def test_nested_platform_tombstone_semantics():
         "抱歉，根据作者设置的微博可见时间范围，此微博已不可见。",
         "抱歉，此微博已被作者删除。查看帮助： 网页链接",
         "该账号因违反相关法律法规和政策，现已无法查看。查看帮助 网页链接",
+        "抱歉，由于作者设置，你暂时没有这条微博的查看权限哦。查看帮助： 网页链接",
+        "该微博因违反法律法规或《微博社区公约》的相关规定，已被删除。查看帮助： 网页链接",
+        "该账号内容存在风险，用户验证之前暂时不能查看。查看帮助 网页链接",
+        "该账号因用户自行申请关闭，现已无法查看。",
+        "该账号因被投诉违反《微博社区公约》的相关规定，现已无法查看。查看帮助 网页链接",
     )
 
     def nested_raw(notice, *, post_id="rt-tombstone", user=None, **fields):
@@ -1397,8 +1421,8 @@ def test_performance_constants_and_adaptive_network_backoff():
         def __exit__(self, *_args):
             return False
 
-        def read(self):
-            return self.body
+        def read(self, amount=-1):
+            return self.body if amount is None or amount < 0 else self.body[:amount]
 
         def geturl(self):
             return self.url
@@ -1594,7 +1618,7 @@ def test_performance_constants_and_adaptive_network_backoff():
         def __exit__(self, *_args):
             return False
 
-        def read(self):
+        def read(self, amount=-1):
             clock.advance(2.5)
             return b"{}"
 
@@ -4029,18 +4053,30 @@ def test_day0_uid_guard_and_user_facing_wording():
         ("123456789", "123456789"),
         ("https://weibo.com/u/123456789", "123456789"),
         ("https://m.weibo.cn/u/123456789", "123456789"),
+        ("https://m.weibo.cn/profile/123456789", "123456789"),
+        ("https://weibo.com/123456789", "123456789"),
+        ("https://weibo.com/123456789/profile", "123456789"),
+        ("https://weibo.com/p/100505123456789", "123456789"),
+        ("https://weibo.com/p/100505123456789/home", "123456789"),
         ("ambiguous text 123456789", "123456789"),
     ):
         assert not app_module.is_obvious_single_post_url(accepted)
         assert app_module.extract_uid(accepted) == expected
+
+    assert app_module.extract_uid("https://weibo.com/p/100808123456789") == ""
+    assert app_module.extract_uid("https://weibo.com/customname?refer_flag=1001030103_") == ""
+    assert app_module.is_weibo_url_without_uid("https://weibo.com/customname?refer_flag=1001030103_")
 
     for rejected in (
         "https://m.weibo.cn/detail/1234567890123456",
         "m.weibo.cn/detail/1234567890123456",
         "https://weibo.com/status/1234567890123456",
         "https://www.weibo.cn/status/1234567890123456",
+        "https://weibo.com/1234567890/AbCdEf123",
+        "https://weibo.com/1234567890/5000000000000001",
     ):
         assert app_module.is_obvious_single_post_url(rejected)
+        assert app_module.extract_uid(rejected) == ""
 
     assert not app_module.is_obvious_single_post_url(
         "https://example.com/detail/1234567890123456"
@@ -4198,7 +4234,12 @@ def test_bounded_github_update_check():
         app_module.threading.Thread = original_thread
     assert len(starts) == 1
 
+    import weibo_archive.paths as paths_module
+
     original_login = app_module.has_saved_login
+    original_settings = paths_module.SETTINGS_FILE
+    settings_tmp = tempfile.TemporaryDirectory(prefix="weibo_settings_update_")
+    paths_module.SETTINGS_FILE = Path(settings_tmp.name) / "settings.json"
     app = None
     try:
         app_module.has_saved_login = lambda: False
@@ -4214,6 +4255,8 @@ def test_bounded_github_update_check():
     finally:
         if app is not None:
             app.destroy()
+        paths_module.SETTINGS_FILE = original_settings
+        settings_tmp.cleanup()
         app_module.has_saved_login = original_login
 
 
@@ -4420,12 +4463,16 @@ def test_expired_login_worker_retry_limit_and_frozen_request():
 
 def test_expired_login_ui_generation_resume_and_cancellation():
     import weibo_archive.app as app_module
+    import weibo_archive.paths as paths_module
 
     originals = (
         app_module.has_saved_login,
         app_module.messagebox.showinfo,
         app_module.messagebox.showerror,
+        paths_module.SETTINGS_FILE,
     )
+    settings_tmp = tempfile.TemporaryDirectory(prefix="weibo_settings_expiry_")
+    paths_module.SETTINGS_FILE = Path(settings_tmp.name) / "settings.json"
     app = None
     notices = []
     try:
@@ -4518,7 +4565,9 @@ def test_expired_login_ui_generation_resume_and_cancellation():
             app_module.has_saved_login,
             app_module.messagebox.showinfo,
             app_module.messagebox.showerror,
+            paths_module.SETTINGS_FILE,
         ) = originals
+        settings_tmp.cleanup()
 
 def test_dpapi_credential_store_and_legacy_migration():
     synthetic_sub = "synthetic-test-secret"
@@ -4645,6 +4694,33 @@ def test_dpapi_credential_store_and_legacy_migration():
         assert not protected.exists()
         assert not legacy.exists()
         assert not store.has_saved_login()
+
+    with tempfile.TemporaryDirectory(prefix="weibo_dpapi_retire_error_") as td:
+        root = Path(td)
+
+        class LockedLegacyPath:
+            def __init__(self, error: OSError):
+                self.error = error
+
+            def exists(self) -> bool:
+                return True
+
+            def unlink(self, missing_ok: bool = False) -> None:
+                raise self.error
+
+            def stat(self):
+                raise self.error
+
+        def fail_write(_path, _data):
+            raise PermissionError("locked legacy file")
+
+        locked_store = store_for(root, atomic_write=fail_write)
+        locked_store.legacy_file = LockedLegacyPath(PermissionError("locked"))
+        assert locked_store._remove_legacy_after_verified_protected() is False
+
+        gone_store = store_for(root, atomic_write=fail_write)
+        gone_store.legacy_file = LockedLegacyPath(FileNotFoundError())
+        assert gone_store._remove_legacy_after_verified_protected() is True
 
     with tempfile.TemporaryDirectory(prefix="weibo_plaintext_compat_") as td:
         root = Path(td)
@@ -5723,12 +5799,20 @@ def test_ai2_time_order_and_rendered_part_budget():
     assert "TZ?" in render_ai_markdown(replace(archive, posts=(wall,)), AI_COMPACT_OPTIONS)[0]
 
     # Use one calendar for sorting, sections and month boundaries; source clocks stay visible.
-    december = replace(b, created_at=datetime(2026, 1, 1, 0, 30, tzinfo=jst))
-    january = replace(a, created_at=datetime(2026, 1, 1, 0, 10, tzinfo=cst))
+    december = replace(b, created_at=datetime(2026, 1, 1, 0, 30, tzinfo=jst), location="发布于 东京")
+    january = replace(a, created_at=datetime(2026, 1, 1, 0, 10, tzinfo=cst), location="发布于 上海")
+    jan_second = replace(a, id="20", created_at=datetime(2026, 1, 1, 1, 10, tzinfo=cst), location="发布于 上海")
     boundary = render_ai_markdown(replace(archive, posts=(january, december)), AI_COMPACT_OPTIONS)[0]
     assert boundary.index("## 2025｜1 records") < boundary.index("## 2026｜1 records")
     assert "[W1｜2026-01-01 00:30+09:00" in boundary
     assert "2025｜1｜1/0/0｜0 0 0 0 0 0 0 0 0 0 0 1" in boundary
+    assert "P=东京×1 (2025-12-31~2025-12-31)" in boundary
+    ordered_locs = render_ai_markdown(
+        replace(archive, posts=(december, january, jan_second)),
+        AI_COMPACT_OPTIONS,
+    )[0]
+    loc_line = next(line for line in ordered_locs.splitlines() if line.startswith("LOCATIONS "))
+    assert loc_line.index("P=上海×2") < loc_line.index("P=东京×1")
 
     with tempfile.TemporaryDirectory(prefix="weibo_ai2_budget_") as td:
         root = Path(td)
@@ -5776,6 +5860,29 @@ def test_ai2_time_order_and_rendered_part_budget():
             raise AssertionError("variant ignored cancellation")
         assert list(cancelled.iterdir()) == []
 
+        from unittest.mock import patch
+        import weibo_archive.exporter as exporter_module
+
+        render_calls = 0
+        real_render = exporter_module.render_ai_markdown
+
+        def counted_render(*args, **kwargs):
+            nonlocal render_calls
+            render_calls += 1
+            return real_render(*args, **kwargs)
+
+        with patch.object(exporter_module, "render_ai_markdown", side_effect=counted_render):
+            exporter_module.export_ai_variant(
+                mixed, root / "no_dup_single", AI_COMPACT_OPTIONS, "AI分析版", max_part_chars=None
+            )
+            assert render_calls == 1
+            render_calls = 0
+            exporter_module.export_ai_variant(
+                large, root / "no_dup_multi", AI_COMPACT_OPTIONS, "AI分析版", max_part_chars=10000
+            )
+            split_count = render_calls
+            assert split_count > 1
+
 
 def test_ai_variant_background_dialog():
     import threading
@@ -5783,11 +5890,14 @@ def test_ai_variant_background_dialog():
     import tkinter as tk
     from unittest.mock import patch
     from weibo_archive import app as app_module
+    import weibo_archive.paths as paths_module
 
     with tempfile.TemporaryDirectory(prefix="weibo_ai_dialog_") as td, \
+            patch.object(paths_module, "SETTINGS_FILE", Path(td) / "settings.json"), \
             patch.object(app_module, "has_saved_login", return_value=False), \
             patch.object(app_module.App, "_start_update_check"), \
-            patch.object(app_module.messagebox, "showerror") as errors:
+            patch.object(app_module.messagebox, "showerror") as errors, \
+            patch.object(app_module.messagebox, "showwarning") as warnings:
         app = app_module.App()
         app.withdraw()
         gate, started, stopped = threading.Event(), threading.Event(), threading.Event()
@@ -5796,7 +5906,7 @@ def test_ai_variant_background_dialog():
         stats = {"count": 3, "output_chars": 100, "estimated_tokens": 70}
 
         def exporter(*args, **kwargs):
-            calls.append((threading.get_ident(), kwargs["source_body_limit"]))
+            calls.append((threading.get_ident(), kwargs["source_body_limit"], kwargs["max_part_chars"]))
             started.set()
             try:
                 while not gate.wait(.01):
@@ -5830,13 +5940,17 @@ def test_ai_variant_background_dialog():
             win = next(w for w in app.winfo_children() if isinstance(w, tk.Toplevel))
             widgets = list(descendants(win))
             choice = next(w for w in widgets if w.winfo_class() == "TRadiobutton" and str(w.cget("value")) == "400")
+            custom_split_radio = next(w for w in widgets if w.winfo_class() == "TRadiobutton" and str(w.cget("value")) == "custom")
+            custom_split_entry = next(w for w in widgets if w.winfo_class() == "TEntry")
             generate = next(w for w in widgets if w.winfo_class() == "TButton" and str(w.cget("text")) == "生成")
+            open_file = next(w for w in widgets if w.winfo_class() == "TButton" and str(w.cget("text")) == "打开文件")
+            assert str(open_file.cget("state")) == "disabled"
             choice.invoke()
             with patch.object(app_module, "export_ai_variant", side_effect=exporter), \
                     patch.object(app, "report_callback_exception") as callback_error:
                 generate.invoke()
                 assert started.wait(1)
-                assert calls == [(calls[0][0], 400)] and calls[0][0] != threading.get_ident()
+                assert calls == [(calls[0][0], 400, None)] and calls[0][0] != threading.get_ident()
                 assert str(generate.cget("state")) == "disabled"
                 assert str(choice.cget("state")) == "disabled"
                 generate.invoke()
@@ -5847,12 +5961,32 @@ def test_ai_variant_background_dialog():
                 gate.set()
                 wait_for(lambda: str(generate.cget("state")) == "normal")
                 assert str(choice.cget("state")) == "normal"
+                assert str(open_file.cget("state")) == "normal"
+                with patch.object(app_module, "launch_with_system", return_value=(True, "")) as launcher:
+                    open_file.invoke()
+                    launcher.assert_called_once_with(Path(td) / "result.md")
                 errors.assert_not_called()
+
+                # Custom split validation and parameter delivery.
+                custom_split_radio.invoke()
+                assert str(custom_split_entry.cget("state")) == "normal"
+                custom_split_entry.delete(0, "end")
+                custom_split_entry.insert(0, "500")
+                generate.invoke()
+                warnings.assert_called_once()
+                custom_split_entry.delete(0, "end")
+                custom_split_entry.insert(0, "6000")
+                started.clear(); stopped.clear()
+                generate.invoke()
+                assert started.wait(1)
+                wait_for(lambda: str(generate.cget("state")) == "normal")
+                assert calls[-1][2] == 6000
 
                 # Failure returns control to the UI and permits another attempt.
                 fail = True
                 generate.invoke()
                 wait_for(lambda: str(generate.cget("state")) == "normal")
+                assert str(open_file.cget("state")) == "disabled"
                 errors.assert_called_once()
                 assert "synthetic storage failure" in str(errors.call_args)
 
@@ -5915,6 +6049,128 @@ def test_checkin_is_kept_beside_ip_region():
     assert "链接：https://weibo.com/1234567890/QxYz12AbC · ID 5000000000000001" in full
 
 
+def test_network_guards_response_size_and_deterministic_client_errors():
+    import urllib.error
+
+    from weibo_archive import network
+    from weibo_archive.network import HttpClient, InvalidResponse, NetworkError
+
+    class SizedResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, amount=-1):
+            return b"{}" if amount is None or amount < 0 else b"x" * amount
+
+        def geturl(self):
+            return "https://m.weibo.cn/api/container/getIndex"
+
+    original_cap = network._MAX_RESPONSE_BYTES
+    network._MAX_RESPONSE_BYTES = 8
+    try:
+        http = HttpClient()
+        http.opener = type("Opener", (), {"open": lambda *_a, **_k: SizedResponse()})()
+        http.wait = lambda _seconds: None
+        try:
+            http.request("https://m.weibo.cn/api/container/getIndex")
+        except InvalidResponse as exc:
+            assert exc.diagnostic.classification == "response_too_large"
+        else:
+            raise AssertionError("oversized response was accepted")
+    finally:
+        network._MAX_RESPONSE_BYTES = original_cap
+
+    # A deterministic 4xx repeats identically on retry; 408 stays transient.
+    for code, expected_calls in ((404, 1), (400, 1), (408, 3)):
+        calls = []
+
+        def open_fixture(request, timeout, _code=code):
+            calls.append(request.full_url)
+            raise urllib.error.HTTPError(request.full_url, _code, "fixture", {}, None)
+
+        http = HttpClient()
+        opener_stub = type("Opener", (), {})()
+        opener_stub.open = open_fixture
+        http.opener = opener_stub
+        waits = []
+        http.wait = waits.append
+        try:
+            http.request("https://m.weibo.cn/api/container/getIndex", retries=3)
+        except NetworkError as exc:
+            assert exc.diagnostic.status == code
+        else:
+            raise AssertionError(f"HTTP {code} was accepted")
+        assert len(calls) == expected_calls
+        assert len(waits) == expected_calls - 1
+
+
+def test_auth_login_opener_is_weibo_only_and_bounded():
+    import urllib.request
+
+    from weibo_archive import auth
+    from weibo_archive.network import _WeiboOnlyRedirectHandler
+
+    opener, _jar = auth._make_opener()
+    redirect_handlers = [
+        handler
+        for handler in opener.handlers
+        if isinstance(handler, urllib.request.HTTPRedirectHandler)
+    ]
+    assert [type(handler) for handler in redirect_handlers] == [
+        _WeiboOnlyRedirectHandler
+    ]
+
+    class SizedResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, amount=-1):
+            return b"{}" if amount is None or amount < 0 else b"x" * amount
+
+    original_cap = auth._MAX_PASSPORT_BYTES
+    auth._MAX_PASSPORT_BYTES = 8
+    try:
+        opener.open = lambda *_a, **_k: SizedResponse()
+        try:
+            auth._request_json(opener, "https://passport.weibo.com/sso/v2/qrcode/check")
+        except RuntimeError as exc:
+            assert "大小上限" in str(exc)
+        else:
+            raise AssertionError("oversized passport response was accepted")
+    finally:
+        auth._MAX_PASSPORT_BYTES = original_cap
+
+
+def test_html_entity_and_location_boundaries():
+    from weibo_archive.htmltext import html_to_text
+
+    # HTMLParser already converts charrefs; a second pass would rewrite literal
+    # entity text and turn escaped markup into live tags in the export.
+    assert html_to_text("我写了 &amp;amp; 符号")[0] == "我写了 &amp; 符号"
+    assert html_to_text("&amp;lt;b&amp;gt;bold&amp;lt;/b&amp;gt;")[0] == "&lt;b&gt;bold&lt;/b&gt;"
+    assert html_to_text("A &amp; B &lt;3")[0] == "A & B <3"
+
+    icon = "<img src='https://h5.sinaimg.cn/x/timeline_card_small_location_default.png'>"
+    # A block boundary ends the location region, so the body survives.
+    assert html_to_text(f"{icon}<br>正文内容") == ("正文内容", "", False)
+    assert html_to_text(f"{icon}<div>正文内容</div>") == ("正文内容", "", False)
+    # Inline wrappers still belong to the location, as Weibo emits them.
+    assert html_to_text(
+        f"今天来看展<a href='https://m.weibo.cn/p/index'>{icon}"
+        "<span class='surl-text'>东京塔</span></a>"
+    )[:2] == ("今天来看展", "东京塔")
+    assert html_to_text(f"{icon}上海<br>带图片的微博。")[:2] == ("带图片的微博。", "上海")
+
+
 def test_login_cookie_never_follows_offsite_redirect():
     import urllib.request
 
@@ -5960,6 +6216,7 @@ def test_login_cookie_never_follows_offsite_redirect():
 def test_quality_polish_range_filename_and_qr_expiry():
     from unittest.mock import patch
     import weibo_archive.app as app_module
+    import weibo_archive.paths as paths_module
     from weibo_archive.markdown_v5 import safe_filename
 
     assert app_module.parse_fetch_range("recent", "42") == FetchRange.recent(42)
@@ -5976,7 +6233,9 @@ def test_quality_polish_range_filename_and_qr_expiry():
     assert Termination.TARGET_COUNT.label() == "达到指定条数"
     assert Termination.SINCE_REACHED.label() == "达到起始日期"
 
-    with patch.object(app_module, "has_saved_login", return_value=False), \
+    with tempfile.TemporaryDirectory(prefix="weibo_settings_qr_") as settings_td, \
+            patch.object(paths_module, "SETTINGS_FILE", Path(settings_td) / "settings.json"), \
+            patch.object(app_module, "has_saved_login", return_value=False), \
             patch.object(app_module.App, "_start_update_check"), \
             patch.object(app_module.messagebox, "showerror") as errors:
         app = app_module.App()
@@ -5995,6 +6254,693 @@ def test_quality_polish_range_filename_and_qr_expiry():
             assert app.qr_window is None
         finally:
             app.destroy()
+
+
+def test_ui_settings_persistence_and_app_restore():
+    from unittest.mock import patch
+    import weibo_archive.app as app_module
+    from weibo_archive.export_options import DateFormat, ExportLayout
+    from weibo_archive.settings import UiPreferences, load_ui_settings, save_ui_settings
+
+    with tempfile.TemporaryDirectory(prefix="weibo_ui_settings_") as td:
+        root = Path(td)
+        settings_path = root / "nested" / "settings.json"
+        saved_dir = root / "SavedArchives"
+        saved_dir.mkdir()
+
+        prefs = UiPreferences(
+            output_dir=str(saved_dir),
+            range_mode=RangeMode.SINCE.value,
+            recent_count="250",
+            since_date="2025-03-04",
+            full_output=False,
+            ai_output=True,
+            custom_output=True,
+            ai_followers=True,
+            ai_friends=False,
+            ai_private=True,
+            custom_options=ExportOptions(
+                layout=ExportLayout.AI,
+                include_source=False,
+                include_location=True,
+                include_engagement=False,
+                date_format=DateFormat.DATE_ONLY,
+            ),
+            custom_filter=CustomFilterOptions(
+                include_original=True,
+                include_reposts=False,
+                keywords=("记录", "#日常#"),
+                start_date=date(2025, 1, 1),
+                end_date=date(2025, 12, 31),
+                visibility_filter_enabled=True,
+                visibilities=frozenset({VisibilityState.PUBLIC, VisibilityState.FRIENDS}),
+            ),
+        )
+        save_ui_settings(prefs, settings_path)
+        reloaded = load_ui_settings(settings_path)
+        assert reloaded == prefs
+
+        corrupt = root / "corrupt.json"
+        corrupt.write_text("{not valid json", encoding="utf-8")
+        assert load_ui_settings(corrupt) == UiPreferences()
+
+        with patch.object(app_module, "has_saved_login", return_value=False), \
+                patch.object(app_module.App, "_start_update_check"):
+            app = app_module.App(settings_path=settings_path)
+            app.withdraw()
+            try:
+                assert app.output_var.get() == str(saved_dir)
+                assert app.range_mode_var.get() == RangeMode.SINCE.value
+                assert app.recent_count_var.get() == "250"
+                assert app.since_date_var.get() == "2025-03-04"
+                assert app.full_output_var.get() is False
+                assert app.custom_output_var.get() is True
+                assert app.ai_followers_var.get() is True
+                assert app.ai_private_var.get() is True
+                assert app.custom_options == prefs.custom_options
+                assert app.custom_filter == prefs.custom_filter
+                assert app.uid_var.get() == ""
+
+                app.uid_var.set("1234567890")
+                app.full_output_var.set(True)
+                app.ai_friends_var.set(True)
+                app._on_close()
+            except Exception:
+                app.destroy()
+                raise
+
+        raw_saved = settings_path.read_text(encoding="utf-8")
+        assert "1234567890" not in raw_saved
+        after_close = load_ui_settings(settings_path)
+        assert after_close.full_output is True
+        assert after_close.ai_friends is True
+
+
+def test_account_identification_and_vanity_profile_resolution():
+    import threading
+    from datetime import datetime, timedelta, timezone
+
+    import weibo_archive.app as app_module
+    from weibo_archive.client import InvalidUser, WeiboClient, identify_logged_in_account
+    from weibo_archive.export_options import (
+        ExportLayout,
+        ExportOptions,
+        ExportPreset,
+        ExportSelection,
+    )
+    from weibo_archive.models import (
+        Archive,
+        Engagement,
+        FetchRange,
+        FetchReport,
+        MediaInfo,
+        Post,
+        Termination,
+        TimestampProvenance,
+        UserProfile,
+    )
+    from weibo_archive.network import AuthenticationExpired, NetworkError, ResponseData
+
+    class StubHttp:
+        def __init__(self, json_map=None, req_map=None):
+            self.json_map = dict(json_map or {})
+            self.req_map = dict(req_map or {})
+            self.calls = []
+
+        def json(self, url, params=None, **_kwargs):
+            self.calls.append(("json", url, params))
+            key = url.split("?")[0]
+            handler = self.json_map.get(key)
+            if callable(handler):
+                return handler(url, params)
+            if isinstance(handler, Exception):
+                raise handler
+            return handler
+
+        def request(self, url, **_kwargs):
+            self.calls.append(("request", url))
+            handler = self.req_map.get(url)
+            if callable(handler):
+                return handler(url)
+            if isinstance(handler, Exception):
+                raise handler
+            return handler
+
+    http_ok = StubHttp(
+        json_map={
+            "https://m.weibo.cn/api/config": {
+                "ok": 1,
+                "data": {"login": True, "uid": "1234567890"},
+            },
+            "https://m.weibo.cn/api/container/getIndex": {
+                "ok": 1,
+                "data": {"userInfo": {"screen_name": "AccountOwner"}},
+            },
+        }
+    )
+    assert identify_logged_in_account(http_ok) == ("1234567890", "AccountOwner")
+
+    http_expired = StubHttp(
+        json_map={
+            "https://m.weibo.cn/api/config": {
+                "ok": 1,
+                "data": {"login": False},
+            }
+        }
+    )
+    try:
+        identify_logged_in_account(http_expired)
+        raise AssertionError("Expected AuthenticationExpired for login=False")
+    except AuthenticationExpired:
+        pass
+
+    client = WeiboClient(cookie_header="SUB=offline-test", cancel_event=threading.Event())
+    client.http = StubHttp(
+        json_map={
+            "https://weibo.com/ajax/profile/info": lambda _u, params: (
+                {"ok": 1, "data": {"user": {"idstr": "1234567890", "screen_name": "Tester"}}}
+                if params == {"screen_name": "NickTester"}
+                else NetworkError("miss")
+            ),
+        },
+        req_map={
+            "https://m.weibo.cn/customvanity": ResponseData(
+                body=b"<html>redirected</html>",
+                url="https://m.weibo.cn/u/1234567890",
+                status=200,
+                content_type="text/html",
+            )
+        },
+    )
+    assert client.resolve_profile_url("https://weibo.com/n/NickTester") == (
+        "1234567890",
+        "Tester",
+    )
+    assert client.resolve_profile_url("https://weibo.com/customvanity") == (
+        "1234567890",
+        "",
+    )
+    try:
+        client.resolve_profile_url("https://example.com/customvanity")
+        raise AssertionError("Expected InvalidUser for offsite URL")
+    except InvalidUser:
+        pass
+
+    # End-to-end _export_worker URL resolution + UI button check.
+    tz = timezone(timedelta(hours=8))
+    post = Post(
+        id="50001",
+        bid="Q01",
+        created_at=datetime(2026, 5, 1, 10, 0, tzinfo=tz),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        text="Vanity URL export body",
+        source="iPhone",
+        location="上海",
+        author="Tester",
+        author_id="1234567890",
+        engagement=Engagement(1, 2, 3),
+        media=MediaInfo(),
+    )
+    sample_archive = Archive(
+        profile=UserProfile(id="1234567890", screen_name="Tester"),
+        posts=(post,),
+        fetch_range=FetchRange.trial(20),
+        report=FetchReport(
+            pages_fetched=1,
+            requests_made=2,
+            termination=Termination.NATURAL,
+            oldest_reached=post.created_at,
+            newest_reached=post.created_at,
+            profile_statuses_count=1,
+        ),
+        fetched_at=datetime(2026, 5, 1, 12, 0, tzinfo=tz),
+    )
+
+    class FakeWorker:
+        def __init__(self):
+            self.events = []
+
+        def _worker_log(self, gen, msg):
+            self.events.append((gen, "log", msg))
+
+        def _emit(self, gen, kind, payload=None):
+            self.events.append((gen, kind, payload))
+
+    originals = (
+        app_module.load_cookie_header,
+        app_module.WeiboClient,
+        app_module.save_normalized_archive,
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="weibo_item7_") as td:
+            out_dir = Path(td)
+            resolved_calls = []
+
+            class StubExportClient:
+                def __init__(self, **_kwargs):
+                    self.performance = None
+
+                def resolve_profile_url(self, url):
+                    resolved_calls.append(url)
+                    return "1234567890", "Tester"
+
+                def fetch(self, uid, _fetch_range):
+                    assert uid == "1234567890"
+                    return sample_archive
+
+            app_module.load_cookie_header = lambda: "SUB=test"
+            app_module.WeiboClient = StubExportClient
+            app_module.save_normalized_archive = lambda _arch: out_dir / "cache.json"
+
+            worker = FakeWorker()
+            req = app_module.ExportRequest(
+                uid="",
+                target_url="https://weibo.com/customvanity",
+                fetch_range=FetchRange.trial(20),
+                output_dir=out_dir,
+                export_selections=(
+                    ExportSelection(
+                        preset=ExportPreset.FULL_ARCHIVE,
+                        filename_suffix="完整",
+                        options=ExportOptions(layout=ExportLayout.FULL),
+                    ),
+                ),
+            )
+            app_module.App._export_worker(worker, 1, threading.Event(), req)
+            assert resolved_calls == ["https://weibo.com/customvanity"]
+            assert any(ev[1] == "resolved_uid" and ev[2] == "1234567890" for ev in worker.events)
+            done = [ev for ev in worker.events if ev[1] == "done"]
+            assert len(done) == 1
+            assert done[0][2]["outputs"][0]["path"].is_file()
+    finally:
+        (
+            app_module.load_cookie_header,
+            app_module.WeiboClient,
+            app_module.save_normalized_archive,
+        ) = originals
+
+    # App widget sanity & account_identified event update.
+    with tempfile.TemporaryDirectory(prefix="weibo_item7_ui_") as td:
+        orig_has_login = app_module.has_saved_login
+        try:
+            app_module.has_saved_login = lambda: True
+            app = app_module.App(settings_path=Path(td) / "settings.json")
+            try:
+                app.withdraw()
+                assert app.login_var.get() == "● 已保存登录信息"
+                assert app.my_account_btn.cget("text") == "填入我的账号"
+                assert app.offline_tools_btn.cget("text") == "离线缓存…"
+                gen, _cancel = app.tasks.start(app_module.TaskState.AUTHENTICATING)
+                app.events.put(
+                    (gen, "account_identified", {"uid": "1234567890", "screen_name": "Tester"})
+                )
+                app._poll_events()
+                assert app.uid_var.get() == "1234567890"
+                assert "Tester" in app.login_var.get()
+                assert "1234567890" in app.login_var.get()
+            finally:
+                app.destroy()
+        finally:
+            app_module.has_saved_login = orig_has_login
+
+
+def test_offline_cache_load_merge_and_reexport():
+    from datetime import date, datetime, timedelta, timezone
+
+    import weibo_archive.paths as paths_module
+    import weibo_archive.storage as storage_module
+    from weibo_archive.export_options import (
+        AIVisibilityOptions,
+        ExportLayout,
+        ExportOptions,
+        ExportPreset,
+        ExportSelection,
+    )
+    from weibo_archive.models import (
+        Archive,
+        ContentState,
+        Engagement,
+        FetchRange,
+        FetchReport,
+        IncompleteReason,
+        MediaInfo,
+        Post,
+        Termination,
+        TimestampProvenance,
+        UserProfile,
+        VisibilityInfo,
+        VisibilityState,
+    )
+    from weibo_archive.offline_archive import (
+        OfflineArchiveError,
+        incremental_since_date,
+        list_cached_archives,
+        load_normalized_archive_file,
+        merge_incremental_archives,
+    )
+
+    tz = timezone(timedelta(hours=8))
+    rt_tombstone = Post(
+        id="1001",
+        bid="",
+        created_at=None,
+        created_at_provenance=TimestampProvenance.UNKNOWN,
+        text=None,
+        source="",
+        location="",
+        author="",
+        author_id=None,
+        engagement=Engagement(),
+        media=MediaInfo(),
+        content_state=ContentState.INCOMPLETE,
+        text_preview="已删除原微博预览",
+        incomplete_reason=IncompleteReason.PLATFORM_TOMBSTONE,
+    )
+    old_post = Post(
+        id="2001",
+        bid="B2001",
+        created_at=datetime(2026, 4, 10, 9, 0, tzinfo=tz),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        text="Old April post",
+        source="Weibo",
+        location="北京",
+        checkin="国贸",
+        author="Alice",
+        author_id="99887766",
+        engagement=Engagement(1, 2, 3),
+        media=MediaInfo(images=2),
+        retweet=rt_tombstone,
+        visibility=VisibilityInfo(state=VisibilityState.PUBLIC),
+    )
+    overlap_complete = Post(
+        id="2002",
+        bid="B2002",
+        created_at=datetime(2026, 4, 20, 12, 0, tzinfo=tz),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        text="Overlap post complete body",
+        source="iPhone",
+        location="上海",
+        author="Alice",
+        author_id="99887766",
+        engagement=Engagement(2, 4, 10),
+        media=MediaInfo(),
+        visibility=VisibilityInfo(state=VisibilityState.FOLLOWERS),
+    )
+    existing = Archive(
+        profile=UserProfile(id="99887766", screen_name="Alice"),
+        posts=(overlap_complete, old_post),
+        fetch_range=FetchRange.all(),
+        report=FetchReport(
+            pages_fetched=2,
+            requests_made=5,
+            termination=Termination.NATURAL,
+            oldest_reached=old_post.created_at,
+            newest_reached=overlap_complete.created_at,
+            profile_statuses_count=2,
+        ),
+        fetched_at=datetime(2026, 4, 21, 10, 0, tzinfo=tz),
+    )
+
+    orig_storage_cache = storage_module.CACHE_DIR
+    orig_paths_cache = paths_module.CACHE_DIR
+    try:
+        with tempfile.TemporaryDirectory(prefix="weibo_item8_") as td:
+            cache_dir = Path(td) / "v7_cache"
+            storage_module.CACHE_DIR = cache_dir
+            paths_module.CACHE_DIR = cache_dir
+
+            saved_path = storage_module.save_normalized_archive(existing)
+            loaded = load_normalized_archive_file(saved_path)
+            assert loaded == existing
+
+            # Bad JSON & bad schema_version raise OfflineArchiveError.
+            bad_file = cache_dir / "99887766" / "bad.json"
+            bad_file.write_text('{"schema_version": 99}', encoding="utf-8")
+            try:
+                load_normalized_archive_file(bad_file)
+                raise AssertionError("Expected OfflineArchiveError for unsupported schema")
+            except OfflineArchiveError:
+                pass
+
+            # Unreadable junk directory ignored cleanly by list_cached_archives.
+            (cache_dir / "junk_dir").mkdir()
+            (cache_dir / "junk_dir" / "last_success.json").write_text("{corrupt", encoding="utf-8")
+            listed = list_cached_archives()
+            assert len(listed) == 1
+            assert listed[0].uid == "99887766"
+            assert listed[0].post_count == 2
+
+            # Incremental boundary keeps 1-day overlap.
+            assert incremental_since_date(loaded) == date(2026, 4, 19)
+
+            overlap_degraded = Post(
+                id="2002",
+                bid="B2002",
+                created_at=datetime(2026, 4, 20, 12, 0, tzinfo=tz),
+                created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+                text=None,
+                source="iPhone",
+                location="上海",
+                author="Alice",
+                author_id="99887766",
+                engagement=Engagement(2, 4, 99),
+                media=MediaInfo(),
+                content_state=ContentState.INCOMPLETE,
+                text_preview="Overlap post...",
+                incomplete_reason=IncompleteReason.CONTENT_UNAVAILABLE,
+            )
+            new_post = Post(
+                id="2003",
+                bid="B2003",
+                created_at=datetime(2026, 5, 2, 18, 30, tzinfo=tz),
+                created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+                text="Fresh May post",
+                source="Web",
+                location="深圳",
+                author="Alice",
+                author_id="99887766",
+                engagement=Engagement(0, 1, 5),
+                media=MediaInfo(),
+            )
+            delta = Archive(
+                profile=UserProfile(id="99887766", screen_name="Alice_New"),
+                posts=(new_post, overlap_degraded),
+                fetch_range=FetchRange.since_date(date(2026, 4, 19)),
+                report=FetchReport(
+                    pages_fetched=1,
+                    requests_made=2,
+                    termination=Termination.SINCE_REACHED,
+                    oldest_reached=overlap_degraded.created_at,
+                    newest_reached=new_post.created_at,
+                    profile_statuses_count=3,
+                ),
+                fetched_at=datetime(2026, 5, 3, 9, 0, tzinfo=tz),
+            )
+            merged = merge_incremental_archives(loaded, delta)
+            assert [p.id for p in merged.posts] == ["2003", "2002", "2001"]
+            assert merged.posts[1].content_state is ContentState.COMPLETE
+            assert merged.profile.screen_name == "Alice_New"
+            assert merged.fetch_range.mode.value == "all"
+            assert merged.report.pages_fetched == 3
+            assert merged.report.requests_made == 7
+
+            # Offline Markdown re-export directly from loaded cache without network.
+            import weibo_archive.app as app_module
+
+            out_dir = Path(td) / "out"
+            outputs, failures, final_dir = app_module.render_export_selections(
+                loaded,
+                (
+                    ExportSelection(
+                        preset=ExportPreset.AI_COMPACT,
+                        filename_suffix="AI分析版",
+                        options=ExportOptions(layout=ExportLayout.AI),
+                        visibility_states=AIVisibilityOptions().included_states,
+                    ),
+                ),
+                out_dir,
+                None,
+            )
+            assert not failures
+            assert final_dir == out_dir
+            assert outputs[0]["path"].is_file()
+
+            # Verify offline variant candidate builder and completion/dialog helpers on App.
+            ui_app = app_module.App(settings_path=Path(td) / "ui_settings.json")
+            try:
+                ui_app.withdraw()
+                variant_candidate = ui_app._build_offline_variant_output(loaded, out_dir)
+                assert variant_candidate["stats"]["estimated_tokens"] >= 1
+                assert variant_candidate["variant_source"]["archive"].profile.id == "99887766"
+            finally:
+                ui_app.destroy()
+    finally:
+        storage_module.CACHE_DIR = orig_storage_cache
+        paths_module.CACHE_DIR = orig_paths_cache
+
+
+def test_portable_json_and_offline_html_bundle_export():
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    from weibo_archive.models import (
+        Archive,
+        Engagement,
+        FetchRange,
+        FetchReport,
+        MediaInfo,
+        Post,
+        Termination,
+        TimestampProvenance,
+        UserProfile,
+    )
+    from weibo_archive.offline_archive import (
+        collect_manifest_image_map,
+        export_offline_html,
+        export_portable_json,
+    )
+
+    tz = timezone(timedelta(hours=8))
+    rt = Post(
+        id="9001",
+        bid="R9001",
+        created_at=datetime(2026, 5, 1, 9, 0, tzinfo=tz),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        text="RT body <img src=x onerror=alert(1)>",
+        source="iPhone",
+        location="杭州",
+        author="Bob",
+        author_id="112233",
+        engagement=Engagement(1, 0, 2),
+        media=MediaInfo(images=1),
+    )
+    post = Post(
+        id="9002",
+        bid="P9002",
+        created_at=datetime(2026, 5, 2, 10, 0, tzinfo=tz),
+        created_at_provenance=TimestampProvenance.SOURCE_OFFSET,
+        text="Top body </script><script>alert(1)</script> end",
+        source="Web",
+        location="上海",
+        author="Alice",
+        author_id="1234567890",
+        engagement=Engagement(3, 4, 5),
+        media=MediaInfo(images=2),
+        retweet=rt,
+    )
+    archive = Archive(
+        profile=UserProfile(
+            id="1234567890",
+            screen_name="Alice</script>",
+            description="Bio <b>safe</b>",
+        ),
+        posts=(post,),
+        fetch_range=FetchRange.all(),
+        report=FetchReport(
+            pages_fetched=1,
+            requests_made=1,
+            termination=Termination.NATURAL,
+            oldest_reached=post.created_at,
+            newest_reached=post.created_at,
+            profile_statuses_count=1,
+        ),
+        fetched_at=datetime(2026, 5, 2, 12, 0, tzinfo=tz),
+    )
+
+    with tempfile.TemporaryDirectory(prefix="weibo_item9_") as td:
+        out_dir = Path(td)
+        img_root = out_dir / "WeiboImages_1234567890"
+        (img_root / "2026" / "05").mkdir(parents=True)
+        (out_dir / "outside_secret.txt").write_text("secret", encoding="utf-8")
+
+        top_img1 = img_root / "2026" / "05" / "9002_01.jpg"
+        top_img2 = img_root / "2026" / "05" / "9002_02.jpg"
+        rt_img1 = img_root / "2026" / "05" / "9002_RT_9001_01.jpg"
+        for img_file in (top_img1, top_img2, rt_img1):
+            img_file.write_bytes(b"\xff\xd8\xff\xd9")
+
+        manifest = {
+            "schema_version": 1,
+            "target_identity": "1234567890",
+            "assets": {
+                "a2": {
+                    "relation": "TOP_LEVEL",
+                    "containing_post_id": "9002",
+                    "source_post_id": "9002",
+                    "slot_index": 2,
+                    "status": "saved",
+                    "relative_path": "2026/05/9002_02.jpg",
+                    "subtype": "still",
+                    "media_type": "jpg",
+                },
+                "a1": {
+                    "relation": "TOP_LEVEL",
+                    "containing_post_id": "9002",
+                    "source_post_id": "9002",
+                    "slot_index": 1,
+                    "status": "already_present",
+                    "relative_path": "2026/05/9002_01.jpg",
+                    "subtype": "still",
+                    "media_type": "jpg",
+                },
+                "rt1": {
+                    "relation": "RETWEET_SOURCE",
+                    "containing_post_id": "9002",
+                    "source_post_id": "9001",
+                    "slot_index": 1,
+                    "status": "saved",
+                    "relative_path": "2026/05/9002_RT_9001_01.jpg",
+                    "subtype": "still",
+                    "media_type": "jpg",
+                },
+                "failed": {
+                    "relation": "TOP_LEVEL",
+                    "containing_post_id": "9002",
+                    "source_post_id": "9002",
+                    "slot_index": 3,
+                    "status": "failed",
+                    "relative_path": "2026/05/9002_01.jpg",
+                },
+                "traversal": {
+                    "relation": "TOP_LEVEL",
+                    "containing_post_id": "9002",
+                    "source_post_id": "9002",
+                    "slot_index": 4,
+                    "status": "saved",
+                    "relative_path": "../outside_secret.txt",
+                },
+            },
+        }
+        (img_root / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        img_map = collect_manifest_image_map(archive, out_dir)
+        assert [item["slot"] for item in img_map[("TOP_LEVEL", "9002", "9002")]] == [1, 2]
+        assert img_map[("TOP_LEVEL", "9002", "9002")][0]["src"] == (
+            "WeiboImages_1234567890/2026/05/9002_01.jpg"
+        )
+        assert len(img_map[("RETWEET_SOURCE", "9002", "9001")]) == 1
+
+        json_path, json_stats = export_portable_json(archive, out_dir)
+        assert json_path.is_file()
+        assert json_stats["count"] == 1
+        parsed_json = json.loads(json_path.read_text(encoding="utf-8"))
+        assert parsed_json["format"] == "weibo-archive-portable-json"
+        assert parsed_json["schema_version"] == 5
+        assert len(parsed_json["posts"]) == 1
+
+        html_path, html_stats = export_offline_html(archive, out_dir)
+        assert html_path.is_file()
+        assert html_stats["linked_images"] == 3
+        assert html_stats["linked_posts"] == 1
+        html_text = html_path.read_text(encoding="utf-8")
+        # Unescaped </script> from post text or screen_name must never break out of tags.
+        assert html_text.count("<script") == 2
+        assert "outside_secret" not in html_text
+        assert "WeiboImages_1234567890/2026/05/9002_01.jpg" in html_text
+        assert "http://" not in html_text and "https://" not in html_text
 
 
 def main():
@@ -6080,7 +7026,14 @@ def main():
         ("WEIBO_AI_2 time order and rendered part budget", test_ai2_time_order_and_rendered_part_budget),
         ("AI variant background generation, failure and close", test_ai_variant_background_dialog),
         ("check-in place kept beside IP region; Full permalinks", test_checkin_is_kept_beside_ip_region),
+        ("HTML entity decoding and location boundaries", test_html_entity_and_location_boundaries),
+        ("network response size cap and deterministic 4xx", test_network_guards_response_size_and_deterministic_client_errors),
+        ("auth login opener is Weibo-only and bounded", test_auth_login_opener_is_weibo_only_and_bounded),
         ("quality polish range, filename and QR expiry", test_quality_polish_range_filename_and_qr_expiry),
+        ("UI settings persistence and restore", test_ui_settings_persistence_and_app_restore),
+        ("account identification and vanity URL resolution", test_account_identification_and_vanity_profile_resolution),
+        ("offline Schema-5 cache load, merge and re-export", test_offline_cache_load_merge_and_reexport),
+        ("portable JSON and offline HTML image-linked export", test_portable_json_and_offline_html_bundle_export),
         ("zero-runtime-dependency audit", test_dependency_audit),
     ]
     for name, fn in suite:

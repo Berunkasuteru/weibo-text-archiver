@@ -70,7 +70,7 @@ class ImageTimelineClient:
         self._check()
         self.http.wait(random.uniform(*PAGE_SPACING))
         js = self.http.json(API_CONTAINER, params={"containerid": "230413" + uid,
-                            "page": page, "count": PAGE_SIZE}, timeout=15, retries=1,
+                            "page": page, "count": PAGE_SIZE}, timeout=15, retries=3,
                             performance_category="timeline")
         if not isinstance(js, dict):
             raise ImageError("invalid_response")
@@ -165,4 +165,6 @@ class ImageTimelineClient:
             no_progress = no_progress + 1 if len(seen) == before else 0
             if no_progress >= 3:
                 raise ImageError("no_progress")
+            if page % 5 == 0 and callable(getattr(self.http, "wait", None)):
+                self.http.wait(random.uniform(1.0, 2.0))
             page += 1

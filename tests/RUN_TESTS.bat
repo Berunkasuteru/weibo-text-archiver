@@ -6,10 +6,21 @@ title Weibo Text Archiver - Tests
 
 where py >nul 2>nul
 if %errorlevel%==0 (
-    py -3 "%~dp0run_tests.py"
+    set "PY_CMD=py -3"
 ) else (
-    python "%~dp0run_tests.py"
+    set "PY_CMD=python"
 )
+
+%PY_CMD% "%~dp0run_tests.py" || goto :fail
+%PY_CMD% "%~dp0test_image_core.py" || goto :fail
+%PY_CMD% "%~dp0test_image_ui.py" || goto :fail
 
 echo.
 pause
+exit /b 0
+
+:fail
+set "EXITCODE=%errorlevel%"
+echo.
+pause
+exit /b %EXITCODE%
